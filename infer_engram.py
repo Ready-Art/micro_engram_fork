@@ -90,7 +90,7 @@ def resolve_settings(args, sd, layer_from_key):
     }
 
     settings = {
-        "layer": pick(args.layer, conf.get("layer"), layer_from_key, 1),
+        "layer": pick(args.layer, conf.get("layer"), layer_from_key, 0),
         "table_size": pick(args.table_size, conf.get("table_size"), from_shapes["table_size"], 65_536),
         "engram_dim": pick(args.dim, conf.get("engram_dim"), from_shapes["engram_dim"], 128),
         "num_heads": pick(args.heads, conf.get("num_heads"), from_shapes["num_heads"], 4),

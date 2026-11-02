@@ -47,7 +47,7 @@ plugins:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `micro_engram_layer` | `1` | Inject the memory after this decoder layer |
+| `micro_engram_layer` | `0` | Inject the memory into the output of this decoder layer (0-indexed: `0` = after the first block, the Engram paper's best single placement) |
 | `micro_engram_table_size` | `65536` | Rows per hash table |
 | `micro_engram_dim` | `128` | Width of each table row |
 | `micro_engram_heads` | `4` | Hash tables per n-gram order (orders 2 and 3 give `2 × heads` tables in total) |
@@ -62,10 +62,10 @@ The engram has `2 × heads × table_size × dim` table parameters plus two `(2·
 
 ```yaml
 unfrozen_parameters:
-  - 'model.language_model.layers.1.(_checkpoint_wrapped_module.)?micro_engram..*'
+  - 'model.language_model.layers.0.(_checkpoint_wrapped_module.)?micro_engram..*'
 ```
 
-Change the `1` if you change `micro_engram_layer`. You can add other patterns too, for example selected embedding rows.
+Change the `0` if you change `micro_engram_layer`. You can add other patterns too, for example selected embedding rows.
 
 If you set **neither** `unfrozen_parameters` **nor** `adapter`, the plugin freezes the whole model and trains only the engram on its own.
 
@@ -90,14 +90,14 @@ sample_packing: true
 pad_to_sequence_len: true
 
 # --- micro-engram ---
-micro_engram_layer: 1
+micro_engram_layer: 0
 micro_engram_table_size: 262144
 micro_engram_dim: 128
 micro_engram_heads: 4
-micro_engram_canon_path: /path/to/canon.pt   # optional
+micro_engram_canon_path: /path/to/canon.pt   # optional, from build_canon.py --paper
 
 unfrozen_parameters:
-  - 'model.language_model.layers.1.(_checkpoint_wrapped_module.)?micro_engram..*'
+  - 'model.language_model.layers.0.(_checkpoint_wrapped_module.)?micro_engram..*'
 
 learning_rate: 1e-3
 lr_scheduler: constant_with_warmup
@@ -145,7 +145,7 @@ python extract_engram.py /path/to/merged_model micro_engram.pt
 
 | Script | What it does |
 |---|---|
-| `build_canon.py` | Builds the token-merge map. `python build_canon.py --tokenizer /path/to/model --out canon.pt [--merge-space]`. By default it merges case/NFKC variants and keeps the leading-space marker. `--merge-space` also merges `▁the` with `the`. Special, added and byte tokens are never merged. It prints the class count so you can compare the two options. |
+| `build_canon.py` | Builds the token-merge map. `python build_canon.py --tokenizer /path/to/model --out canon.pt --paper`. By default it merges only case/NFKC variants (`▁The` = `▁the`). Each option merges more: `--merge-space` (`▁the` = `the`), `--strip-accents` (`é` = `e`, Latin/Greek/Cyrillic diacritics only) and `--merge-whitespace` (all whitespace-only pieces share one id). `--paper` turns on all three, like the paper's tokenizer compression. Special, added and byte tokens are never merged. It prints the class count for each step so you can compare. |
 | `engram_data_stats.py` | Estimates how many n-grams your data trains and how crowded each table size would be. `python engram_data_stats.py /path/to/last_run_prepared/<hash> [--max-tokens N]`. Use it to pick `micro_engram_table_size`. |
 | `extract_engram.py` | Pulls the engram tensors out of merged safetensors into a standalone `.pt` file. |
 | `infer_engram.py` | Test generation with the engram attached. See below. |
