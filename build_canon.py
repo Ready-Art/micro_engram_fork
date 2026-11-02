@@ -1,14 +1,20 @@
 """
 Build the token-merging map for the engram.
 
-    python build_canon.py --tokenizer /path/to/gemma-4-31B-it --out canon.pt
-    python build_canon.py --tokenizer /path/to/gemma-4-31B-it --out canon.pt --merge-space
+    python build_canon.py --tokenizer /path/to/gemma-4-31B-it --out canon.pt --paper
+    python build_canon.py --tokenizer /path/to/gemma-4-31B-it --out canon.pt   # case only
 
 Default: merge case variants (NFKC + lowercase), keeping the leading-space marker,
-so "?The" and "?the" share a row but "?the" and the word-piece "the" do not.
---merge-space also merges space-prefixed and non-prefixed pieces ("?the" with "the").
+so "▁The" and "▁the" share a row but "▁the" and the word-piece "the" do not.
+
+Extra options (each one merges more):
+  --merge-space        also merge space-prefixed and bare pieces ("▁the" with "the")
+  --strip-accents      also merge accented Latin/Greek/Cyrillic letters with plain ones ("é" with "e")
+  --merge-whitespace   all whitespace-only pieces (spaces, tabs, newlines, runs of them) share one id
+  --paper              all three, as in the Engram paper's "tokenizer compression"
+
 Special tokens, added tokens and byte tokens are never merged.
-The script prints how many classes each option gives, so you can pick.
+The script prints how many classes each option gives, so you can compare.
 """
 import argparse
 import random
@@ -19,28 +25,44 @@ from collections import defaultdict
 import torch
 from transformers import AutoTokenizer
 
-MARKERS = ("\u2581", "\u0120")  # SentencePiece space marker, byte-level BPE space marker
-SPACE = "\u2581"
+MARKERS = ("▁", "Ġ")  # SentencePiece space marker, byte-level BPE space marker
+SPACE = "▁"
 BYTE_TOKEN = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
+# Visible stand-ins tokenizers use for whitespace -> the real character.
+WS_STANDINS = str.maketrans({"▁": " ", "Ġ": " ", "Ċ": "\n", "ĉ": "\t"})
+WS_KEY = "<whitespace>"
 
 
-def merge_key(piece, merge_space):
+def strip_accents(s):
+    """Drop combining diacritics (U+0300-U+036F) only, so other scripts' marks are kept."""
+    decomposed = unicodedata.normalize("NFKD", s)
+    kept = "".join(c for c in decomposed if not 0x300 <= ord(c) <= 0x36F)
+    return unicodedata.normalize("NFKC", kept)
+
+
+def merge_key(piece, merge_space, accents=False, whitespace=False):
+    if whitespace:
+        real = piece.translate(WS_STANDINS)
+        if real and real.isspace():
+            return WS_KEY
     lead = ""
     if piece and piece[0] in MARKERS:
         lead, piece = SPACE, piece[1:]
     body = unicodedata.normalize("NFKC", piece).lower()
+    if accents:
+        body = strip_accents(body)
     if body == "":
         return None  # nothing to merge on
     return body if merge_space else lead + body
 
 
-def build(pieces, protected, vocab_size, merge_space):
+def build(pieces, protected, vocab_size, merge_space, accents=False, whitespace=False):
     canon = list(range(vocab_size))
     groups = defaultdict(list)
     for i, p in enumerate(pieces):
         if i in protected or p is None or BYTE_TOKEN.match(p):
             continue
-        key = merge_key(p, merge_space)
+        key = merge_key(p, merge_space, accents, whitespace)
         if key is not None:
             groups[key].append(i)  # ids arrive in increasing order
     for ids in groups.values():
@@ -50,13 +72,27 @@ def build(pieces, protected, vocab_size, merge_space):
     return canon, groups
 
 
+OPTION_SETS = (  # (label, merge_space, strip_accents, merge_whitespace), each adds one step
+    ("case only", False, False, False),
+    ("+ space", True, False, False),
+    ("+ accents", True, True, False),
+    ("+ whitespace (paper)", True, True, True),
+)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokenizer", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--vocab-size", type=int, default=262_144, help="model vocab size (Gemma 4: 262144)")
     ap.add_argument("--merge-space", action="store_true")
+    ap.add_argument("--strip-accents", action="store_true")
+    ap.add_argument("--merge-whitespace", action="store_true")
+    ap.add_argument("--paper", action="store_true", help="same as all three options above")
     args = ap.parse_args()
+    if args.paper:
+        args.merge_space = args.strip_accents = args.merge_whitespace = True
+    chosen = (args.merge_space, args.strip_accents, args.merge_whitespace)
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
     n = min(len(tok), args.vocab_size)
@@ -64,16 +100,19 @@ def main():
     protected = set(tok.get_added_vocab().values()) | set(tok.all_special_ids)
     print(f"tokenizer pieces: {n:,} | protected (special/added): {len(protected):,}")
 
-    results = {}
-    for name, flag in (("case only", False), ("case + space", True)):
-        canon, groups = build(pieces, protected, args.vocab_size, flag)
+    for name, *flags in OPTION_SETS:
+        canon, _ = build(pieces, protected, args.vocab_size, *flags)
         classes = len(set(canon[:n]))
-        results[flag] = (canon, groups)
-        print(f"{name:13s}: {n:,} tokens -> {classes:,} classes ({1 - classes / n:.1%} fewer)")
+        mark = "  <- chosen" if tuple(flags) == chosen else ""
+        print(f"{name:22s}: {n:,} tokens -> {classes:,} classes ({1 - classes / n:.1%} fewer){mark}")
 
-    canon, groups = results[args.merge_space]
-    print(f"\nchosen: {'case + space' if args.merge_space else 'case only'}")
-    multi = [ids for ids in groups.values() if len(ids) >= 3]
+    canon, groups = build(pieces, protected, args.vocab_size, *chosen)
+    print(f"\nchosen: merge_space={args.merge_space} strip_accents={args.strip_accents} "
+          f"merge_whitespace={args.merge_whitespace}")
+    if WS_KEY in groups:
+        ws = groups[WS_KEY]
+        print(f"whitespace class: {len(ws)} pieces, e.g. {[pieces[i] for i in ws[:8]]}")
+    multi = [ids for k, ids in groups.items() if len(ids) >= 3 and k != WS_KEY]
     random.seed(0)
     print("\nsample of merged groups (check these look right):")
     for ids in random.sample(multi, min(12, len(multi))):
