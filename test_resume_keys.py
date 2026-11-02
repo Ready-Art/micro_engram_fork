@@ -1,6 +1,6 @@
 """
 CPU-only test: does the plugin's key-rename hook make resume loading work?
-Run from the folder that contains the micro_engram package:
+Run from the repo root (or with the package pip-installed):
     python test_resume_keys.py
 """
 import torch

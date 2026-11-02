@@ -124,8 +124,10 @@ def _patch_accelerate_resume():
             return orig(model, state_dict, *args, **kwargs)
         rest = {k: v for k, v in state_dict.items() if not _is_engram_key(k)}
 
-        loaded = 0
+        loaded, expected = 0, 0
         for k, v in engram_items.items():
+            if not (k.endswith(".mults") or k.endswith(".canon")):
+                expected += 1
             if k.endswith(".mults"):
                 continue  # integer hash multipliers: rebuilt from the seed, identical every run
             target = _find_param(model, k)
@@ -143,7 +145,7 @@ def _patch_accelerate_resume():
             loaded += 1
         example = next(iter(engram_items))
         LOG.warning(f"[micro_engram] resume: copied {loaded} engram tensors directly "
-                    f"(expected 10; example checkpoint key: {example})")
+                    f"(expected {expected}; example checkpoint key: {example})")
 
         opts = kwargs.get("sd_options")
         if opts is not None:
@@ -170,7 +172,9 @@ class MicroEngramPlugin(BasePlugin):
         self.conf = None
 
     def get_input_args(self):
-        return "micro_engram.args.MicroEngramArgs"
+        # Relative to this package, so it resolves however the package was imported
+        # (pip-installed `micro_engram`, or the repo folder as `micro_engram.micro_engram`).
+        return f"{__name__}.args.MicroEngramArgs"
 
     def post_model_load(self, cfg, model):
         text_cfg = getattr(model.config, "text_config", model.config)

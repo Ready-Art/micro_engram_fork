@@ -97,6 +97,8 @@ def resolve_settings(args, sd, layer_from_key):
         "orders": orders,
         "pad_id": conf.get("pad_id"),
         "model_dim": conf.get("model_dim"),
+        "token_merge": conf.get("token_merge"),
+        "canon_path": conf.get("canon_path"),
     }
 
     if source:
@@ -106,7 +108,7 @@ def resolve_settings(args, sd, layer_from_key):
               "(assumes n-gram orders 2 and 3)")
     else:
         print("[engram] no config and no tensors to read, using defaults")
-    shown = {k: v for k, v in settings.items() if k not in ("pad_id", "model_dim")}
+    shown = {k: v for k, v in settings.items() if k not in ("pad_id", "model_dim", "canon_path")}
     print(f"[engram] using: {shown}")
     return settings
 
@@ -205,6 +207,18 @@ def main():
         raise SystemExit(f"Config says model_dim {settings['model_dim']} but the model has "
                          f"hidden_size {text_cfg.hidden_size}. Wrong config for this model?")
 
+    # The token-merge map is normally saved with the weights. If the run used one but the
+    # weights lack it, hashing would silently differ from training: load it or stop.
+    canon = None
+    if "canon" not in sd and settings["token_merge"]:
+        path = settings["canon_path"]
+        if not path or not os.path.isfile(path):
+            raise SystemExit(f"Training used token merging but the weights have no 'canon' tensor and "
+                             f"the canon file is not available ({path}). Copy it here and fix canon_path "
+                             f"in {CONFIG_NAME}.")
+        canon = torch.load(path, map_location="cpu")
+        print(f"[engram] token-merge map loaded from {path}")
+
     engram = MicroEngram(
         model_dim=text_cfg.hidden_size,
         table_size=settings["table_size"],
@@ -212,6 +226,8 @@ def main():
         num_heads=settings["num_heads"],
         orders=settings["orders"],
         pad_id=pick(settings["pad_id"], text_cfg.pad_token_id, 0),
+        vocab_size=text_cfg.vocab_size,
+        canon=canon,
     )
     runner = EngramRunner(model, engram, settings["layer"])
 
