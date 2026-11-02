@@ -17,7 +17,7 @@ At each position `t`, the module looks up the 2-grams and 3-grams that **end** a
 Install into the **same Python environment as Axolotl**:
 
 ```bash
-git clone <this-repo-url> micro_engram
+git clone https://github.com/som1tokmynam/micro_engram.git
 cd micro_engram
 pip install -e .
 ```
