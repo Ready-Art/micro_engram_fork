@@ -226,7 +226,7 @@ class MicroEngramPlugin(BasePlugin):
 
         n_eng = sum(p.numel() for p in self.engram.parameters())
         n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        LOG.info(f"[micro_engram] attached at {where}: {n_eng / 1e6:.1f}M engram params, "
+        LOG.warning(f"[micro_engram] attached at {where}: {n_eng / 1e6:.1f}M engram params, "
                  f"{n_train / 1e6:.1f}M trainable right now (Axolotl may still change this)")
 
     def add_callbacks_post_trainer(self, cfg, trainer):
