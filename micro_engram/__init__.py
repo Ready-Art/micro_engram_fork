@@ -54,6 +54,25 @@ class _WriteConfigCallback(TrainerCallback):
             self._write(os.path.join(args.output_dir, f"checkpoint-{state.global_step}"))
 
 
+class _ReportTrainableCallback(TrainerCallback):
+    """Logs the real trainable count at train start, after Axolotl has applied its freezing."""
+
+    def __init__(self, engram):
+        self.engram = engram
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if not state.is_world_process_zero or model is None:
+            return
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_eng = sum(p.numel() for p in self.engram.parameters())
+        n_eng_train = sum(p.numel() for p in self.engram.parameters() if p.requires_grad)
+        LOG.warning(f"[micro_engram] at train start: {n_train / 1e6:.1f}M trainable in total, "
+                    f"engram {n_eng_train / 1e6:.1f}M of {n_eng / 1e6:.1f}M trainable")
+        if n_eng_train == 0:
+            LOG.error("[micro_engram] the engram is FROZEN: check that unfrozen_parameters matches "
+                      "layers.<micro_engram_layer>...micro_engram")
+
+
 def _uses_fsdp(cfg):
     return bool(cfg.fsdp_config or cfg.fsdp)
 
@@ -225,12 +244,11 @@ class MicroEngramPlugin(BasePlugin):
                 p.requires_grad_(True)
 
         n_eng = sum(p.numel() for p in self.engram.parameters())
-        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        LOG.warning(f"[micro_engram] attached at {where}: {n_eng / 1e6:.1f}M engram params, "
-                 f"{n_train / 1e6:.1f}M trainable right now (Axolotl may still change this)")
+        LOG.warning(f"[micro_engram] attached at {where}: {n_eng / 1e6:.1f}M engram params "
+                    f"(trainable count is logged at train start, after Axolotl's freezing)")
 
     def add_callbacks_post_trainer(self, cfg, trainer):
-        callbacks = [_WriteConfigCallback(self.conf)]
+        callbacks = [_WriteConfigCallback(self.conf), _ReportTrainableCallback(self.engram)]
         if not _uses_fsdp(cfg):  # under FSDP the checkpoint already contains the engram
             callbacks.append(_SaveEngramCallback(self.engram, cfg.micro_engram_save_steps))
         return callbacks
