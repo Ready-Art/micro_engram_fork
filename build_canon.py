@@ -13,6 +13,9 @@ Extra options (each one merges more):
   --merge-whitespace   all whitespace-only pieces (spaces, tabs, newlines, runs of them) share one id
   --paper              all three, as in the Engram paper's "tokenizer compression"
 
+  --protect FILE       names to keep apart from the ordinary word ("Peril" the dragon vs
+                       "peril"): one name per line, # comments. Repeatable.
+
 Special tokens, added tokens and byte tokens are never merged.
 The script prints how many classes each option gives, so you can compare.
 """
@@ -56,6 +59,29 @@ def merge_key(piece, merge_space, accents=False, whitespace=False):
     return body if merge_space else lead + body
 
 
+def read_names(path):
+    with open(path, encoding="utf-8") as f:
+        return [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+def name_token_ids(names, pieces):
+    """Ids of the tokens that ARE a name (bare or with a leading-space marker).
+
+    Returns (ids to protect, names that are a single token, names split into several
+    tokens). A split name is left alone: its pieces are not the name.
+    """
+    index = {p: i for i, p in enumerate(pieces) if p is not None}
+    ids, single, split = set(), [], []
+    for name in names:
+        found = [index[v] for v in (name, *(m + name for m in MARKERS)) if v in index]
+        if found:
+            ids.update(found)
+            single.append(name)
+        else:
+            split.append(name)
+    return ids, single, split
+
+
 def build(pieces, protected, vocab_size, merge_space, accents=False, whitespace=False):
     canon = list(range(vocab_size))
     groups = defaultdict(list)
@@ -89,6 +115,8 @@ def main():
     ap.add_argument("--strip-accents", action="store_true")
     ap.add_argument("--merge-whitespace", action="store_true")
     ap.add_argument("--paper", action="store_true", help="same as all three options above")
+    ap.add_argument("--protect", action="append", default=[], metavar="FILE",
+                    help="file of names whose own tokens are never merged (repeatable)")
     args = ap.parse_args()
     if args.paper:
         args.merge_space = args.strip_accents = args.merge_whitespace = True
@@ -99,6 +127,12 @@ def main():
     pieces = tok.convert_ids_to_tokens(list(range(n)))
     protected = set(tok.get_added_vocab().values()) | set(tok.all_special_ids)
     print(f"tokenizer pieces: {n:,} | protected (special/added): {len(protected):,}")
+    for path in args.protect:
+        ids, single, split = name_token_ids(read_names(path), pieces)
+        protected |= ids
+        print(f"{path}: {len(single)} names kept apart ({len(ids)} tokens)")
+        if split:
+            print(f"  not single tokens, left alone ({len(split)}): {', '.join(split)}")
 
     for name, *flags in OPTION_SETS:
         canon, _ = build(pieces, protected, args.vocab_size, *flags)
