@@ -124,10 +124,20 @@ def encode_text(prompt):
 
 # ----------------------------------------------------------------------------- generation
 class CancelFlag(StoppingCriteria):
+    """Stops generation on request. Called once per generated token, so it also times them."""
+
     def __init__(self):
         self.cancelled = False
+        self.steps = 0          # tokens generated
+        self.t_first = None     # when the first token was done (= end of prompt processing)
+        self.t_last = None
 
     def __call__(self, input_ids, scores, **kwargs):
+        now = time.time()
+        if self.t_first is None:
+            self.t_first = now
+        self.t_last = now
+        self.steps += 1
         return torch.full((input_ids.shape[0],), self.cancelled, dtype=torch.bool, device=input_ids.device)
 
 
@@ -416,8 +426,16 @@ class Handler(BaseHTTPRequestHandler):
         n_new = len(S.tok(all_out, add_special_tokens=False).input_ids) if all_out else 0
         finish = "length" if n_new >= max_new else "stop"
         dt = max(time.time() - t0, 1e-6)
+        if cancel.t_first is not None:
+            prefill = cancel.t_first - t0
+            gen_dt = cancel.t_last - cancel.t_first
+            gen_speed = f"{(cancel.steps - 1) / gen_dt:.1f} tok/s" if cancel.steps > 1 and gen_dt > 0 else "n/a"
+            timing = (f"prompt {prefill:.1f}s ({input_ids.shape[1] / max(prefill, 1e-6):.0f} tok/s) | "
+                      f"generation {gen_speed} | {cancel.steps} new tok")
+        else:
+            timing = f"~{n_new} new tok | {n_new / dt:.1f} tok/s (incl. prompt)"
         print(f"[server] {'ENGRAM' if engram_on else 'no-engram'} | prompt {input_ids.shape[1]} tok | "
-              f"~{n_new} new tok | {n_new / dt:.1f} tok/s (incl. prompt) | {finish}")
+              f"{timing} | {finish}")
 
         if stream:
             try:

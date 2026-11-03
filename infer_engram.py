@@ -160,8 +160,11 @@ class EngramRunner:
     def _engram_forward(self, hidden):
         eng = self.engram
         T = hidden.shape[1]
-        # hash the FULL history, then keep only the positions we are computing right now
-        idx = eng.hash_ids(self.hist.to(hidden.device))
+        # Hash only the tail: the T new positions plus the (max order - 1) tokens before them,
+        # which is all their n-grams can reach. Same result as hashing the whole history,
+        # without redoing the whole conversation for every generated token.
+        tail = self.hist[:, -(T + max(eng.orders) - 1):]
+        idx = eng.hash_ids(tail.to(hidden.device))
         idx = [i[:, -T:] for i in idx]
         return eng.inject(hidden, idx)  # same gate code as training
 
