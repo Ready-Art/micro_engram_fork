@@ -159,6 +159,7 @@ python extract_engram.py /path/to/merged_model micro_engram.pt
 | `engram_data_stats.py` | Estimates how many n-grams your data trains and how crowded each table size would be. `python engram_data_stats.py /path/to/last_run_prepared/<hash> [--max-tokens N]`. Use it to pick `micro_engram_table_size`. |
 | `extract_engram.py` | Pulls the engram tensors out of merged safetensors into a standalone `.pt` file. |
 | `infer_engram.py` | Test generation with the engram attached. See below. |
+| `eval_logprob.py` | Measures how well a served model predicts held-out text, through vLLM's prompt log-probabilities, and compares two configs (e.g. with and without the engram): loss, perplexity, per-chunk win rate and a 95% interval. `run --url ... --data heldout/ --out a.json` once per config, then `compare a.json b.json`. |
 
 ### Inference
 
