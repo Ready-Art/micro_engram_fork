@@ -227,7 +227,7 @@ vllm serve /path/to/base_model --tensor-parallel-size 4 \
 - `micro_engram` is a `micro_engram_config.json`, or the folder that holds it. Its `"weights"` field says where the engram is, relative to the config file: a DCP checkpoint folder (only the engram is read from it, even from a full checkpoint), a `.safetensors` file or folder, or a `.pt`.
 - Training writes `"weights"` for you: FSDP checkpoints point to their `pytorch_model_fsdp_0`, a non-FSDP run's final config points to `micro_engram.pt`. For other files, add it by hand, e.g. `"weights": "my_engram.pt"`.
 - Without `--additional-config` (or the `MICRO_ENGRAM_CONFIG` environment variable) the plugin uses a `micro_engram_config.json` next to the model weights (an assembled folder), and otherwise serves plain Gemma 4. A chosen engram replaces any engram already in the model folder.
-- The engram must have been trained on this exact base model.
+- The engram must have been trained on this exact base model. Training records a fingerprint of the base weights in the config (`base_fingerprint`: a hash of the embeddings and of every projection in the first, middle and last layer, independent of the folder name). vLLM, `assemble_engram_model.py` and the HF scripts **warn** when the model they load differs, but load it anyway.
 - `infer_engram.py` / `serve_engram.py` do the same with `--engram-config path/to/micro_engram_config.json`. Their `--engram-pt` accepts every format above.
 
 ---

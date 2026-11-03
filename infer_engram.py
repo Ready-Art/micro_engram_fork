@@ -26,7 +26,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from micro_engram.module import MicroEngram, find_text_layers
 from micro_engram.weights import load_engram_weights as load_engram_file
-from micro_engram.weights import resolve_weights_path
+from micro_engram.weights import base_mismatch, resolve_weights_path
 
 CONFIG_NAME = "micro_engram_config.json"
 _LAYER_RE = re.compile(r"layers\.(\d+)\.micro_engram\.")
@@ -67,6 +67,15 @@ def engram_pt_from_config(args):
         return args.engram_pt
     with open(args.engram_config) as f:
         return resolve_weights_path(json.load(f), args.engram_config)
+
+
+def warn_if_other_base(args):
+    """Print a warning if the engram was trained on different base weights than --model."""
+    conf_path = args.engram_config or os.path.join(args.model, CONFIG_NAME)
+    if os.path.isfile(conf_path):
+        with open(conf_path) as f:
+            if (msg := base_mismatch(json.load(f), args.model)):
+                print(f"[engram] WARNING: {msg}")
 
 
 def pick(*values):
@@ -201,6 +210,7 @@ def main():
 
     # load the engram weights first, so a wrong path fails before the slow model load
     args.engram_pt = engram_pt_from_config(args)
+    warn_if_other_base(args)
     sd, layer_from_key = load_engram_weights(args.model, args.engram_pt)
     if not sd:
         raise SystemExit("No micro_engram weights found in the checkpoint. Wrong path, or they were not saved.")

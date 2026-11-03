@@ -9,6 +9,7 @@ from transformers import TrainerCallback
 from axolotl.integrations.base import BasePlugin
 
 from .module import MicroEngram, attach_engram
+from .weights import base_fingerprint
 
 LOG = logging.getLogger(__package__)  # keeps the old "[micro_engram...]" logger name
 
@@ -79,6 +80,14 @@ class _ReportTrainableCallback(TrainerCallback):
         if n_eng_train == 0:
             LOG.error("[micro_engram] the engram is FROZEN: check that unfrozen_parameters matches "
                       "layers.<micro_engram_layer>...micro_engram")
+
+
+def _safe_fingerprint(path):
+    try:
+        return base_fingerprint(path) if path and os.path.isdir(path) else None
+    except Exception as e:  # noqa: BLE001  -- never block training over this
+        LOG.warning(f"[micro_engram] could not fingerprint the base weights: {e}")
+        return None
 
 
 def _uses_fsdp(cfg):
@@ -278,6 +287,10 @@ class MicroEngramPlugin(BasePlugin):
             "vocab_size": vocab_size,
             "token_merge": canon is not None,
             "canon_path": cfg.micro_engram_canon_path,
+            # which base weights the engram belongs to (folder-name independent), so loaders
+            # can warn when it is put on a different model
+            "base_model": cfg.base_model,
+            "base_fingerprint": _safe_fingerprint(cfg.base_model),
             "gate": cfg.micro_engram_gate,
         }
 

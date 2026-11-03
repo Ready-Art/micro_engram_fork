@@ -30,7 +30,7 @@ import sys
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from micro_engram.weights import load_engram_weights
+from micro_engram.weights import base_mismatch, load_engram_weights
 
 CONFIG_NAME = "micro_engram_config.json"
 INDEX_NAME = "model.safetensors.index.json"
@@ -99,6 +99,8 @@ def main():
     with open(config_path) as f:
         conf = json.load(f)
 
+    if (msg := base_mismatch(conf, base)):
+        print(f"WARNING: {msg}")
     index = base_weight_map(base)
     weight_map = {k: v for k, v in index["weight_map"].items() if TAG not in k}  # replace any old engram
     prefix = layer_prefix(weight_map, conf.get("layer", 0)) + TAG

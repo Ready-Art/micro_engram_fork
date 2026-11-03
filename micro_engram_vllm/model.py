@@ -17,7 +17,7 @@ from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4ForCausa
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from micro_engram.module import MicroEngram
-from micro_engram.weights import load_engram_weights, resolve_weights_path
+from micro_engram.weights import base_mismatch, load_engram_weights, resolve_weights_path
 
 # Under "vllm." so vLLM's log handler prints it (other logger names are dropped).
 logger = init_logger("vllm.micro_engram")
@@ -88,6 +88,8 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
             return
         self.micro_engram_weights = weights
         self.micro_engram_conf = conf
+        if (msg := base_mismatch(conf, vllm_config.model_config.model)):
+            logger.warning("[micro_engram] %s", msg)
 
         if vllm_config.model_config.architecture != "Gemma4ForCausalLM":
             raise ValueError(

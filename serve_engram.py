@@ -40,7 +40,7 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer, StoppingCriteria,
 
 from micro_engram.module import MicroEngram
 from infer_engram import (EngramRunner, engram_pt_from_config, load_engram_weights, pick,
-                          resolve_settings)
+                          resolve_settings, warn_if_other_base)
 
 S = SimpleNamespace()          # model, tok, runner, name, lock
 LOCK = threading.Lock()
@@ -49,6 +49,7 @@ LOCK = threading.Lock()
 # ----------------------------------------------------------------------------- loading
 def load_everything(args):
     args.engram_pt = engram_pt_from_config(args)
+    warn_if_other_base(args)
     sd, layer_from_key = load_engram_weights(args.model, args.engram_pt)
     if not sd:
         raise SystemExit("No micro_engram weights found in the checkpoint. Wrong path, or they were not saved.")
