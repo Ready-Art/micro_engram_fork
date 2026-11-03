@@ -20,6 +20,8 @@ Notes:
       "chat_template_kwargs": {"enable_thinking": false}
   * Chat replies put the thinking in `reasoning_content` (like vLLM's reasoning parser),
     so frontends show it as a thinking block; `content` is only the answer.
+    With --raw-thinking the markers stay in `content` instead, for frontends that
+    parse <|channel>thought ... <channel|> themselves.
 
 Put this file next to infer_engram.py and the micro_engram package folder.
 """
@@ -229,6 +231,22 @@ def split_reasoning(pieces, specials):
             close()
 
 
+def keep_markers(tagged):
+    """For --raw-thinking: put the thinking back into the reply text, markers included,
+    exactly as the template writes it, for frontends that parse the raw markers."""
+    in_reasoning = False
+    for kind, text in tagged:
+        if kind == "reasoning" and not in_reasoning:
+            yield "content", THINK_START + "\n"
+            in_reasoning = True
+        elif kind == "content" and in_reasoning:
+            yield "content", THINK_END
+            in_reasoning = False
+        yield "content", text
+    if in_reasoning:  # stopped while still thinking (max_tokens or cancel)
+        yield "content", THINK_END
+
+
 def with_stops(pieces, stops, cancel):
     """Cut the stream at the first stop string in the answer (reasoning is never cut).
 
@@ -353,6 +371,8 @@ class Handler(BaseHTTPRequestHandler):
             if chat:  # keep special tokens so the thinking channel can be split off
                 raw = raw_pieces(body, input_ids, engram_on, cancel, max_new, skip_special=False)
                 tagged = split_reasoning(raw, S.tok.all_special_tokens + list(S.tok.get_added_vocab()))
+                if S.raw_thinking:
+                    tagged = keep_markers(tagged)
             else:  # plain completions: raw text, as before
                 raw = raw_pieces(body, input_ids, engram_on, cancel, max_new)
                 tagged = (("content", p) for p in raw)
@@ -435,12 +455,15 @@ def main():
     ap.add_argument("--dim", type=int, default=None)
     ap.add_argument("--heads", type=int, default=None)
     ap.add_argument("--gate", choices=MicroEngram.GATES, default=None)
+    ap.add_argument("--raw-thinking", action="store_true",
+                    help="keep <|channel>thought ... <channel|> in the reply text instead of reasoning_content")
     ap.add_argument("--no-thinking", action="store_true",
                     help="default to enable_thinking=false (requests can still override via chat_template_kwargs)")
     args = ap.parse_args()
 
     # Same defaults as training (chat_template_kwargs in the Axolotl YAML).
     S.template_kwargs = {"enable_thinking": not args.no_thinking, "preserve_thinking": True}
+    S.raw_thinking = args.raw_thinking
     S.name = args.name or os.path.basename(os.path.normpath(args.model))
     load_everything(args)
 
