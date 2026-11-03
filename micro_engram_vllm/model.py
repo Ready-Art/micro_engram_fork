@@ -18,7 +18,8 @@ from vllm.model_executor.models.utils import PPMissingLayer
 
 from micro_engram.module import MicroEngram
 
-logger = init_logger(__name__)
+# Under "vllm." so vLLM's log handler prints it (other logger names are dropped).
+logger = init_logger("vllm.micro_engram")
 
 CONFIG_NAME = "micro_engram_config.json"
 _WRAP = "._checkpoint_wrapped_module."  # can appear in keys saved with checkpointing
