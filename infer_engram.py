@@ -21,7 +21,6 @@ import os
 import re
 
 import torch
-import torch.nn.functional as F
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -87,6 +86,7 @@ def resolve_settings(args, sd, layer_from_key):
         "table_size": int(t0.shape[0]) if t0 is not None else None,
         "engram_dim": int(t0.shape[1]) if t0 is not None else None,
         "num_heads": (n_tables // len(orders)) if n_tables else None,
+        "gate": "ple" if "up.weight" in sd else ("scalar" if "value.weight" in sd else None),
     }
 
     settings = {
@@ -99,6 +99,8 @@ def resolve_settings(args, sd, layer_from_key):
         "model_dim": conf.get("model_dim"),
         "token_merge": conf.get("token_merge"),
         "canon_path": conf.get("canon_path"),
+        # configs from before the gate option have no "gate": those runs were scalar
+        "gate": pick(args.gate, conf.get("gate"), from_shapes["gate"], "scalar"),
     }
 
     if source:
@@ -161,12 +163,7 @@ class EngramRunner:
         # hash the FULL history, then keep only the positions we are computing right now
         idx = eng.hash_ids(self.hist.to(hidden.device))
         idx = [i[:, -T:] for i in idx]
-        mem = torch.cat([tab(i) for tab, i in zip(eng.tables, idx)], dim=-1)
-        d = hidden.shape[-1]
-        h = F.rms_norm(hidden.float(), (d,))
-        k = F.rms_norm(eng.key(mem).float(), (d,))
-        alpha = torch.sigmoid((h * k).sum(-1, keepdim=True) / d ** 0.5)
-        return hidden + (alpha * eng.value(mem).float()).to(hidden.dtype)
+        return eng.inject(hidden, idx)  # same gate code as training
 
 
 def main():
@@ -186,6 +183,7 @@ def main():
     ap.add_argument("--table-size", type=int, default=None)
     ap.add_argument("--dim", type=int, default=None)
     ap.add_argument("--heads", type=int, default=None)
+    ap.add_argument("--gate", choices=MicroEngram.GATES, default=None)
     args = ap.parse_args()
 
     # load the engram weights first, so a wrong path fails before the slow model load
@@ -228,6 +226,7 @@ def main():
         pad_id=pick(settings["pad_id"], text_cfg.pad_token_id, 0),
         vocab_size=text_cfg.vocab_size,
         canon=canon,
+        gate=settings["gate"],
     )
     runner = EngramRunner(model, engram, settings["layer"])
 
@@ -235,8 +234,10 @@ def main():
     print(f"[engram] loaded {len(sd)} tensors | missing: {missing} | unexpected: {unexpected}")
     # 'mults' missing is fine: it is rebuilt from the seed. Anything else missing is a problem.
 
-    # Sanity check: the 'value' layer starts at zero, so a trained engram must have a non-zero one.
-    print(f"[engram] value-weight magnitude: {engram.value.weight.float().abs().mean().item():.6f} "
+    # Sanity check: the output layer starts at zero, so a trained engram must have a non-zero one.
+    out_layer = engram.value if engram.gate == "scalar" else engram.up
+    print(f"[engram] output-weight magnitude ({engram.gate} gate): "
+          f"{out_layer.weight.float().abs().mean().item():.6f} "
           f"(0.000000 would mean it never trained or did not load)")
 
     runner.enabled = not args.no_engram

@@ -216,7 +216,9 @@ class MicroEngramPlugin(BasePlugin):
             pad_id=text_cfg.pad_token_id or 0,
             vocab_size=vocab_size,
             canon=canon,
+            gate=cfg.micro_engram_gate,
         )
+        LOG.warning(f"[micro_engram] gate: {cfg.micro_engram_gate}")
         where, _ = attach_engram(model, self.engram, cfg.micro_engram_layer)
 
         self.conf = {
@@ -230,6 +232,7 @@ class MicroEngramPlugin(BasePlugin):
             "vocab_size": vocab_size,
             "token_merge": canon is not None,
             "canon_path": cfg.micro_engram_canon_path,
+            "gate": cfg.micro_engram_gate,
         }
 
         model._register_load_state_dict_pre_hook(_strip_wrapper_prefix)

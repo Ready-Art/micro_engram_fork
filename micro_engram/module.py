@@ -15,12 +15,23 @@ class MicroEngram(nn.Module):
     Token merging: `canon` maps every token id to a canonical id (e.g. case variants
     share one), applied before hashing. It is a buffer, so it is saved in checkpoints.
     canon=None means identity (no merging).
+
+    Gate modes:
+      "scalar" (paper): one sigmoid per token, from rms(h) . rms(W_K e); injects alpha * W_V e.
+      "ple" (Gemma 3n per-layer-embedding style): a per-dimension gate from the hidden
+            state, g = gelu(W_down rms(h)), injects W_up (g * e). Each head's slice of e
+            gets its own slice of the gate.
     """
+
+    GATES = ("scalar", "ple")
 
     def __init__(self, model_dim, table_size=65_536, engram_dim=128,
                  num_heads=4, orders=(2, 3), pad_id=0, seed=0,
-                 vocab_size=262_144, canon=None):
+                 vocab_size=262_144, canon=None, gate="scalar"):
         super().__init__()
+        if gate not in self.GATES:
+            raise ValueError(f"gate must be one of {self.GATES}, got {gate!r}")
+        self.gate = gate
         self.orders = tuple(orders)
         self.table_size = table_size
         self.pad_id = pad_id
@@ -32,9 +43,14 @@ class MicroEngram(nn.Module):
             nn.init.normal_(t.weight, std=0.02)
 
         mem_dim = engram_dim * n_tables
-        self.key = nn.Linear(mem_dim, model_dim, bias=False)    # used only by the gate
-        self.value = nn.Linear(mem_dim, model_dim, bias=False)  # what gets injected
-        nn.init.zeros_(self.value.weight)  # step 0: exact no-op
+        if gate == "scalar":
+            self.key = nn.Linear(mem_dim, model_dim, bias=False)    # used only by the gate
+            self.value = nn.Linear(mem_dim, model_dim, bias=False)  # what gets injected
+            nn.init.zeros_(self.value.weight)  # step 0: exact no-op
+        else:
+            self.down = nn.Linear(model_dim, mem_dim, bias=False)   # hidden -> per-dim gate
+            self.up = nn.Linear(mem_dim, model_dim, bias=False)     # gated memory -> hidden
+            nn.init.zeros_(self.up.weight)  # step 0: exact no-op
 
         # Deterministic from `seed`, so it can be rebuilt if a checkpoint drops buffers.
         g = torch.Generator().manual_seed(seed)
@@ -73,14 +89,24 @@ class MicroEngram(nn.Module):
             out.append((x % _PRIME) % self.table_size)
         return out
 
-    def forward(self, hidden, input_ids, position_ids=None):
-        idx = self.hash_ids(input_ids.to(hidden.device), position_ids)
+    def inject(self, hidden, idx):
+        """Look up the hashed rows `idx` and add the gated memory to `hidden`."""
         mem = torch.cat([tab(i) for tab, i in zip(self.tables, idx)], dim=-1)
         d = hidden.shape[-1]
         h = F.rms_norm(hidden.float(), (d,))
-        k = F.rms_norm(self.key(mem).float(), (d,))
-        alpha = torch.sigmoid((h * k).sum(-1, keepdim=True) / d ** 0.5)
-        return hidden + (alpha * self.value(mem).float()).to(hidden.dtype)
+        if self.gate == "scalar":
+            k = F.rms_norm(self.key(mem).float(), (d,))
+            alpha = torch.sigmoid((h * k).sum(-1, keepdim=True) / d ** 0.5)
+            out = alpha * self.value(mem).float()
+        else:
+            # Normalising h keeps the gate well-scaled (Gemma's residual stream is large).
+            g = F.gelu(self.down(h.to(self.down.weight.dtype)), approximate="tanh")
+            out = self.up(g * mem).float()
+        return hidden + out.to(hidden.dtype)
+
+    def forward(self, hidden, input_ids, position_ids=None):
+        idx = self.hash_ids(input_ids.to(hidden.device), position_ids)
+        return self.inject(hidden, idx)
 
 
 def find_text_layers(model):

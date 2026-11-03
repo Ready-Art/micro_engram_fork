@@ -53,8 +53,18 @@ plugins:
 | `micro_engram_heads` | `4` | Hash tables per n-gram order (orders 2 and 3 give `2 × heads` tables in total) |
 | `micro_engram_save_steps` | `250` | Non-FSDP only: also save `micro_engram-step{N}.pt` every N steps (`0` = save only at the end) |
 | `micro_engram_canon_path` | `null` | Token-merge map from `build_canon.py`. `null` turns merging off |
+| `micro_engram_gate` | `scalar` | How the memory is mixed in: `scalar` (the paper's sigmoid gate) or `ple` (a Gemma 3n PLE-style per-dimension gate). See below |
 
 The engram has `2 × heads × table_size × dim` table parameters plus two `(2·heads·dim) × hidden_size` projections. With the settings below on Gemma 4 31B, that is about 268M table parameters and 11M projection parameters.
+
+#### Gate modes
+
+Both modes use the same tables and the same number of parameters, and both start as an exact no-op.
+
+- **`scalar`** (default, as in the Engram paper): one gate value per token, `α = sigmoid(rms(h)·rms(W_K·e)/√d)`, then `h += α · W_V·e`. The memory is let in or held back as a whole.
+- **`ple`** (Gemma 3n per-layer-embedding style): a gate per dimension, computed from the hidden state: `g = gelu(W_down·rms(h))`, then `h += W_up·(g ⊙ e)`. The context chooses *which features* of the memory to use, and each hash head's slice gets its own slice of the gate.
+
+The gate mode is saved in `micro_engram_config.json`, and `infer_engram.py` picks it up automatically. Checkpoints from before this option are `scalar`.
 
 ### 3. Make it trainable
 
@@ -175,6 +185,7 @@ Engram settings are resolved in this order: explicit flag (`--layer`, `--table-s
 Run them from the repo root:
 
 ```bash
+python test_gate.py                           # both gate modes: no-op start, gradients, bf16, checkpoint names
 python test_canon.py                          # token-merge hashing and state-dict compatibility
 python test_resume_keys.py                    # checkpoint-wrapper key renaming on resume
 ```
