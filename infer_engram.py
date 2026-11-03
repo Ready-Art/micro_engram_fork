@@ -178,7 +178,7 @@ def main():
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--raw", action="store_true", help="skip the chat template, feed the prompt as plain text")
     ap.add_argument("--no-engram", action="store_true", help="turn the engram off to compare outputs")
-    ap.add_argument("--max-new-tokens", type=int, default=200)
+    ap.add_argument("--max-new-tokens", type=int, default=2000)
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-p", type=float, default=0.95)
     # optional overrides; normally found automatically
