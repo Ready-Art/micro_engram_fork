@@ -54,7 +54,10 @@ class MicroEngram(nn.Module):
 
         # Deterministic from `seed`, so it can be rebuilt if a checkpoint drops buffers.
         g = torch.Generator().manual_seed(seed)
-        mults = torch.randint(1, _PRIME, (n_tables, max(self.orders)), generator=g) | 1
+        # device="cpu": the generator is a CPU one, and servers (vLLM) build models with
+        # CUDA as the default device. Same values either way; .to() moves it later.
+        mults = torch.randint(1, _PRIME, (n_tables, max(self.orders)), generator=g,
+                              device="cpu") | 1
         self.register_buffer("mults", mults)
 
         if canon is None:
@@ -86,6 +89,27 @@ class MicroEngram(nn.Module):
             x = shifted[0] * mults[k, 0]
             for i in range(1, n):
                 x = x + shifted[i] * mults[k, i]  # < 2^51, safe in int64
+            out.append((x % _PRIME) % self.table_size)
+        return out
+
+    def hash_prev(self, ids):
+        """Same hashes as `hash_ids`, from a flat list of tokens with their predecessors.
+
+        `ids` is [N, max order]: column 0 holds the token at t, column i the token at
+        t - i, and -1 where there is none (before the start of the document). Used by
+        servers (vLLM) that see flattened batches instead of whole sequences.
+        """
+        ids = ids.long()
+        canon = self.canon.to(ids.device)
+        merged = canon[ids.clamp(0, canon.numel() - 1)]  # token merging
+        # missing tokens get the raw pad id, exactly like the padding in hash_ids
+        merged = torch.where(ids >= 0, merged, torch.full_like(merged, self.pad_id))
+        mults = self.mults.to(ids.device)
+        out = []
+        for k, n in enumerate(self._table_orders):
+            x = merged[:, 0] * mults[k, 0]
+            for i in range(1, n):
+                x = x + merged[:, i] * mults[k, i]
             out.append((x % _PRIME) % self.table_size)
         return out
 

@@ -176,7 +176,31 @@ python infer_engram.py --model /path/to/base_model --engram-pt micro_engram.pt \
 
 Engram settings are resolved in this order: explicit flag (`--layer`, `--table-size`, `--dim`, `--heads`), then `micro_engram_config.json`, then the shapes of the saved tensors, then the defaults.
 
-> The engram is not part of the Hugging Face model class. Plain `transformers` / vLLM / llama.cpp loading will **ignore** it. Use `infer_engram.py` (or its `MicroEngram` + `find_text_layers` code) to attach it.
+> The engram is not part of the Hugging Face model class. Plain `transformers` and llama.cpp loading will **ignore** it. Use `infer_engram.py` / `serve_engram.py`, or vLLM with the plugin below.
+
+### Serving with vLLM
+
+`micro_engram_vllm` is a vLLM plugin (no vLLM fork). Installing this package registers it automatically; it replaces vLLM's text-only Gemma 4 class with one that runs the engram at its layer. Models without a `micro_engram_config.json` keep running as plain Gemma 4.
+
+Install the package **in the vLLM environment** (Axolotl is not needed there):
+
+```bash
+pip install -e /path/to/micro_engram
+```
+
+Serve the **merged** model folder, with `micro_engram_config.json` copied into it:
+
+```bash
+vllm serve /path/to/merged_model --tensor-parallel-size 4 \
+    --hf-overrides '{"architectures": ["Gemma4ForCausalLM"]}' \
+    --reasoning-parser gemma4        # optional: thinking in reasoning_content
+```
+
+- **`--hf-overrides` is required.** The plugin runs on the text-only architecture; without it, vLLM starts the multimodal one and the plugin stops with an error.
+- **Model Runner V2 is required.** It is vLLM's default; the plugin stops with an error if something forces the old runner.
+- **A/B test:** start with `MICRO_ENGRAM_OFF=1` to load the same weights with the engram switched off.
+- **vLLM version:** the plugin uses internal vLLM APIs and was written against commit `64175d3827`. Other versions may need changes.
+- The startup log shows `[micro_engram] attached at layer ...` when the engram is active.
 
 ---
 
@@ -188,6 +212,7 @@ Run them from the repo root:
 python test_gate.py                           # both gate modes: no-op start, gradients, bf16, checkpoint names
 python test_canon.py                          # token-merge hashing and state-dict compatibility
 python test_resume_keys.py                    # checkpoint-wrapper key renaming on resume
+python test_vllm_ids.py                       # vLLM path: previous tokens per batch type, same output as training
 ```
 
 ---

@@ -1,0 +1,263 @@
+import dataclasses
+import json
+import logging
+import os
+
+import torch
+from transformers import TrainerCallback
+
+from axolotl.integrations.base import BasePlugin
+
+from .module import MicroEngram, attach_engram
+
+LOG = logging.getLogger(__package__)  # keeps the old "[micro_engram...]" logger name
+
+_WRAP = "._checkpoint_wrapped_module."
+CONFIG_NAME = "micro_engram_config.json"
+
+
+def save_engram(engram, out_dir, fname="micro_engram.pt"):
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, fname)
+    torch.save(engram.state_dict(), path)
+    LOG.info(f"[micro_engram] saved {path}")
+
+
+class _SaveEngramCallback(TrainerCallback):
+    def __init__(self, engram, every):
+        self.engram, self.every = engram, every
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.every and state.global_step % self.every == 0 and state.is_world_process_zero:
+            save_engram(self.engram, args.output_dir, f"micro_engram-step{state.global_step}.pt")
+
+
+class _WriteConfigCallback(TrainerCallback):
+    """Writes the engram settings next to the output and next to every checkpoint."""
+
+    def __init__(self, conf):
+        self.conf = conf
+
+    def _write(self, folder):
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, CONFIG_NAME)
+        with open(path, "w") as f:
+            json.dump(self.conf, f, indent=2)
+        LOG.info(f"[micro_engram] wrote {path}")
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            self._write(args.output_dir)
+
+    def on_save(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            self._write(os.path.join(args.output_dir, f"checkpoint-{state.global_step}"))
+
+
+class _ReportTrainableCallback(TrainerCallback):
+    """Logs the real trainable count at train start, after Axolotl has applied its freezing."""
+
+    def __init__(self, engram):
+        self.engram = engram
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if not state.is_world_process_zero or model is None:
+            return
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_eng = sum(p.numel() for p in self.engram.parameters())
+        n_eng_train = sum(p.numel() for p in self.engram.parameters() if p.requires_grad)
+        LOG.warning(f"[micro_engram] at train start: {n_train / 1e6:.1f}M trainable in total, "
+                    f"engram {n_eng_train / 1e6:.1f}M of {n_eng / 1e6:.1f}M trainable")
+        if n_eng_train == 0:
+            LOG.error("[micro_engram] the engram is FROZEN: check that unfrozen_parameters matches "
+                      "layers.<micro_engram_layer>...micro_engram")
+
+
+def _uses_fsdp(cfg):
+    return bool(cfg.fsdp_config or cfg.fsdp)
+
+
+def _check_canon(canon, vocab_size):
+    """Validate a token-merge map loaded from disk."""
+    if not torch.is_tensor(canon) or canon.dim() != 1 or canon.numel() != vocab_size:
+        raise ValueError(f"[micro_engram] canon file must be a 1-D tensor of length {vocab_size}")
+    canon = canon.long()
+    if int(canon.min()) < 0 or int(canon.max()) >= vocab_size:
+        raise ValueError("[micro_engram] canon file has ids outside the vocabulary")
+    if not torch.equal(canon[canon], canon):
+        raise ValueError("[micro_engram] canon map is not idempotent (a canonical id must map to itself)")
+    return canon
+
+
+def _strip_wrapper_prefix(state_dict, prefix, local_metadata, strict,
+                          missing_keys, unexpected_keys, error_msgs):
+    """(kept from the earlier attempt; harmless) rename wrapper-prefixed engram keys."""
+    for k in list(state_dict.keys()):
+        if "micro_engram" in k and _WRAP in k:
+            state_dict[k.replace(_WRAP, ".")] = state_dict.pop(k)
+
+
+def _is_engram_key(k):
+    return isinstance(k, str) and "micro_engram" in k
+
+
+def _find_param(model, key):
+    """Walk the model by name to the engram tensor, ignoring any wrapper name in the key."""
+    clean = key.replace(_WRAP, ".")
+    parts = clean.split(".")
+    obj = model
+    for p in parts[:-1]:
+        obj = getattr(obj, p)  # the checkpoint wrapper forwards unknown names to the layer inside
+    return getattr(obj, parts[-1])
+
+
+def _patch_accelerate_resume():
+    """On resume, load the engram tensors directly and let PyTorch load everything else.
+
+    PyTorch's own key renaming breaks for the engram (it re-adds the checkpoint-wrapper
+    name), so the engram entries are taken out of the state dict, copied straight into
+    the engram weights, and the rest is loaded non-strictly. Any problem with a
+    non-engram key still raises.
+
+    `mults` is rebuilt from a seed, so it is skipped. `canon` (token merging) comes from
+    the file named in the YAML, so it is not copied but CHECKED against the checkpoint:
+    if they differ, the run would silently train on different hashes, so it raises.
+    """
+    try:
+        from accelerate.utils import fsdp_utils
+    except Exception as e:  # noqa: BLE001
+        LOG.warning(f"[micro_engram] could not import accelerate fsdp_utils, resume patch skipped: {e}")
+        return
+    orig = getattr(fsdp_utils, "_set_model_state_dict", None)
+    if orig is None:
+        LOG.warning("[micro_engram] accelerate has no _set_model_state_dict, resume patch skipped")
+        return
+    if getattr(orig, "_micro_engram_patched", False):
+        return
+
+    def patched(model, state_dict, *args, **kwargs):
+        if not isinstance(state_dict, dict):
+            return orig(model, state_dict, *args, **kwargs)
+        engram_items = {k: v for k, v in state_dict.items() if _is_engram_key(k)}
+        if not engram_items:
+            return orig(model, state_dict, *args, **kwargs)
+        rest = {k: v for k, v in state_dict.items() if not _is_engram_key(k)}
+
+        loaded, expected = 0, 0
+        for k, v in engram_items.items():
+            if not (k.endswith(".mults") or k.endswith(".canon")):
+                expected += 1
+            if k.endswith(".mults"):
+                continue  # integer hash multipliers: rebuilt from the seed, identical every run
+            target = _find_param(model, k)
+            if k.endswith(".canon"):
+                try:
+                    same = torch.equal(v.detach().cpu(), target.detach().cpu())
+                except Exception:  # noqa: BLE001
+                    same = True  # could not compare (unusual tensor type): do not block the resume
+                if not same:
+                    raise RuntimeError("[micro_engram] resume: the token-merge map in the checkpoint differs "
+                                       "from micro_engram_canon_path in the YAML. Use the same canon file.")
+                continue
+            with torch.no_grad():
+                target.copy_(v)
+            loaded += 1
+        example = next(iter(engram_items))
+        LOG.warning(f"[micro_engram] resume: copied {loaded} engram tensors directly "
+                    f"(expected {expected}; example checkpoint key: {example})")
+
+        opts = kwargs.get("sd_options")
+        if opts is not None:
+            kwargs["sd_options"] = dataclasses.replace(opts, strict=False)
+        result = orig(model, rest, *args, **kwargs)
+
+        if result is not None:
+            problems = [k for k in list(getattr(result, "missing_keys", []) or [])
+                        + list(getattr(result, "unexpected_keys", []) or [])
+                        if "micro_engram" not in k]
+            if problems:
+                raise RuntimeError(f"[micro_engram] resume: non-engram keys did not match: {problems[:10]}")
+        return result
+
+    patched._micro_engram_patched = True
+    fsdp_utils._set_model_state_dict = patched
+    LOG.warning("[micro_engram] resume patch installed")
+
+
+class MicroEngramPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.engram = None
+        self.conf = None
+
+    def get_input_args(self):
+        # Relative to this package, so it resolves however the package was imported
+        # (pip-installed `micro_engram`, or the repo folder as `micro_engram.micro_engram`).
+        return f"{__package__}.args.MicroEngramArgs"
+
+    def post_model_load(self, cfg, model):
+        text_cfg = getattr(model.config, "text_config", model.config)
+        vocab_size = text_cfg.vocab_size
+
+        canon = None
+        if cfg.micro_engram_canon_path:
+            canon = _check_canon(torch.load(cfg.micro_engram_canon_path, map_location="cpu"), vocab_size)
+            classes = int(torch.unique(canon).numel())
+            LOG.warning(f"[micro_engram] token merging ON: {canon.numel():,} ids -> {classes:,} classes "
+                        f"({cfg.micro_engram_canon_path})")
+        else:
+            LOG.warning("[micro_engram] token merging OFF (no micro_engram_canon_path)")
+
+        self.engram = MicroEngram(
+            model_dim=text_cfg.hidden_size,  # 5376 for Gemma 4 31B
+            table_size=cfg.micro_engram_table_size,
+            engram_dim=cfg.micro_engram_dim,
+            num_heads=cfg.micro_engram_heads,
+            pad_id=text_cfg.pad_token_id or 0,
+            vocab_size=vocab_size,
+            canon=canon,
+            gate=cfg.micro_engram_gate,
+        )
+        LOG.warning(f"[micro_engram] gate: {cfg.micro_engram_gate}")
+        where, _ = attach_engram(model, self.engram, cfg.micro_engram_layer)
+
+        self.conf = {
+            "layer": cfg.micro_engram_layer,
+            "table_size": cfg.micro_engram_table_size,
+            "engram_dim": cfg.micro_engram_dim,
+            "num_heads": cfg.micro_engram_heads,
+            "orders": list(self.engram.orders),
+            "model_dim": text_cfg.hidden_size,
+            "pad_id": text_cfg.pad_token_id or 0,
+            "vocab_size": vocab_size,
+            "token_merge": canon is not None,
+            "canon_path": cfg.micro_engram_canon_path,
+            "gate": cfg.micro_engram_gate,
+        }
+
+        model._register_load_state_dict_pre_hook(_strip_wrapper_prefix)
+        _patch_accelerate_resume()
+
+        # If unfrozen_parameters / an adapter controls freezing, leave it to Axolotl
+        # (add the engram to unfrozen_parameters). Otherwise freeze Gemma here.
+        if not cfg.unfrozen_parameters and not cfg.adapter:
+            for p in model.parameters():
+                p.requires_grad_(False)
+            for p in self.engram.parameters():
+                p.requires_grad_(True)
+
+        n_eng = sum(p.numel() for p in self.engram.parameters())
+        LOG.warning(f"[micro_engram] attached at {where}: {n_eng / 1e6:.1f}M engram params "
+                    f"(trainable count is logged at train start, after Axolotl's freezing)")
+
+    def add_callbacks_post_trainer(self, cfg, trainer):
+        callbacks = [_WriteConfigCallback(self.conf), _ReportTrainableCallback(self.engram)]
+        if not _uses_fsdp(cfg):  # under FSDP the checkpoint already contains the engram
+            callbacks.append(_SaveEngramCallback(self.engram, cfg.micro_engram_save_steps))
+        return callbacks
+
+    def post_train(self, cfg, model):
+        if _uses_fsdp(cfg):
+            LOG.info("[micro_engram] FSDP run: merge the checkpoint, then run extract_engram.py")
+            return
+        save_engram(self.engram, cfg.output_dir)
