@@ -25,6 +25,8 @@ from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from micro_engram.module import MicroEngram, find_text_layers
+from micro_engram.weights import load_engram_weights as load_engram_file
+from micro_engram.weights import resolve_weights_path
 
 CONFIG_NAME = "micro_engram_config.json"
 _LAYER_RE = re.compile(r"layers\.(\d+)\.micro_engram\.")
@@ -32,8 +34,8 @@ _LAYER_RE = re.compile(r"layers\.(\d+)\.micro_engram\.")
 
 def load_engram_weights(model_path, engram_pt):
     """Returns (state dict with the key prefix stripped, layer index seen in key names or None)."""
-    if engram_pt:
-        return torch.load(engram_pt, map_location="cpu"), None
+    if engram_pt:  # .pt, .safetensors, a safetensors folder or a DCP checkpoint folder
+        return load_engram_file(engram_pt), None
 
     sd, layer = {}, None
 
@@ -57,6 +59,14 @@ def load_engram_weights(model_path, engram_pt):
                 if "micro_engram." in key:
                     take(key, val)
     return sd, layer
+
+
+def engram_pt_from_config(args):
+    """--engram-config with a "weights" field works like --engram-pt (unless one is given)."""
+    if args.engram_pt or not args.engram_config:
+        return args.engram_pt
+    with open(args.engram_config) as f:
+        return resolve_weights_path(json.load(f), args.engram_config)
 
 
 def pick(*values):
@@ -172,7 +182,7 @@ class EngramRunner:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="merged model dir (or base model dir if using --engram-pt)")
-    ap.add_argument("--engram-pt", default=None, help="optional separate micro_engram.pt file")
+    ap.add_argument("--engram-pt", default=None, help="separate engram: .pt, .safetensors, a safetensors folder or a DCP checkpoint folder")
     ap.add_argument("--engram-config", default=None,
                     help=f"path to {CONFIG_NAME} (default: looked up inside --model)")
     ap.add_argument("--prompt", required=True)
@@ -190,6 +200,7 @@ def main():
     args = ap.parse_args()
 
     # load the engram weights first, so a wrong path fails before the slow model load
+    args.engram_pt = engram_pt_from_config(args)
     sd, layer_from_key = load_engram_weights(args.model, args.engram_pt)
     if not sd:
         raise SystemExit("No micro_engram weights found in the checkpoint. Wrong path, or they were not saved.")

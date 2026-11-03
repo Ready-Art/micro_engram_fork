@@ -39,7 +39,8 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer, StoppingCriteria,
                           StoppingCriteriaList, TextIteratorStreamer)
 
 from micro_engram.module import MicroEngram
-from infer_engram import EngramRunner, load_engram_weights, pick, resolve_settings
+from infer_engram import (EngramRunner, engram_pt_from_config, load_engram_weights, pick,
+                          resolve_settings)
 
 S = SimpleNamespace()          # model, tok, runner, name, lock
 LOCK = threading.Lock()
@@ -47,6 +48,7 @@ LOCK = threading.Lock()
 
 # ----------------------------------------------------------------------------- loading
 def load_everything(args):
+    args.engram_pt = engram_pt_from_config(args)
     sd, layer_from_key = load_engram_weights(args.model, args.engram_pt)
     if not sd:
         raise SystemExit("No micro_engram weights found in the checkpoint. Wrong path, or they were not saved.")
@@ -462,7 +464,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="merged model dir (or base model dir if using --engram-pt)")
-    ap.add_argument("--engram-pt", default=None, help="optional separate micro_engram.pt file")
+    ap.add_argument("--engram-pt", default=None, help="separate engram: .pt, .safetensors, a safetensors folder or a DCP checkpoint folder")
     ap.add_argument("--engram-config", default=None, help="path to micro_engram_config.json")
     ap.add_argument("--name", default=None, help="model name shown to the frontend")
     ap.add_argument("--host", default="127.0.0.1")

@@ -17,6 +17,7 @@ from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4ForCausa
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from micro_engram.module import MicroEngram
+from micro_engram.weights import load_engram_weights, resolve_weights_path
 
 # Under "vllm." so vLLM's log handler prints it (other logger names are dropped).
 logger = init_logger("vllm.micro_engram")
@@ -39,23 +40,54 @@ class EngramGemma4DecoderLayer(Gemma4DecoderLayer):
         return self.micro_engram.inject(hidden_states, idx), residual
 
 
-def _load_engram_config(model_path: str) -> dict | None:
-    path = os.path.join(model_path, CONFIG_NAME)
-    if not os.path.isfile(path):
-        return None
-    with open(path) as f:
-        return json.load(f)
+def _resolve_engram(vllm_config: VllmConfig):
+    """Which engram to load: (config, path to separate weights or None) or (None, None).
+
+    1. --additional-config '{"micro_engram": "<micro_engram_config.json or its folder>"}'
+       (or the MICRO_ENGRAM_CONFIG environment variable): the weights come from the
+       file the config's "weights" field points to; the base model is left untouched.
+    2. A micro_engram_config.json next to the model weights (an assembled folder):
+       the weights come from the checkpoint itself.
+    3. Neither: plain Gemma 4.
+    """
+    extra = vllm_config.additional_config
+    chosen = (extra.get("micro_engram") if isinstance(extra, dict) else None) or os.environ.get(
+        "MICRO_ENGRAM_CONFIG"
+    )
+    if chosen:
+        path = os.path.join(chosen, CONFIG_NAME) if os.path.isdir(chosen) else chosen
+        if not os.path.isfile(path):
+            raise ValueError(f"[micro_engram] engram config not found: {path}")
+        with open(path) as f:
+            conf = json.load(f)
+        weights = resolve_weights_path(conf, path)
+        if weights is None or not os.path.exists(weights):
+            raise ValueError(
+                f"[micro_engram] {path} must say where the engram is: add \"weights\": "
+                f"\"<file or folder, relative to the config>\" (found: {weights})"
+            )
+        return conf, weights
+
+    path = os.path.join(vllm_config.model_config.model, CONFIG_NAME)
+    if os.path.isfile(path):
+        with open(path) as f:
+            return json.load(f), None
+    return None, None
 
 
 class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.micro_engram_layer = None
+        self.micro_engram_weights = None  # separate engram file, or None: it is in the checkpoint
+        self.micro_engram_conf = None
 
-        conf = _load_engram_config(vllm_config.model_config.model)
+        conf, weights = _resolve_engram(vllm_config)
         if conf is None:
-            logger.info("[micro_engram] no %s next to the weights: plain Gemma 4", CONFIG_NAME)
+            logger.info("[micro_engram] no engram configured: plain Gemma 4")
             return
+        self.micro_engram_weights = weights
+        self.micro_engram_conf = conf
 
         if vllm_config.model_config.architecture != "Gemma4ForCausalLM":
             raise ValueError(
@@ -101,10 +133,11 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
         layer.__class__ = EngramGemma4DecoderLayer
         self.micro_engram_layer = layer
         logger.info(
-            "[micro_engram] attached at layer %d: %s gate, %d tables x %d rows x %d dims%s",
+            "[micro_engram] attached at layer %d: %s gate, %d tables x %d rows x %d dims%s, from %s",
             layer_idx, engram.gate, len(engram.tables), engram.table_size,
             engram.tables[0].embedding_dim,
             "" if layer.micro_engram_on else " (OFF: MICRO_ENGRAM_OFF=1)",
+            weights or "the model checkpoint",
         )
 
     @property
@@ -118,4 +151,42 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
         return EngramModelState
 
     def load_weights(self, weights):
-        return super().load_weights((name.replace(_WRAP, "."), w) for name, w in weights)
+        weights = ((name.replace(_WRAP, "."), w) for name, w in weights)
+        if self.micro_engram_weights is None or self.micro_engram_layer is None:
+            return super().load_weights(weights)
+
+        # Separate engram: ignore any engram already in the checkpoint, then load the chosen one.
+        skipped = []
+
+        def without_engram():
+            for name, w in weights:
+                if ".micro_engram." in name:
+                    skipped.append(name)
+                else:
+                    yield name, w
+
+        loaded = super().load_weights(without_engram())
+        if skipped:
+            logger.warning("[micro_engram] the checkpoint has its own engram (%d tensors); "
+                           "using %s instead", len(skipped), self.micro_engram_weights)
+        return loaded | self._load_separate_engram()
+
+    def _load_separate_engram(self) -> set[str]:
+        engram = self.micro_engram_layer.micro_engram
+        sd = load_engram_weights(self.micro_engram_weights)
+        if not any(k.startswith("tables.") for k in sd):
+            raise ValueError(f"[micro_engram] no engram weights in {self.micro_engram_weights}")
+        if "canon" not in sd and self.micro_engram_conf.get("token_merge"):
+            canon_path = self.micro_engram_conf.get("canon_path")
+            if not canon_path or not os.path.isfile(canon_path):
+                raise ValueError("[micro_engram] the run used token merging but the weights have no "
+                                 f"'canon' and the canon file is missing ({canon_path})")
+            sd["canon"] = torch.load(canon_path, map_location="cpu")
+        result = engram.load_state_dict(sd, strict=False)  # copies onto the GPU, in its dtype
+        problems = [k for k in result.missing_keys if k != "mults"] + list(result.unexpected_keys)
+        if problems:  # mults is rebuilt from its seed; anything else is a wrong file
+            raise ValueError(f"[micro_engram] {self.micro_engram_weights} does not match the "
+                             f"config: {problems[:10]}")
+        prefix = next(n for n, m in self.named_modules() if m is engram)
+        logger.info("[micro_engram] loaded %d engram tensors from %s", len(sd), self.micro_engram_weights)
+        return {f"{prefix}.{n}" for n, _ in engram.named_parameters()}

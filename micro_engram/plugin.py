@@ -32,18 +32,25 @@ class _SaveEngramCallback(TrainerCallback):
             save_engram(self.engram, args.output_dir, f"micro_engram-step{state.global_step}.pt")
 
 
+def write_config(conf, folder, weights=None):
+    """micro_engram_config.json in `folder`; `weights` (relative to it) says where the
+    engram tensors are, so vLLM / assemble_engram_model.py can load them from the config."""
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, CONFIG_NAME)
+    with open(path, "w") as f:
+        json.dump({**conf, "weights": weights} if weights else conf, f, indent=2)
+    LOG.info(f"[micro_engram] wrote {path}")
+
+
 class _WriteConfigCallback(TrainerCallback):
     """Writes the engram settings next to the output and next to every checkpoint."""
 
-    def __init__(self, conf):
+    def __init__(self, conf, checkpoint_weights=None):
         self.conf = conf
+        self.checkpoint_weights = checkpoint_weights  # e.g. the FSDP checkpoint folder
 
-    def _write(self, folder):
-        os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, CONFIG_NAME)
-        with open(path, "w") as f:
-            json.dump(self.conf, f, indent=2)
-        LOG.info(f"[micro_engram] wrote {path}")
+    def _write(self, folder, weights=None):
+        write_config(self.conf, folder, weights)
 
     def on_train_begin(self, args, state, control, **kwargs):
         if state.is_world_process_zero:
@@ -51,7 +58,8 @@ class _WriteConfigCallback(TrainerCallback):
 
     def on_save(self, args, state, control, **kwargs):
         if state.is_world_process_zero:
-            self._write(os.path.join(args.output_dir, f"checkpoint-{state.global_step}"))
+            self._write(os.path.join(args.output_dir, f"checkpoint-{state.global_step}"),
+                        self.checkpoint_weights)
 
 
 class _ReportTrainableCallback(TrainerCallback):
@@ -296,13 +304,17 @@ class MicroEngramPlugin(BasePlugin):
                     f"(trainable count is logged at train start, after Axolotl's freezing)")
 
     def add_callbacks_post_trainer(self, cfg, trainer):
-        callbacks = [_WriteConfigCallback(self.conf), _ReportTrainableCallback(self.engram)]
+        # FSDP checkpoints hold the engram in their DCP folder (Accelerate's name for model 0)
+        ckpt_weights = "pytorch_model_fsdp_0" if _uses_fsdp(cfg) else None
+        callbacks = [_WriteConfigCallback(self.conf, ckpt_weights), _ReportTrainableCallback(self.engram)]
         if not _uses_fsdp(cfg):  # under FSDP the checkpoint already contains the engram
             callbacks.append(_SaveEngramCallback(self.engram, cfg.micro_engram_save_steps))
         return callbacks
 
     def post_train(self, cfg, model):
         if _uses_fsdp(cfg):
-            LOG.info("[micro_engram] FSDP run: merge the checkpoint, then run extract_engram.py")
+            LOG.info("[micro_engram] FSDP run: each checkpoint's micro_engram_config.json points to its "
+                     "engram; load it in vLLM with --additional-config, or use assemble_engram_model.py")
             return
         save_engram(self.engram, cfg.output_dir)
+        write_config(self.conf, cfg.output_dir, "micro_engram.pt")

@@ -214,6 +214,22 @@ vllm serve /path/to/merged_model --tensor-parallel-size 4 \
 - **vLLM version:** the plugin uses internal vLLM APIs and was written against commit `64175d3827`. Other versions may need changes.
 - The startup log shows `[micro_engram] attached at layer ...` when the engram is active.
 
+#### Choosing the engram at launch
+
+The engram doesn't have to live in the model folder. Serve the **plain base model** and pick an engram at launch, like a LoRA adapter:
+
+```bash
+vllm serve /path/to/base_model --tensor-parallel-size 4 \
+    --hf-overrides '{"architectures": ["Gemma4ForCausalLM"]}' \
+    --additional-config '{"micro_engram": "/path/to/run/checkpoint-400/micro_engram_config.json"}'
+```
+
+- `micro_engram` is a `micro_engram_config.json`, or the folder that holds it. Its `"weights"` field says where the engram is, relative to the config file: a DCP checkpoint folder (only the engram is read from it, even from a full checkpoint), a `.safetensors` file or folder, or a `.pt`.
+- Training writes `"weights"` for you: FSDP checkpoints point to their `pytorch_model_fsdp_0`, a non-FSDP run's final config points to `micro_engram.pt`. For other files, add it by hand, e.g. `"weights": "my_engram.pt"`.
+- Without `--additional-config` (or the `MICRO_ENGRAM_CONFIG` environment variable) the plugin uses a `micro_engram_config.json` next to the model weights (an assembled folder), and otherwise serves plain Gemma 4. A chosen engram replaces any engram already in the model folder.
+- The engram must have been trained on this exact base model.
+- `infer_engram.py` / `serve_engram.py` do the same with `--engram-config path/to/micro_engram_config.json`. Their `--engram-pt` accepts every format above.
+
 ---
 
 ## Tests (CPU only)

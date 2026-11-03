@@ -26,62 +26,16 @@ import os
 import re
 import shutil
 import sys
-import tempfile
 
-import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+
+from micro_engram.weights import load_engram_weights
 
 CONFIG_NAME = "micro_engram_config.json"
 INDEX_NAME = "model.safetensors.index.json"
 ENGRAM_FILE = "micro_engram.safetensors"
 TAG = "micro_engram."
-
-
-def flatten(d, prefix=""):
-    """{"model": {"a.b": t}} -> {"model.a.b": t} (DCP checkpoints come back nested)."""
-    out = {}
-    for k, v in d.items():
-        key = f"{prefix}{k}"
-        if isinstance(v, dict):
-            out.update(flatten(v, key + "."))
-        else:
-            out[key] = v
-    return out
-
-
-def local_names(sd):
-    """Keep the engram tensors, named relative to the engram (tables.0.weight, canon, ...)."""
-    out = {}
-    for k, v in sd.items():
-        if not torch.is_tensor(v):
-            continue
-        if f".{TAG}" in k:
-            out[k.split(f".{TAG}", 1)[1]] = v
-        elif k.startswith(TAG):
-            out[k[len(TAG):]] = v
-        elif not any(c in k for c in (".layers.", "embed", "lm_head")):
-            out[k] = v  # already local (micro_engram.pt)
-    return out
-
-
-def load_engram(path):
-    if os.path.isfile(path):
-        return local_names(flatten(torch.load(path, map_location="cpu", weights_only=True)))
-    if os.path.isfile(os.path.join(path, ".metadata")):  # DCP checkpoint folder
-        from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
-
-        with tempfile.TemporaryDirectory() as tmp:
-            out = os.path.join(tmp, "full.pt")
-            dcp_to_torch_save(path, out)
-            return local_names(flatten(torch.load(out, map_location="cpu", weights_only=True)))
-    sd = {}
-    for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
-        with safe_open(f, framework="pt", device="cpu") as fh:
-            for k in fh.keys():
-                if TAG in k:
-                    sd[k] = fh.get_tensor(k)
-    return local_names(sd)
 
 
 def find_config(args):
@@ -138,7 +92,7 @@ def main():
     if os.path.exists(out) and os.listdir(out) and not args.force:
         sys.exit(f"{out} is not empty (use --force to write into it)")
 
-    sd = load_engram(args.engram)
+    sd = load_engram_weights(args.engram)
     if not any(k.startswith("tables.") for k in sd):
         sys.exit(f"no micro_engram weights found in {args.engram}")
     config_path = find_config(args)
@@ -169,7 +123,9 @@ def main():
     meta["total_size"] = int(meta.get("total_size", 0)) + sum(v.numel() * v.element_size() for v in engram.values())
     with open(os.path.join(out, INDEX_NAME), "w") as f:
         json.dump({"metadata": meta, "weight_map": dict(sorted(weight_map.items()))}, f, indent=2)
-    shutil.copy2(config_path, os.path.join(out, CONFIG_NAME))
+    # the engram is now inside this folder, so the config must not point elsewhere
+    with open(os.path.join(out, CONFIG_NAME), "w") as f:
+        json.dump({k: v for k, v in conf.items() if k != "weights"}, f, indent=2)
 
     size = sum(v.numel() * v.element_size() for v in engram.values()) / 2**30
     print(f"engram: {len(engram)} tensors, {size:.2f} GiB, keys like {next(iter(engram))}")
