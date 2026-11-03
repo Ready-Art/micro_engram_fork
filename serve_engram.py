@@ -72,11 +72,14 @@ def load_everything(args):
         pad_id=pick(settings["pad_id"], text_cfg.pad_token_id, 0),
         vocab_size=text_cfg.vocab_size,
         canon=canon,
+        gate=settings["gate"],
     )
     runner = EngramRunner(model, engram, settings["layer"])
     missing, unexpected = engram.load_state_dict(sd, strict=False)
     print(f"[engram] loaded {len(sd)} tensors | missing: {missing} | unexpected: {unexpected}")
-    print(f"[engram] value-weight magnitude: {engram.value.weight.float().abs().mean().item():.6f} "
+    out_layer = engram.value if engram.gate == "scalar" else engram.up
+    print(f"[engram] output-weight magnitude ({engram.gate} gate): "
+          f"{out_layer.weight.float().abs().mean().item():.6f} "
           f"(0.000000 would mean it never trained or did not load)")
 
     S.model, S.tok, S.runner = model, tok, runner
@@ -344,6 +347,7 @@ def main():
     ap.add_argument("--table-size", type=int, default=None)
     ap.add_argument("--dim", type=int, default=None)
     ap.add_argument("--heads", type=int, default=None)
+    ap.add_argument("--gate", choices=MicroEngram.GATES, default=None)
     args = ap.parse_args()
 
     S.name = args.name or os.path.basename(os.path.normpath(args.model))

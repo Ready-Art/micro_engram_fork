@@ -100,7 +100,7 @@ def resolve_settings(args, sd, layer_from_key):
         "token_merge": conf.get("token_merge"),
         "canon_path": conf.get("canon_path"),
         # configs from before the gate option have no "gate": those runs were scalar
-        "gate": pick(args.gate, conf.get("gate"), from_shapes["gate"], "scalar"),
+        "gate": pick(getattr(args, "gate", None), conf.get("gate"), from_shapes["gate"], "scalar"),
     }
 
     if source:
