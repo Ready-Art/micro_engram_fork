@@ -53,6 +53,7 @@ plugins:
 | `micro_engram_heads` | `4` | Hash tables per n-gram order (orders 2 and 3 give `2 × heads` tables in total) |
 | `micro_engram_save_steps` | `250` | Non-FSDP only: also save `micro_engram-step{N}.pt` every N steps (`0` = save only at the end) |
 | `micro_engram_canon_path` | `null` | Token-merge map from `build_canon.py`. `null` turns merging off |
+| `micro_engram_save_trainable_only` | `false` | FSDP2 only: checkpoints hold only the trainable weights (the engram, ~0.5–3 GB) instead of the whole model. Resuming reads them back and takes the frozen weights from `base_model`. See *Outputs* |
 | `micro_engram_gate` | `scalar` | How the memory is mixed in: `scalar` (the paper's sigmoid gate) or `ple` (a Gemma 3n PLE-style per-dimension gate). See below |
 
 The engram has `2 × heads × table_size × dim` table parameters plus two `(2·heads·dim) × hidden_size` projections. With the settings below on Gemma 4 31B, that is about 268M table parameters and 11M projection parameters.
@@ -147,6 +148,15 @@ During training, the plugin writes `micro_engram_config.json` (layer, table size
 python extract_engram.py /path/to/merged_model micro_engram.pt
 ```
 
+**Smaller checkpoints:** with `micro_engram_save_trainable_only: true` (FSDP2), each checkpoint holds only the trainable weights instead of the whole model, e.g. ~0.5 GB of engram instead of ~62 GB for Gemma 4 31B. Resuming works the same way, and older full checkpoints still resume. The checkpoint is then **not a servable model**: build one with `assemble_engram_model.py`, which links the base weights and adds the engram (no merge step, no copy of the base):
+
+```bash
+python assemble_engram_model.py --base /path/to/base_model \
+    --engram /path/to/output/checkpoint-400/pytorch_model_fsdp_0 --out /path/to/base_model-engram
+```
+
+`--engram` also takes a merged safetensors folder or a `.pt` file. The output folder works with vLLM (plugin) and with `serve_engram.py` / `infer_engram.py`.
+
 **Resuming** (`auto_resume_from_checkpoints: true`) is handled. The plugin patches Accelerate's FSDP state-dict loading so the engram weights are restored even with the checkpoint wrapper. If the canon file in your YAML differs from the one the checkpoint was trained with, resume **fails on purpose**, because otherwise the run would silently train on different hashes.
 
 ---
@@ -157,6 +167,7 @@ python extract_engram.py /path/to/merged_model micro_engram.pt
 |---|---|
 | `build_canon.py` | Builds the token-merge map. `python build_canon.py --tokenizer /path/to/model --out canon.pt --paper`. By default it merges only case/NFKC variants (`▁The` = `▁the`). Each option merges more: `--merge-space` (`▁the` = `the`), `--strip-accents` (`é` = `e`, Latin/Greek/Cyrillic diacritics only) and `--merge-whitespace` (all whitespace-only pieces share one id). `--paper` turns on all three, like the paper's tokenizer compression. `--protect names.txt` (one name per line, `#` comments, repeatable) keeps names that are also ordinary words apart from the word, e.g. `Peril` the dragon vs `peril`: a single-token name keeps its own id while the word forms still merge with each other. Names split into several tokens are listed and left alone. Special, added and byte tokens are never merged. It prints the class count for each step so you can compare. |
 | `engram_data_stats.py` | Estimates how many n-grams your data trains and how crowded each table size would be. `python engram_data_stats.py /path/to/last_run_prepared/<hash> [--max-tokens N]`. Use it to pick `micro_engram_table_size`. |
+| `assemble_engram_model.py` | Builds a servable model folder from the base weights (symlinked, not copied) plus an engram from a DCP checkpoint, a safetensors folder or a `.pt`. See *Outputs*. |
 | `extract_engram.py` | Pulls the engram tensors out of merged safetensors into a standalone `.pt` file. |
 | `infer_engram.py` | Test generation with the engram attached. See below. |
 | `eval_logprob.py` | Measures how well a served model predicts held-out text, through vLLM's prompt log-probabilities, and compares two configs (e.g. with and without the engram): loss, perplexity, per-chunk win rate and a 95% interval. `run --url ... --data heldout/ --out a.json` once per config, then `compare a.json b.json`. |

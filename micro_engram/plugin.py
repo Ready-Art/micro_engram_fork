@@ -166,14 +166,19 @@ def _patch_accelerate_resume():
         LOG.warning(f"[micro_engram] resume: copied {loaded} engram tensors directly "
                     f"(expected {expected}; example checkpoint key: {example})")
 
+        if not rest:
+            return None  # trainable-only checkpoint: everything else comes from the base weights
+
         opts = kwargs.get("sd_options")
         if opts is not None:
             kwargs["sd_options"] = dataclasses.replace(opts, strict=False)
         result = orig(model, rest, *args, **kwargs)
 
         if result is not None:
-            problems = [k for k in list(getattr(result, "missing_keys", []) or [])
-                        + list(getattr(result, "unexpected_keys", []) or [])
+            # With trainable-only checkpoints the frozen weights are expected to be missing
+            # (they come from base_model); keys the model does not have are always an error.
+            missing = [] if _TRAINABLE_ONLY["on"] else list(getattr(result, "missing_keys", []) or [])
+            problems = [k for k in missing + list(getattr(result, "unexpected_keys", []) or [])
                         if "micro_engram" not in k]
             if problems:
                 raise RuntimeError(f"[micro_engram] resume: non-engram keys did not match: {problems[:10]}")
@@ -182,6 +187,39 @@ def _patch_accelerate_resume():
     patched._micro_engram_patched = True
     fsdp_utils._set_model_state_dict = patched
     LOG.warning("[micro_engram] resume patch installed")
+
+
+_TRAINABLE_ONLY = {"on": False}
+
+
+def _patch_save_trainable_only():
+    """FSDP2 checkpoints keep only trainable weights (the engram), not the frozen model.
+
+    Accelerate builds the state-dict options for both saving and resuming in
+    _prepare_sd_options; adding ignore_frozen_params makes checkpoints ~0.5-3 GB instead
+    of the whole model, and resuming then reads only those weights back (the frozen
+    ones come from base_model, as at the start of training). Older full checkpoints
+    still resume: only their trainable part is read.
+    """
+    try:
+        from accelerate.utils import fsdp_utils
+    except Exception as e:  # noqa: BLE001
+        LOG.warning(f"[micro_engram] could not import accelerate fsdp_utils, full checkpoints kept: {e}")
+        return
+    orig = getattr(fsdp_utils, "_prepare_sd_options", None)
+    if orig is None:
+        LOG.warning("[micro_engram] accelerate has no _prepare_sd_options, full checkpoints kept")
+        return
+    if not getattr(orig, "_micro_engram_patched", False):
+        def patched(fsdp_plugin):
+            opts = orig(fsdp_plugin)
+            return None if opts is None else dataclasses.replace(opts, ignore_frozen_params=True)
+
+        patched._micro_engram_patched = True
+        fsdp_utils._prepare_sd_options = patched
+    _TRAINABLE_ONLY["on"] = True
+    LOG.warning("[micro_engram] checkpoints keep only trainable weights; the merged output is NOT "
+                "a full model: build a servable folder with assemble_engram_model.py")
 
 
 class MicroEngramPlugin(BasePlugin):
@@ -237,6 +275,13 @@ class MicroEngramPlugin(BasePlugin):
 
         model._register_load_state_dict_pre_hook(_strip_wrapper_prefix)
         _patch_accelerate_resume()
+        if cfg.micro_engram_save_trainable_only:
+            fsdp_version = cfg.fsdp_version or (cfg.fsdp_config or {}).get("fsdp_version")
+            if _uses_fsdp(cfg) and str(fsdp_version) == "2":
+                _patch_save_trainable_only()
+            else:
+                LOG.warning("[micro_engram] micro_engram_save_trainable_only needs FSDP2; ignored "
+                            "(without FSDP the engram is also saved on its own as micro_engram.pt)")
 
         # If unfrozen_parameters / an adapter controls freezing, leave it to Axolotl
         # (add the engram to unfrozen_parameters). Otherwise freeze Gemma here.
