@@ -15,6 +15,11 @@ Notes:
   * Every request re-reads the full prompt, which is exactly what the engram needs.
   * No API key / auth. Default host is localhost only; use --host 0.0.0.0 for your LAN.
   * For a fair A/B, use the same seed (or temperature 0) in your frontend.
+  * Thinking is ON by default, as in training (enable_thinking + preserve_thinking).
+    Start with --no-thinking to flip the default, or send per request:
+      "chat_template_kwargs": {"enable_thinking": false}
+  * Chat replies put the thinking in `reasoning_content` (like vLLM's reasoning parser),
+    so frontends show it as a thinking block; `content` is only the answer.
 
 Put this file next to infer_engram.py and the micro_engram package folder.
 """
@@ -96,9 +101,15 @@ def flat_content(c):
     return str(c)
 
 
-def encode_chat(messages):
-    msgs = [{"role": m.get("role", "user"), "content": flat_content(m.get("content"))} for m in messages]
-    text = S.tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+def encode_chat(messages, template_kwargs):
+    msgs = []
+    for m in messages:
+        msg = {"role": m.get("role", "user"), "content": flat_content(m.get("content"))}
+        reasoning = m.get("reasoning_content") or m.get("reasoning")
+        if reasoning:  # earlier thinking sent back by the frontend (used with preserve_thinking)
+            msg["reasoning_content"] = reasoning
+        msgs.append(msg)
+    text = S.tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False, **template_kwargs)
     # the template already contains <bos>, so don't add a second one
     return S.tok(text, add_special_tokens=False, return_tensors="pt").input_ids
 
@@ -118,7 +129,7 @@ class CancelFlag(StoppingCriteria):
         return torch.full((input_ids.shape[0],), self.cancelled, dtype=torch.bool, device=input_ids.device)
 
 
-def raw_pieces(body, input_ids, engram_on, cancel, max_new):
+def raw_pieces(body, input_ids, engram_on, cancel, max_new, skip_special=True):
     """Yield decoded text pieces from model.generate running in a thread. Caller holds LOCK."""
     S.runner.enabled = engram_on
     S.runner.reset()
@@ -145,7 +156,7 @@ def raw_pieces(body, input_ids, engram_on, cancel, max_new):
     if body.get("seed") is not None:
         torch.manual_seed(int(body["seed"]))
 
-    streamer = TextIteratorStreamer(S.tok, skip_prompt=True, skip_special_tokens=True)
+    streamer = TextIteratorStreamer(S.tok, skip_prompt=True, skip_special_tokens=skip_special)
     kw["streamer"] = streamer
     errors = []
 
@@ -169,27 +180,85 @@ def raw_pieces(body, input_ids, engram_on, cancel, max_new):
         raise errors[0]
 
 
+THINK_START, THINK_END = "<|channel>thought", "<channel|>"
+
+
+def split_reasoning(pieces, specials):
+    """Turn raw text (special tokens kept) into ("reasoning" | "content", text) pairs.
+
+    Text between <|channel>thought and <channel|> is reasoning, the rest is content.
+    Other special tokens (<turn|>, <eos>, ...) are dropped. Text that might be the start
+    of a marker is held back until it is complete.
+    """
+    specials = [s for s in specials if s and s not in (THINK_START, THINK_END, "<|channel>")]
+    hold = max([len(THINK_START), len(THINK_END)] + [len(s) for s in specials]) - 1
+    buf, mode, strip_nl = "", "content", False
+
+    def clean(text):
+        for s in specials:
+            text = text.replace(s, "")
+        return text
+
+    try:
+        for p in pieces:
+            buf += p
+            while True:
+                if strip_nl and buf:
+                    buf, strip_nl = buf.removeprefix("\n"), False
+                marker = THINK_START if mode == "content" else THINK_END
+                i = buf.find(marker)
+                if i >= 0:
+                    head = clean(buf[:i])
+                    if head:
+                        yield mode, head
+                    buf = buf[i + len(marker):]
+                    mode = "reasoning" if mode == "content" else "content"
+                    strip_nl = True  # the template puts a newline after both markers
+                    continue
+                buf = clean(buf)
+                if len(buf) > hold:
+                    yield mode, buf[:len(buf) - hold]
+                    buf = buf[len(buf) - hold:]
+                break
+        buf = clean(buf)
+        if buf:
+            yield mode, buf
+    finally:
+        close = getattr(pieces, "close", None)
+        if close:
+            close()
+
+
 def with_stops(pieces, stops, cancel):
-    """Cut the stream at the first stop string, holding back text that might be the start of one."""
+    """Cut the stream at the first stop string in the answer (reasoning is never cut).
+
+    Takes and yields ("reasoning" | "content", text) pairs. Holds back answer text that
+    might be the start of a stop string.
+    """
     if not stops:
         yield from pieces
         return
     hold = max(len(s) for s in stops) - 1
     buf = ""
     try:
-        for p in pieces:
+        for kind, p in pieces:
+            if kind != "content":
+                yield kind, p
+                continue
             buf += p
             hits = [buf.find(s) for s in stops if s in buf]
             if hits:
-                yield buf[:min(hits)]
+                yield "content", buf[:min(hits)]
                 cancel.cancelled = True
                 return
             if len(buf) > hold:
-                yield buf[:len(buf) - hold]
+                yield "content", buf[:len(buf) - hold]
                 buf = buf[len(buf) - hold:]
-        yield buf
+        yield "content", buf
     finally:
-        pieces.close()
+        close = getattr(pieces, "close", None)
+        if close:
+            close()
 
 
 # ----------------------------------------------------------------------------- HTTP
@@ -245,7 +314,10 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
             chat = path.endswith("chat/completions")
             if chat:
-                input_ids = encode_chat(body.get("messages", []))
+                # server defaults (thinking on, as in training), overridable per request like vLLM
+                tmpl = dict(S.template_kwargs)
+                tmpl.update(body.get("chat_template_kwargs") or {})
+                input_ids = encode_chat(body.get("messages", []), tmpl)
             else:
                 prompt = body.get("prompt", "")
                 input_ids = encode_text(prompt if isinstance(prompt, str) else "".join(prompt))
@@ -261,13 +333,13 @@ class Handler(BaseHTTPRequestHandler):
         rid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex[:24]
         created = int(time.time())
 
-        def chunk(delta_text, finish=None, first=False):
+        def chunk(delta_text, finish=None, first=False, kind="content"):
             if chat:
                 delta = {}
                 if first:
                     delta["role"] = "assistant"
                 if delta_text:
-                    delta["content"] = delta_text
+                    delta["reasoning_content" if kind == "reasoning" else "content"] = delta_text
                 return {"id": rid, "object": "chat.completion.chunk", "created": created,
                         "model": model_name,
                         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
@@ -275,10 +347,16 @@ class Handler(BaseHTTPRequestHandler):
                     "choices": [{"index": 0, "text": delta_text, "finish_reason": finish}]}
 
         t0 = time.time()
-        text_out = ""
+        text_out, reasoning_out = "", ""
         with LOCK:
             cancel = CancelFlag()
-            gen = with_stops(raw_pieces(body, input_ids, engram_on, cancel, max_new), stops, cancel)
+            if chat:  # keep special tokens so the thinking channel can be split off
+                raw = raw_pieces(body, input_ids, engram_on, cancel, max_new, skip_special=False)
+                tagged = split_reasoning(raw, S.tok.all_special_tokens + list(S.tok.get_added_vocab()))
+            else:  # plain completions: raw text, as before
+                raw = raw_pieces(body, input_ids, engram_on, cancel, max_new)
+                tagged = (("content", p) for p in raw)
+            gen = with_stops(tagged, stops, cancel)
             try:
                 if stream:
                     self.send_response(200)
@@ -288,14 +366,21 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     if chat:
                         self.wfile.write(f"data: {json.dumps(chunk('', first=True))}\n\n".encode())
-                    for piece in gen:
+                    for kind, piece in gen:
                         if not piece:
                             continue
-                        text_out += piece
-                        self.wfile.write(f"data: {json.dumps(chunk(piece))}\n\n".encode())
+                        if kind == "reasoning":
+                            reasoning_out += piece
+                        else:
+                            text_out += piece
+                        self.wfile.write(f"data: {json.dumps(chunk(piece, kind=kind))}\n\n".encode())
                         self.wfile.flush()
                 else:
-                    text_out = "".join(gen)
+                    for kind, piece in gen:
+                        if kind == "reasoning":
+                            reasoning_out += piece
+                        else:
+                            text_out += piece
             except (BrokenPipeError, ConnectionResetError):
                 cancel.cancelled = True  # client hit stop
                 print("[server] client disconnected, generation cancelled")
@@ -307,7 +392,8 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 gen.close()
 
-        n_new = len(S.tok(text_out, add_special_tokens=False).input_ids) if text_out else 0
+        all_out = reasoning_out + text_out
+        n_new = len(S.tok(all_out, add_special_tokens=False).input_ids) if all_out else 0
         finish = "length" if n_new >= max_new else "stop"
         dt = max(time.time() - t0, 1e-6)
         print(f"[server] {'ENGRAM' if engram_on else 'no-engram'} | prompt {input_ids.shape[1]} tok | "
@@ -326,7 +412,8 @@ class Handler(BaseHTTPRequestHandler):
                  "total_tokens": int(input_ids.shape[1]) + n_new}
         if chat:
             self._json({"id": rid, "object": "chat.completion", "created": created, "model": model_name,
-                        "choices": [{"index": 0, "message": {"role": "assistant", "content": text_out},
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": text_out,
+                                                             "reasoning_content": reasoning_out or None},
                                      "finish_reason": finish}], "usage": usage})
         else:
             self._json({"id": rid, "object": "text_completion", "created": created, "model": model_name,
@@ -348,8 +435,12 @@ def main():
     ap.add_argument("--dim", type=int, default=None)
     ap.add_argument("--heads", type=int, default=None)
     ap.add_argument("--gate", choices=MicroEngram.GATES, default=None)
+    ap.add_argument("--no-thinking", action="store_true",
+                    help="default to enable_thinking=false (requests can still override via chat_template_kwargs)")
     args = ap.parse_args()
 
+    # Same defaults as training (chat_template_kwargs in the Axolotl YAML).
+    S.template_kwargs = {"enable_thinking": not args.no_thinking, "preserve_thinking": True}
     S.name = args.name or os.path.basename(os.path.normpath(args.model))
     load_everything(args)
 
