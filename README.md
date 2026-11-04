@@ -150,6 +150,7 @@ micro_engram_save_trainable_only: true
 Notes:
 - **Change the `unfrozen_parameters` pattern.** The old `model.language_model.layers.0...` pattern matches nothing under PEFT (Axolotl matches from the start of the name), so the engram would stay frozen. The plugin logs an error at train start if that happens, and a warning if anything besides the engram is training (e.g. the LoRA).
 - Don't set a PEFT init option (`peft_init_lora_weights` / PiSSA / OLoRA etc.): only the default init starts the LoRA at exactly zero.
+- Checkpoints: with an adapter, the Trainer saves FSDP checkpoints "adapter only", which in Accelerate means only the LoRA, so the engram would be missing (a ~100 KB `pytorch_model_fsdp_0`). The plugin patches this: checkpoints hold every trainable weight (the engram), and resume reads it back. Check the size of the first checkpoint: about 0.5 GB per 274M-parameter engram in bf16.
 - Don't merge the LoRA; it is zero. The engram is in the checkpoint as usual (`assemble_engram_model.py`, vLLM `--additional-config`).
 - The engram learns against the 4-bit model's hidden states and is served on bf16 ones. Like QLoRA adapters this is usually fine, but measure it: `eval_logprob.py` on the bf16 base, engram on vs off.
 - Tested on CPU only (`test_quant.py`: real bitsandbytes NF4 layers plus a PEFT LoRA). Not yet run on GPUs with FSDP2.

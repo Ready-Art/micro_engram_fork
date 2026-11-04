@@ -267,6 +267,55 @@ check("train-start report lists both engrams, the frozen one as frozen, and no e
       "layer 0: 0.0M of" in report and "(frozen)" in report and "layer 2:" in report
       and "FROZEN" not in report and "should be frozen" not in report)
 
+# ----------------------------------------------------------------------------- adapter checkpoints
+# With an adapter (placeholder QLoRA) the Trainer saves FSDP checkpoints adapter_only=True;
+# Accelerate then kept only the LoRA and the engram was lost (~100 KB checkpoints).
+try:
+    from peft import LoraConfig, get_peft_model
+    from accelerate.utils import fsdp_utils
+    from torch.distributed.checkpoint.state_dict import StateDictOptions
+    have_peft = True
+except ImportError as e:
+    print(f"   (adapter checkpoint checks skipped: {e})")
+    have_peft = False
+
+if have_peft:
+
+    def peft_with_engram():
+        m = get_peft_model(Toy(), LoraConfig(r=1, lora_alpha=1, target_modules=["model.language_model.layers.3.lin"]))
+        p = MicroEngramPlugin()
+        p.post_model_load(cfg(adapter="qlora", unfrozen_parameters=[".+micro_engram"]), m)
+        axolotl_unfreeze(m, ".+micro_engram")
+        return m, p.slots[0].engram
+
+    opts = StateDictOptions(full_state_dict=False)  # SHARDED_STATE_DICT, as in your runs
+    unpatched = fsdp_utils._get_model_state_dict  # the plugin installs the fix when it loads
+    pm, pe = peft_with_engram()
+    before = unpatched(pm, adapter_only=True, sd_options=opts)
+    check("reproduced: unpatched adapter_only checkpoint has the LoRA but no engram",
+          any("lora" in k for k in before) and not any("micro_engram" in k for k in before))
+
+    check("the plugin installs the fix itself on an adapter + FSDP run",
+          getattr(fsdp_utils._get_model_state_dict, "_micro_engram_patched", False))
+    after = fsdp_utils._get_model_state_dict(pm, adapter_only=True, sd_options=opts)
+    check("fixed: adapter_only checkpoint holds the engram, not the frozen LoRA",
+          any(k.endswith("micro_engram.tables.0.weight") for k in after)
+          and not any("lora" in k for k in after))
+
+    with torch.no_grad():
+        pe.value.weight.normal_(std=0.05)
+        pe.tables[0].weight.add_(0.5)
+    ck = os.path.join(TMP, "adapter_ckpt")
+    dcp.save(fsdp_utils._get_model_state_dict(pm, adapter_only=True, sd_options=opts), checkpoint_id=ck, no_dist=True)
+    pm2, pe2 = peft_with_engram()  # fresh run resuming: same steps as load_fsdp_model
+    template = fsdp_utils._get_model_state_dict(pm2, adapter_only=True, sd_options=opts)
+    dcp.load(template, checkpoint_id=ck, no_dist=True)
+    fsdp_utils._set_model_state_dict(pm2, template, adapter_only=True, sd_options=opts)
+    check("resume from an adapter_only checkpoint restores the engram",
+          torch.equal(pe2.tables[0].weight, pe.tables[0].weight) and torch.equal(pe2.value.weight, pe.value.weight))
+    check("assemble/inference loaders read the engram from it (PEFT key prefix stripped)",
+          torch.equal(load_engram_weights(ck, layer=0)["value.weight"], pe.value.weight))
+
 # ----------------------------------------------------------------------------- legacy
 legacy = {"layer": 1, "table_size": 64, "engram_dim": 8, "num_heads": 2, "weights": "micro_engram.pt"}
 sp = engram_specs(legacy, "/x/micro_engram_config.json")

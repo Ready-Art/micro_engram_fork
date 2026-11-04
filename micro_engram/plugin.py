@@ -307,6 +307,50 @@ def _patch_accelerate_resume():
     LOG.warning("[micro_engram] resume patch installed")
 
 
+def _has_engram(model):
+    return any("micro_engram" in n for n, _ in model.named_parameters())
+
+
+def _patch_adapter_only_checkpoints():
+    """With an adapter (e.g. the placeholder QLoRA for a 4-bit base), FSDP checkpoints must
+    still hold the engram.
+
+    The Trainer saves and resumes PEFT models with adapter_only=True. For sharded
+    checkpoints Accelerate then uses PEFT's get_peft_model_state_dict, which returns
+    only the LoRA, so the engram was never saved (a ~100 KB checkpoint). Accelerate's
+    adapter-only *full* state dict path already means "every trainable parameter"
+    (ignore_frozen_params); use that for sharded checkpoints too when the model has an
+    engram. Loading builds its template with the same function, so resume reads the
+    engram back.
+    """
+    try:
+        from accelerate.utils import fsdp_utils
+    except Exception as e:  # noqa: BLE001
+        LOG.warning(f"[micro_engram] could not import accelerate fsdp_utils: {e}. With an adapter, "
+                    f"checkpoints may NOT contain the engram")
+        return
+    orig = getattr(fsdp_utils, "_get_model_state_dict", None)
+    if orig is None:
+        LOG.warning("[micro_engram] accelerate has no _get_model_state_dict: with an adapter, "
+                    "checkpoints may NOT contain the engram")
+        return
+    if getattr(orig, "_micro_engram_patched", False):
+        return
+
+    def patched(model, adapter_only=False, sd_options=None):
+        if adapter_only and sd_options is not None and _has_engram(model):
+            from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+            # trainable parameters only: the engram (and any LoRA that is actually training)
+            return get_model_state_dict(model, options=dataclasses.replace(sd_options, ignore_frozen_params=True))
+        return orig(model, adapter_only=adapter_only, sd_options=sd_options)
+
+    patched._micro_engram_patched = True
+    fsdp_utils._get_model_state_dict = patched
+    LOG.warning("[micro_engram] adapter run: checkpoints will hold the engram (all trainable weights), "
+                "not only the LoRA")
+
+
 _TRAINABLE_ONLY = {"on": False}
 
 
@@ -483,6 +527,8 @@ class MicroEngramPlugin(BasePlugin):
 
         model._register_load_state_dict_pre_hook(_strip_wrapper_prefix)
         _patch_accelerate_resume()
+        if cfg.adapter and _uses_fsdp(cfg):
+            _patch_adapter_only_checkpoints()
         if cfg.micro_engram_save_trainable_only:
             fsdp_version = cfg.fsdp_version or (cfg.fsdp_config or {}).get("fsdp_version")
             if _uses_fsdp(cfg) and str(fsdp_version) == "2":
