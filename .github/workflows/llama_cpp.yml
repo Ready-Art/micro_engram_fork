@@ -1,0 +1,71 @@
+# Checks the llama.cpp patch (llama_cpp/) against the PyTorch engram on CPU:
+# applies it to llama.cpp, builds libllama, and runs llama_cpp/test/compare.py.
+#
+# - "tested": the llama.cpp commit apply.sh was made for; checks changes to this repo.
+# - "master": the latest llama.cpp; a failure means upstream changed and the patch needs a rebase.
+#
+# Runs every Monday, on pushes that touch the engram code, and by hand (Actions tab -> Run workflow).
+name: llama.cpp patch
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+  push:
+    paths:
+      - "llama_cpp/**"
+      - "micro_engram/module.py"
+      - "micro_engram/weights.py"
+      - "infer_engram.py"
+      - ".github/workflows/llama_cpp.yml"
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        llama_cpp: [tested, master]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Get llama.cpp (${{ matrix.llama_cpp }})
+        run: |
+          if [ "${{ matrix.llama_cpp }}" = "tested" ]; then
+            ref=$(sed -n 's/^tested=//p' llama_cpp/apply.sh)
+          else
+            ref=master
+          fi
+          git init -q llama.cpp
+          git -C llama.cpp fetch -q --depth 1 https://github.com/ggml-org/llama.cpp "$ref"
+          git -C llama.cpp checkout -q FETCH_HEAD
+          echo "llama.cpp at $(git -C llama.cpp rev-parse HEAD)"
+
+      - name: Apply the patch
+        run: bash llama_cpp/apply.sh llama.cpp
+
+      - name: Build libllama (CPU)
+        run: |
+          cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF
+          cmake --build llama.cpp/build --target llama -j "$(nproc)"
+
+      - name: Build the test driver
+        run: |
+          L=$PWD/llama.cpp
+          g++ -O2 -std=c++17 -I$L/include -I$L/ggml/include llama_cpp/test/engram_logits.cpp \
+            -L$L/build/bin -lllama -lggml -lggml-base -Wl,-rpath,$L/build/bin -o engram_logits
+
+      - name: Install Python packages
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install transformers safetensors numpy sentencepiece pyyaml
+
+      - name: Compare with the PyTorch engram
+        run: python llama_cpp/test/compare.py --llama-cpp llama.cpp --driver ./engram_logits --work "$RUNNER_TEMP/engram_test"
