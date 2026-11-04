@@ -316,6 +316,57 @@ if have_peft:
     check("assemble/inference loaders read the engram from it (PEFT key prefix stripped)",
           torch.equal(load_engram_weights(ck, layer=0)["value.weight"], pe.value.weight))
 
+# ----------------------------------------------------------------------------- 4-bit base + adapter resume
+# A 4-bit (bitsandbytes) base adds quant state (absmax, quant_map, ...) to its state dict;
+# those are not parameters, so ignore_frozen_params kept them and resume refused them.
+try:
+    import bitsandbytes as bnb
+except ImportError as e:
+    print(f"   (4-bit resume checks skipped: {e})")
+    bnb = None
+
+if have_peft and bnb is not None:
+    def peft_4bit_with_engram():
+        base = Toy()
+        q = bnb.nn.Linear4bit(D, D, bias=True, compute_dtype=torch.float32, quant_type="nf4")
+        q.weight = bnb.nn.Params4bit(base.model.language_model.layers[1].lin.weight.data.clone(),
+                                     requires_grad=False, quant_type="nf4")
+        q.bias = base.model.language_model.layers[1].lin.bias
+        base.model.language_model.layers[1].lin = q
+        base = base.to("cpu")  # quantizes
+        m = get_peft_model(base, LoraConfig(r=1, lora_alpha=1, target_modules=["model.language_model.layers.3.lin"]))
+        p = MicroEngramPlugin()
+        p.post_model_load(cfg(adapter="qlora", unfrozen_parameters=[".+micro_engram"]), m)
+        axolotl_unfreeze(m, ".+micro_engram")
+        return m, p.slots[0].engram
+
+    qm, qe = peft_4bit_with_engram()
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict  # noqa: E402
+
+    old_style = get_model_state_dict(qm, options=StateDictOptions(full_state_dict=False, ignore_frozen_params=True))
+    check("reproduced: the first fix also saved bitsandbytes quant state (absmax, quant_map)",
+          any(k.endswith(".absmax") for k in old_style))
+    new_style = fsdp_utils._get_model_state_dict(qm, adapter_only=True, sd_options=opts)
+    check("now: checkpoint holds only the engram, no quant state",
+          new_style and all("micro_engram" in k for k in new_style))
+
+    with torch.no_grad():
+        qe.value.weight.normal_(std=0.05)
+        qe.tables[2].weight.add_(0.5)
+    old_ck = os.path.join(TMP, "old_style_ckpt")  # like the checkpoint-20 that failed to resume
+    dcp.save(old_style | {k: v for k, v in get_model_state_dict(qm, options=StateDictOptions(
+        full_state_dict=False, ignore_frozen_params=True)).items()}, checkpoint_id=old_ck, no_dist=True)
+    qm2, qe2 = peft_4bit_with_engram()
+    template = fsdp_utils._get_model_state_dict(qm2, adapter_only=True, sd_options=opts)
+    dcp.load(template, checkpoint_id=old_ck, no_dist=True)
+    try:
+        fsdp_utils._set_model_state_dict(qm2, template, adapter_only=True, sd_options=opts)
+        resumed = torch.equal(qe2.tables[2].weight, qe.tables[2].weight) and torch.equal(qe2.value.weight, qe.value.weight)
+    except Exception as e:  # noqa: BLE001
+        print("   resume error:", str(e)[:200])
+        resumed = False
+    check("a checkpoint saved by the first fix (with quant state) now resumes, engram restored", resumed)
+
 # ----------------------------------------------------------------------------- legacy
 legacy = {"layer": 1, "table_size": 64, "engram_dim": 8, "num_heads": 2, "weights": "micro_engram.pt"}
 sp = engram_specs(legacy, "/x/micro_engram_config.json")

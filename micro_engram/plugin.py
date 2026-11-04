@@ -290,7 +290,14 @@ def _patch_accelerate_resume():
         opts = kwargs.get("sd_options")
         if opts is not None:
             kwargs["sd_options"] = dataclasses.replace(opts, strict=False)
-        result = orig(model, rest, *args, **kwargs)
+        if kwargs.get("adapter_only") and opts is not None:
+            # adapter run: the rest are trainable parameters under their full names (see
+            # _patch_adapter_only_checkpoints); PEFT's own loader expects adapter-style names
+            from torch.distributed.checkpoint.state_dict import set_model_state_dict
+
+            result = set_model_state_dict(model, rest, options=kwargs["sd_options"])
+        else:
+            result = orig(model, rest, *args, **kwargs)
 
         if result is not None:
             # With trainable-only checkpoints the frozen weights are expected to be missing
@@ -305,6 +312,10 @@ def _patch_accelerate_resume():
     patched._micro_engram_patched = True
     fsdp_utils._set_model_state_dict = patched
     LOG.warning("[micro_engram] resume patch installed")
+
+
+def _norm_key(k):
+    return k.replace(_WRAP, ".")
 
 
 def _has_engram(model):
@@ -341,8 +352,14 @@ def _patch_adapter_only_checkpoints():
         if adapter_only and sd_options is not None and _has_engram(model):
             from torch.distributed.checkpoint.state_dict import get_model_state_dict
 
-            # trainable parameters only: the engram (and any LoRA that is actually training)
-            return get_model_state_dict(model, options=dataclasses.replace(sd_options, ignore_frozen_params=True))
+            sd = get_model_state_dict(model, options=dataclasses.replace(sd_options, ignore_frozen_params=True))
+            # ignore_frozen_params skips frozen *parameters* only. Keep the engram (with its
+            # buffers) and trainable parameters; drop the rest, e.g. bitsandbytes 4-bit
+            # quant state (absmax, quant_map, ...) that a 4-bit base adds to its state dict.
+            # The template for resuming is built here too, so old checkpoints that still
+            # hold those entries resume fine (only the requested keys are read).
+            trainable = {_norm_key(n) for n, p in model.named_parameters() if p.requires_grad}
+            return {k: v for k, v in sd.items() if "micro_engram" in k or _norm_key(k) in trainable}
         return orig(model, adapter_only=adapter_only, sd_options=sd_options)
 
     patched._micro_engram_patched = True
