@@ -54,15 +54,17 @@ plugins:
 | `micro_engram_save_steps` | `250` | Non-FSDP only: also save `micro_engram-step{N}.pt` every N steps (`0` = save only at the end) |
 | `micro_engram_canon_path` | `null` | Token-merge map from `build_canon.py`. `null` turns merging off |
 | `micro_engram_save_trainable_only` | `false` | FSDP2 only: checkpoints hold only the trainable weights (the engram, ~0.5–3 GB) instead of the whole model. Resuming reads them back and takes the frozen weights from `base_model`. See *Outputs* |
-| `micro_engram_gate` | `scalar` | How the memory is mixed in: `scalar` (the paper's sigmoid gate) or `ple` (a Gemma 3n PLE-style per-dimension gate). See below |
+| `micro_engram_gate` | `scalar` | How the memory is mixed in: `scalar` (the paper's sigmoid gate), `scalar_sqrt` (DeepSeek's released code: signed-sqrt gate with learnable norm scales, recommended for new runs) or `ple` (a Gemma 3n PLE-style per-dimension gate). See below |
+| `micro_engram_stats_steps` | `10` | Every N steps, add engram stats to the training log line (output-weight size, table RMS and share of rows trained per n-gram order, gate mean and saturation). `0` = off. See *Watching training* |
 
 The engram has `2 × heads × table_size × dim` table parameters plus two `(2·heads·dim) × hidden_size` projections. With the settings below on Gemma 4 31B, that is about 268M table parameters and 11M projection parameters.
 
 #### Gate modes
 
-Both modes use the same tables and the same number of parameters, and both start as an exact no-op.
+All modes use the same tables and start as an exact no-op. `scalar` and `ple` have the same parameter count; `scalar_sqrt` adds two vectors of `hidden_size`.
 
 - **`scalar`** (default, as in the Engram paper): one gate value per token, `α = sigmoid(rms(h)·rms(W_K·e)/√d)`, then `h += α · W_V·e`. The memory is let in or held back as a whole.
+- **`scalar_sqrt`** (as in DeepSeek's released Engram code): like `scalar`, but the score goes through a signed square root, `α = sigmoid(sign(s)·√|s|)`, and both RMSNorms get learnable scales. The score is about `cos·√d`; with Gemma's `d = 5376` (`√d ≈ 73`) the plain sigmoid is already at 0.999 for a cosine of 0.1, where it barely learns. The square root keeps the gate responsive (cosine 0.1 gives 0.94), and the scales let it learn its own sharpness. Recommended for new runs; `scalar` checkpoints keep loading as `scalar`.
 - **`ple`** (Gemma 3n per-layer-embedding style): a gate per dimension, computed from the hidden state: `g = gelu(W_down·rms(h))`, then `h += W_up·(g ⊙ e)`. The context chooses *which features* of the memory to use, and each hash head's slice gets its own slice of the gate.
 
 The gate mode is saved in `micro_engram_config.json`, and `infer_engram.py` picks it up automatically. Checkpoints from before this option are `scalar`.
@@ -170,6 +172,7 @@ python assemble_engram_model.py --base /path/to/base_model \
 | `assemble_engram_model.py` | Builds a servable model folder from the base weights (symlinked, not copied) plus an engram from a DCP checkpoint, a safetensors folder or a `.pt`. See *Outputs*. |
 | `extract_engram.py` | Pulls the engram tensors out of merged safetensors into a standalone `.pt` file. |
 | `infer_engram.py` | Test generation with the engram attached. See below. |
+| `engram_stats.py` | Engram weight stats from checkpoints on disk, **while training keeps running** (CPU only, reads only the engram tensors). `python engram_stats.py /path/to/output_dir` (newest checkpoint), `--all` (every checkpoint on disk), `--watch 120` (print each new checkpoint as it appears). Skips checkpoints that are still being written. |
 | `eval_logprob.py` | Measures how well a served model predicts held-out text, through vLLM's prompt log-probabilities, and compares two configs (e.g. with and without the engram): loss, perplexity, per-chunk win rate and a 95% interval. `run --url ... --data heldout/ --out a.json` once per config, then `compare a.json b.json`. |
 
 ### Inference
@@ -232,12 +235,31 @@ vllm serve /path/to/base_model --tensor-parallel-size 4 \
 
 ---
 
+## Watching training
+
+With `micro_engram_stats_steps` (default every 10 steps) the training log line gets `engram/...` entries, which also reach wandb/tensorboard:
+
+| Entry | Meaning | What to look for |
+|---|---|---|
+| `engram/out_abs_mean` | mean \|weight\| of the output layer (`value`, or `up` for `ple`) | starts at 0 and should grow; 0 means it is not training |
+| `engram/table_rms_2g`, `_3g` | RMS of the 2-gram / 3-gram tables (start at 0.02) | slowly rising |
+| `engram/rows_learned_2g`, `_3g` | share of rows whose RMS grew past 1.5× the start | how much of each table is in use; 3-grams fill more slowly |
+| `engram/gate_mean` | mean gate value over the tokens since the last log (scalar gates) | not stuck at 0 or 1 |
+| `engram/gate_saturated` | share of tokens with gate > 0.99 | high values mean an on/off gate that learns slowly |
+| `engram/q_scale_mean`, `k_scale_mean` | learnable norm scales (`scalar_sqrt`) | start at 1; drifting shows the gate tuning its sharpness |
+
+Under FSDP the numbers come from rank 0's shard of each weight, a random sample of rows, so no extra communication is needed.
+
+For a run that started without this option (or to look at past checkpoints), `engram_stats.py` reads the same weight stats from the checkpoints on disk without stopping training.
+
+---
+
 ## Tests (CPU only)
 
 Run them from the repo root:
 
 ```bash
-python test_gate.py                           # both gate modes: no-op start, gradients, bf16, checkpoint names
+python test_gate.py                           # all gate modes: no-op start, gradients, bf16, checkpoint names; weight stats
 python test_canon.py                          # token-merge hashing and state-dict compatibility
 python test_resume_keys.py                    # checkpoint-wrapper key renaming on resume
 python test_vllm_ids.py                       # vLLM path: previous tokens per batch type, same output as training

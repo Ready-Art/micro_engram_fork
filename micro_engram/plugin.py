@@ -9,6 +9,7 @@ from transformers import TrainerCallback
 from axolotl.integrations.base import BasePlugin
 
 from .module import MicroEngram, attach_engram
+from .stats import module_stats
 from .weights import base_fingerprint
 
 LOG = logging.getLogger(__package__)  # keeps the old "[micro_engram...]" logger name
@@ -80,6 +81,34 @@ class _ReportTrainableCallback(TrainerCallback):
         if n_eng_train == 0:
             LOG.error("[micro_engram] the engram is FROZEN: check that unfrozen_parameters matches "
                       "layers.<micro_engram_layer>...micro_engram")
+
+
+class _StatsCallback(TrainerCallback):
+    """Every `every` steps, adds engram weight/gate stats to the training log line.
+
+    Rank 0 only, from its own FSDP shard (a random sample of rows), so there is no
+    communication and no risk of a hang. Never raises: stats must not stop a run.
+    """
+
+    def __init__(self, engram, every):
+        self.engram, self.every = engram, every
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not self.every or not state.is_world_process_zero:
+            return
+        if logs is None or "loss" not in logs:
+            return  # only training-step logs (not eval or the end-of-training summary)
+        gate = self.engram.pop_gate_stats()  # pop every log so the mean covers the recent steps
+        if state.global_step % self.every:
+            return
+        try:
+            stats = module_stats(self.engram)
+            if gate is not None:
+                stats["engram/gate_mean"], stats["engram/gate_saturated"] = gate
+        except Exception as e:  # noqa: BLE001
+            LOG.warning(f"[micro_engram] stats failed (training continues): {e}")
+            return
+        logs.update(stats)  # shown in the normal log line, and reaches wandb / tensorboard
 
 
 def _safe_fingerprint(path):
@@ -320,6 +349,10 @@ class MicroEngramPlugin(BasePlugin):
         # FSDP checkpoints hold the engram in their DCP folder (Accelerate's name for model 0)
         ckpt_weights = "pytorch_model_fsdp_0" if _uses_fsdp(cfg) else None
         callbacks = [_WriteConfigCallback(self.conf, ckpt_weights), _ReportTrainableCallback(self.engram)]
+        if cfg.micro_engram_stats_steps:
+            # first in line, so the stats are in `logs` before the printer/loggers see it
+            trainer.callback_handler.callbacks.insert(
+                0, _StatsCallback(self.engram, cfg.micro_engram_stats_steps))
         if not _uses_fsdp(cfg):  # under FSDP the checkpoint already contains the engram
             callbacks.append(_SaveEngramCallback(self.engram, cfg.micro_engram_save_steps))
         return callbacks

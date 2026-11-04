@@ -105,7 +105,8 @@ def resolve_settings(args, sd, layer_from_key):
         "table_size": int(t0.shape[0]) if t0 is not None else None,
         "engram_dim": int(t0.shape[1]) if t0 is not None else None,
         "num_heads": (n_tables // len(orders)) if n_tables else None,
-        "gate": "ple" if "up.weight" in sd else ("scalar" if "value.weight" in sd else None),
+        "gate": "ple" if "up.weight" in sd else ("scalar_sqrt" if "q_scale" in sd
+                                                  else ("scalar" if "value.weight" in sd else None)),
     }
 
     settings = {
@@ -259,7 +260,7 @@ def main():
     # 'mults' missing is fine: it is rebuilt from the seed. Anything else missing is a problem.
 
     # Sanity check: the output layer starts at zero, so a trained engram must have a non-zero one.
-    out_layer = engram.value if engram.gate == "scalar" else engram.up
+    out_layer = engram.up if engram.gate == "ple" else engram.value
     print(f"[engram] output-weight magnitude ({engram.gate} gate): "
           f"{out_layer.weight.float().abs().mean().item():.6f} "
           f"(0.000000 would mean it never trained or did not load)")

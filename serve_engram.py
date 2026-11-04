@@ -87,7 +87,7 @@ def load_everything(args):
     runner = EngramRunner(model, engram, settings["layer"])
     missing, unexpected = engram.load_state_dict(sd, strict=False)
     print(f"[engram] loaded {len(sd)} tensors | missing: {missing} | unexpected: {unexpected}")
-    out_layer = engram.value if engram.gate == "scalar" else engram.up
+    out_layer = engram.up if engram.gate == "ple" else engram.value
     print(f"[engram] output-weight magnitude ({engram.gate} gate): "
           f"{out_layer.weight.float().abs().mean().item():.6f} "
           f"(0.000000 would mean it never trained or did not load)")

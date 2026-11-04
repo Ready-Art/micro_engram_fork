@@ -23,7 +23,7 @@ def make(gate="scalar"):
     eng = MicroEngram(model_dim=D, table_size=257, engram_dim=4, num_heads=2,
                       vocab_size=V, pad_id=0, gate=gate)
     with torch.no_grad():
-        (eng.value if gate == "scalar" else eng.up).weight.normal_()
+        (eng.up if gate == "ple" else eng.value).weight.normal_()
     canon = torch.arange(V)
     canon[11], canon[501] = 10, 500  # some token merging
     eng.canon.copy_(canon)
@@ -100,7 +100,7 @@ for name, chunks in cases.items():
     results.append((f"token ids: {name}", ok))
 
 # 3. end to end: a request served step by step in vLLM matches the training forward
-for gate in ("scalar", "ple"):
+for gate in MicroEngram.GATES:
     eng = make(gate)
     seq = torch.tensor(hist[0][:30])
     seq[4], seq[17] = 11, 501
