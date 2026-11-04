@@ -183,6 +183,36 @@ def find_text_layers(model):
     raise RuntimeError("Could not find text decoder layers; print(model) and set the path by hand.")
 
 
+def engram_from_spec(spec, model_dim, vocab_size, pad_default=0, canon=None):
+    """A MicroEngram built from one entry of weights.engram_specs (seed included: the seed
+    decides the hash addresses, so a wrong one would silently scramble every lookup)."""
+    return MicroEngram(
+        model_dim=model_dim,
+        table_size=spec["table_size"],
+        engram_dim=spec["engram_dim"],
+        num_heads=spec["num_heads"],
+        orders=tuple(spec.get("orders") or (2, 3)),
+        pad_id=spec["pad_id"] if spec.get("pad_id") is not None else pad_default,
+        seed=spec.get("seed") or 0,
+        vocab_size=vocab_size,
+        canon=canon,
+        gate=spec.get("gate") or "scalar",
+    )
+
+
+def check_loaded(engram, sd, where):
+    """Load `sd` into `engram`; raise if it does not fit. mults may be missing (rebuilt from
+    the seed); if present it must equal the rebuilt one, otherwise the seed is wrong."""
+    if "mults" in sd and not torch.equal(sd["mults"].to(engram.mults.device).long(), engram.mults.long()):
+        raise ValueError(f"[micro_engram] {where}: the saved hash multipliers differ from the ones "
+                         f"this engram's seed gives; the seed is wrong for these weights")
+    result = engram.load_state_dict(sd, strict=False)
+    problems = [k for k in result.missing_keys if k != "mults"] + list(result.unexpected_keys)
+    if problems:
+        raise ValueError(f"[micro_engram] {where} does not match the engram settings: {problems[:10]}")
+    return result
+
+
 _QUANTIZED_PARAMS = ("Params4bit", "Int8Params")  # bitsandbytes packed weights
 
 

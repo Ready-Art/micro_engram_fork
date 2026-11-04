@@ -24,9 +24,10 @@ import torch
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from micro_engram.module import MicroEngram, find_text_layers, layer_device_dtype
+from micro_engram.module import (MicroEngram, check_loaded, engram_from_spec, find_text_layers,
+                                 layer_device_dtype)
 from micro_engram.weights import load_engram_weights as load_engram_file
-from micro_engram.weights import base_mismatch, resolve_weights_path
+from micro_engram.weights import base_mismatch, engram_specs, resolve_weights_path
 
 CONFIG_NAME = "micro_engram_config.json"
 _LAYER_RE = re.compile(r"layers\.(\d+)\.micro_engram\.")
@@ -121,6 +122,7 @@ def resolve_settings(args, sd, layer_from_key):
         "canon_path": conf.get("canon_path"),
         # configs from before the gate option have no "gate": those runs were scalar
         "gate": pick(getattr(args, "gate", None), conf.get("gate"), from_shapes["gate"], "scalar"),
+        "seed": pick(conf.get("seed"), 0),  # decides the hash addresses; older configs: 0
     }
 
     if source:
@@ -136,22 +138,27 @@ def resolve_settings(args, sd, layer_from_key):
 
 
 class EngramRunner:
-    """Attaches the engram to the model and keeps a full token history for generation."""
+    """Attaches the engram(s) to the model and keeps a full token history for generation.
 
-    def __init__(self, model, engram, layer_idx):
+    EngramRunner(model, engram, layer) for one engram, or EngramRunner(model, [(engram, layer), ...]).
+    """
+
+    def __init__(self, model, engrams, layer_idx=None):
         self.model = model
-        self.engram = engram
+        pairs = [(engrams, layer_idx)] if layer_idx is not None else list(engrams)
+        self.engrams = pairs
+        self.engram = pairs[0][0]  # first engram (older callers)
         self.hist = None  # all token ids seen so far in the current generation
         self.enabled = True
 
         _, layers = find_text_layers(model)
-        target = layers[layer_idx]
-        device, dtype = layer_device_dtype(target)  # also right on a 4-bit base
-        engram.to(device=device, dtype=dtype)
-        target.add_module("micro_engram", engram)
-
         model.register_forward_pre_hook(self._grab_ids, with_kwargs=True)
-        target.register_forward_hook(self._inject)
+        for engram, layer in pairs:
+            target = layers[layer]
+            device, dtype = layer_device_dtype(target)  # also right on a 4-bit base
+            engram.to(device=device, dtype=dtype)
+            target.add_module("micro_engram", engram)
+            target.register_forward_hook(self._make_inject(engram))
 
     def reset(self):
         self.hist = None
@@ -167,18 +174,19 @@ class EngramRunner:
         else:
             self.hist = torch.cat([self.hist, ids.to(self.hist.device)], dim=1)
 
-    def _inject(self, _mod, _args, output):
-        if not self.enabled or self.hist is None:
-            return output
-        hidden = output[0] if isinstance(output, tuple) else output
-        new = self._engram_forward(hidden)
-        if isinstance(output, tuple):
-            return (new,) + tuple(output[1:])
-        return new
+    def _make_inject(self, engram):
+        def inject(_mod, _args, output):
+            if not self.enabled or self.hist is None:
+                return output
+            hidden = output[0] if isinstance(output, tuple) else output
+            new = self._engram_forward(engram, hidden)
+            if isinstance(output, tuple):
+                return (new,) + tuple(output[1:])
+            return new
+        return inject
 
     @torch.no_grad()
-    def _engram_forward(self, hidden):
-        eng = self.engram
+    def _engram_forward(self, eng, hidden):
         T = hidden.shape[1]
         # Hash only the tail: the T new positions plus the (max order - 1) tokens before them,
         # which is all their n-grams can reach. Same result as hashing the whole history,
@@ -187,6 +195,73 @@ class EngramRunner:
         idx = eng.hash_ids(tail.to(hidden.device))
         idx = [i[:, -T:] for i in idx]
         return eng.inject(hidden, idx)  # same gate code as training
+
+
+def _read_conf(args):
+    conf_path = args.engram_config or os.path.join(args.model, CONFIG_NAME)
+    if os.path.isfile(conf_path):
+        with open(conf_path) as f:
+            return json.load(f), conf_path
+    return {}, conf_path
+
+
+def plan_engrams(args):
+    """Read the engram weights (before the slow model load, so a wrong path fails fast).
+
+    Returns [(settings, state dict)], one per engram. A config listing several engrams
+    loads each from its own "weights" (or from --engram-pt / the model folder), by layer.
+    """
+    explicit_pt = args.engram_pt  # --engram-pt given by hand: used for every engram
+    args.engram_pt = engram_pt_from_config(args)
+    warn_if_other_base(args)
+    conf, conf_path = _read_conf(args)
+    if len(conf.get("engrams") or []) > 1:
+        plans = []
+        for spec in engram_specs(conf, conf_path):
+            src = explicit_pt or spec["weights"] or args.model  # no weights: inside the model folder
+            sd = load_engram_file(src, layer=spec["layer"])
+            if not any(k.startswith("tables.") for k in sd):
+                raise SystemExit(f"No engram weights for layer {spec['layer']} in {src}.")
+            spec["model_dim"] = conf.get("model_dim")
+            print(f"[engram] layer {spec['layer']}: {spec['gate']} gate, {spec['num_heads']} heads x "
+                  f"{spec['table_size']} rows x {spec['engram_dim']}, seed {spec['seed']}, from {src}")
+            plans.append((spec, sd))
+        return plans
+    sd, layer_from_key = load_engram_weights(args.model, args.engram_pt)
+    if not sd:
+        raise SystemExit("No micro_engram weights found in the checkpoint. Wrong path, or they were not saved.")
+    return [(resolve_settings(args, sd, layer_from_key), sd)]
+
+
+def attach_planned(plans, model):
+    """Build each planned engram, load its weights, attach them all. Returns the runner."""
+    text_cfg = getattr(model.config, "text_config", model.config)
+    pairs = []
+    for settings, sd in plans:
+        if settings.get("model_dim") and settings["model_dim"] != text_cfg.hidden_size:
+            raise SystemExit(f"Config says model_dim {settings['model_dim']} but the model has "
+                             f"hidden_size {text_cfg.hidden_size}. Wrong config for this model?")
+        # The token-merge map is normally saved with the weights. If the run used one but the
+        # weights lack it, hashing would silently differ from training: load it or stop.
+        canon = None
+        if "canon" not in sd and settings.get("token_merge"):
+            path = settings.get("canon_path")
+            if not path or not os.path.isfile(path):
+                raise SystemExit(f"Training used token merging but the weights have no 'canon' tensor and "
+                                 f"the canon file is not available ({path}). Copy it here and fix canon_path "
+                                 f"in {CONFIG_NAME}.")
+            canon = torch.load(path, map_location="cpu")
+            print(f"[engram] token-merge map loaded from {path}")
+        engram = engram_from_spec(settings, text_cfg.hidden_size, text_cfg.vocab_size,
+                                  pick(text_cfg.pad_token_id, 0), canon)
+        check_loaded(engram, sd, f"layer {settings['layer']} weights")
+        # the output layer starts at zero, so a trained engram must have a non-zero one
+        out_layer = engram.up if engram.gate == "ple" else engram.value
+        print(f"[engram] layer {settings['layer']}: loaded {len(sd)} tensors, output-weight magnitude "
+              f"{out_layer.weight.float().abs().mean().item():.6f} ({engram.gate} gate; 0 would mean "
+              f"it never trained or did not load)")
+        pairs.append((engram, settings["layer"]))
+    return EngramRunner(model, pairs)
 
 
 def main():
@@ -210,12 +285,7 @@ def main():
     args = ap.parse_args()
 
     # load the engram weights first, so a wrong path fails before the slow model load
-    args.engram_pt = engram_pt_from_config(args)
-    warn_if_other_base(args)
-    sd, layer_from_key = load_engram_weights(args.model, args.engram_pt)
-    if not sd:
-        raise SystemExit("No micro_engram weights found in the checkpoint. Wrong path, or they were not saved.")
-    settings = resolve_settings(args, sd, layer_from_key)
+    plans = plan_engrams(args)
 
     tok = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
@@ -224,46 +294,7 @@ def main():
         device_map="auto",  # spreads layers over all 5 GPUs
     )
     model.eval()
-
-    text_cfg = getattr(model.config, "text_config", model.config)
-    if settings["model_dim"] and settings["model_dim"] != text_cfg.hidden_size:
-        raise SystemExit(f"Config says model_dim {settings['model_dim']} but the model has "
-                         f"hidden_size {text_cfg.hidden_size}. Wrong config for this model?")
-
-    # The token-merge map is normally saved with the weights. If the run used one but the
-    # weights lack it, hashing would silently differ from training: load it or stop.
-    canon = None
-    if "canon" not in sd and settings["token_merge"]:
-        path = settings["canon_path"]
-        if not path or not os.path.isfile(path):
-            raise SystemExit(f"Training used token merging but the weights have no 'canon' tensor and "
-                             f"the canon file is not available ({path}). Copy it here and fix canon_path "
-                             f"in {CONFIG_NAME}.")
-        canon = torch.load(path, map_location="cpu")
-        print(f"[engram] token-merge map loaded from {path}")
-
-    engram = MicroEngram(
-        model_dim=text_cfg.hidden_size,
-        table_size=settings["table_size"],
-        engram_dim=settings["engram_dim"],
-        num_heads=settings["num_heads"],
-        orders=settings["orders"],
-        pad_id=pick(settings["pad_id"], text_cfg.pad_token_id, 0),
-        vocab_size=text_cfg.vocab_size,
-        canon=canon,
-        gate=settings["gate"],
-    )
-    runner = EngramRunner(model, engram, settings["layer"])
-
-    missing, unexpected = engram.load_state_dict(sd, strict=False)
-    print(f"[engram] loaded {len(sd)} tensors | missing: {missing} | unexpected: {unexpected}")
-    # 'mults' missing is fine: it is rebuilt from the seed. Anything else missing is a problem.
-
-    # Sanity check: the output layer starts at zero, so a trained engram must have a non-zero one.
-    out_layer = engram.up if engram.gate == "ple" else engram.value
-    print(f"[engram] output-weight magnitude ({engram.gate} gate): "
-          f"{out_layer.weight.float().abs().mean().item():.6f} "
-          f"(0.000000 would mean it never trained or did not load)")
+    runner = attach_planned(plans, model)
 
     runner.enabled = not args.no_engram
     print(f"[engram] enabled: {runner.enabled}")

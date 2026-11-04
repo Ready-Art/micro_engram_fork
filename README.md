@@ -94,6 +94,34 @@ sample_packing: true     # supported, as long as position_ids restart at 0 per d
 
 Hashed tables usually want a **higher learning rate** than normal fine-tuning (we use `1e-3`) and `weight_decay: 0.0`.
 
+### Several engrams, and starting from a trained one
+
+Each engram sits in its own decoder layer. The settings above describe the main engram; `micro_engram_extra` adds more. Any engram can start from trained weights (`init_from`) and can be kept frozen (`frozen`):
+
+| Setting (main engram / in `micro_engram_extra`) | Meaning |
+|---|---|
+| `micro_engram_init_from` / `init_from` | Start from a trained engram: an output folder (its newest complete checkpoint is used), a `checkpoint-N` folder, a `micro_engram_config.json`, or the weights themselves (DCP folder, `.pt`, `.safetensors`). With a config, the engram is rebuilt exactly as trained (sizes, gate, **seed**); the YAML can't change those |
+| `micro_engram_frozen` / `frozen` | Load it but don't train it (needs `init_from`). A frozen engram costs only its weights, not gradients or optimizer state |
+| `micro_engram_seed` / `seed` | Hash seed. Default `10007 × layer` (DeepSeek's scheme), so each layer hashes n-grams to different rows; layer 0 keeps seed 0, as before |
+| `layer`, `table_size`, `dim`, `heads`, `gate` (extra only) | `layer` is required (one engram per layer); the others default to the main engram's |
+
+Second engram at mid depth, after the layer-0 one has finished training:
+
+```yaml
+micro_engram_layer: 0
+micro_engram_init_from: /path/to/first_run_output   # its newest checkpoint
+micro_engram_frozen: true
+micro_engram_extra:
+  - layer: 29          # pick one right after a global-attention layer (see layer_types in config.json)
+    gate: scalar_sqrt
+unfrozen_parameters:
+  - '.+micro_engram'   # matches both; the plugin re-freezes the frozen one before training
+```
+
+Both at once: leave out `init_from`/`frozen`. Fine-tuning a 4-bit-trained engram on the bf16 base for a short final stretch: `micro_engram_init_from` without `frozen`.
+
+Every checkpoint's `micro_engram_config.json` lists all engrams under `"engrams"`, each with its own `weights`: a trained one points to that checkpoint, a frozen one to the files it was loaded from (it is not in trainable-only checkpoints). The first engram is also written at the top level, so older loaders still see it. `infer_engram.py`, `serve_engram.py`, the vLLM plugin, `assemble_engram_model.py` and `engram_stats.py` load all of them. The training log uses `engram_L<layer>/...` keys when there is more than one.
+
 ### Training on a 4-bit base (NF4, experimental)
 
 The frozen base can be loaded in 4-bit (bitsandbytes NF4, as in QLoRA) while the engram trains in bf16. Gemma 4 31B drops from ~62 GB to ~17 GB, so FSDP no longer needs `offload_params` and training gets much faster, with room for bigger tables. The engram is still served on the normal bf16 base.
@@ -296,6 +324,7 @@ python test_canon.py                          # token-merge hashing and state-di
 python test_resume_keys.py                    # checkpoint-wrapper key renaming on resume
 python test_vllm_ids.py                       # vLLM path: previous tokens per batch type, same output as training
 python test_quant.py                          # 4-bit (NF4) base + placeholder QLoRA: dtype, freezing pattern, gradients (needs bitsandbytes, peft)
+python test_multi.py                          # several engrams, init_from + frozen, config, inference == training, assemble, stats (needs transformers)
 ```
 
 ---

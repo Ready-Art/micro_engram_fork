@@ -39,8 +39,7 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer, StoppingCriteria,
                           StoppingCriteriaList, TextIteratorStreamer)
 
 from micro_engram.module import MicroEngram
-from infer_engram import (EngramRunner, engram_pt_from_config, load_engram_weights, pick,
-                          resolve_settings, warn_if_other_base)
+from infer_engram import attach_planned, plan_engrams
 
 S = SimpleNamespace()          # model, tok, runner, name, lock
 LOCK = threading.Lock()
@@ -48,49 +47,12 @@ LOCK = threading.Lock()
 
 # ----------------------------------------------------------------------------- loading
 def load_everything(args):
-    args.engram_pt = engram_pt_from_config(args)
-    warn_if_other_base(args)
-    sd, layer_from_key = load_engram_weights(args.model, args.engram_pt)
-    if not sd:
-        raise SystemExit("No micro_engram weights found in the checkpoint. Wrong path, or they were not saved.")
-    settings = resolve_settings(args, sd, layer_from_key)
+    plans = plan_engrams(args)  # reads the engram weights first, so a wrong path fails fast
 
     tok = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, device_map="auto")
     model.eval()
-
-    text_cfg = getattr(model.config, "text_config", model.config)
-    if settings["model_dim"] and settings["model_dim"] != text_cfg.hidden_size:
-        raise SystemExit(f"Config says model_dim {settings['model_dim']} but the model has "
-                         f"hidden_size {text_cfg.hidden_size}. Wrong config for this model?")
-
-    canon = None
-    if "canon" not in sd and settings["token_merge"]:
-        path = settings["canon_path"]
-        if not path or not os.path.isfile(path):
-            raise SystemExit(f"Training used token merging but the weights have no 'canon' tensor and "
-                             f"the canon file is not available ({path}).")
-        canon = torch.load(path, map_location="cpu")
-        print(f"[engram] token-merge map loaded from {path}")
-
-    engram = MicroEngram(
-        model_dim=text_cfg.hidden_size,
-        table_size=settings["table_size"],
-        engram_dim=settings["engram_dim"],
-        num_heads=settings["num_heads"],
-        orders=settings["orders"],
-        pad_id=pick(settings["pad_id"], text_cfg.pad_token_id, 0),
-        vocab_size=text_cfg.vocab_size,
-        canon=canon,
-        gate=settings["gate"],
-    )
-    runner = EngramRunner(model, engram, settings["layer"])
-    missing, unexpected = engram.load_state_dict(sd, strict=False)
-    print(f"[engram] loaded {len(sd)} tensors | missing: {missing} | unexpected: {unexpected}")
-    out_layer = engram.up if engram.gate == "ple" else engram.value
-    print(f"[engram] output-weight magnitude ({engram.gate} gate): "
-          f"{out_layer.weight.float().abs().mean().item():.6f} "
-          f"(0.000000 would mean it never trained or did not load)")
+    runner = attach_planned(plans, model)
 
     S.model, S.tok, S.runner = model, tok, runner
 

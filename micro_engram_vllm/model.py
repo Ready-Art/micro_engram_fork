@@ -1,10 +1,11 @@
 """Gemma 4 with a micro-engram, for vLLM (text-only, Model Runner V2).
 
-Layer 0 gets the engram and a fixed token-id buffer. Before every step the model
-state fills that buffer with each token and the ones before it; inside the compiled
-model, layer 0 hashes them and adds the gated memory to its output, exactly like
-training. Without a micro_engram_config.json next to the weights this class behaves
-like stock Gemma 4.
+Each engram layer (layer 0, plus any others the config lists) gets its engram and a
+view of one shared, fixed token-id buffer. Before every step the model state fills that
+buffer with each token and the ones before it; inside the compiled model, each engram
+layer hashes them and adds its gated memory to its output, exactly like training.
+Without a micro_engram_config.json next to the weights this class behaves like stock
+Gemma 4.
 """
 import json
 import os
@@ -16,8 +17,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4ForCausalLM
 from vllm.model_executor.models.utils import PPMissingLayer
 
-from micro_engram.module import MicroEngram
-from micro_engram.weights import base_mismatch, load_engram_weights, resolve_weights_path
+from micro_engram.module import check_loaded, engram_from_spec
+from micro_engram.weights import base_mismatch, engram_specs, load_engram_weights
 
 # Under "vllm." so vLLM's log handler prints it (other logger names are dropped).
 logger = init_logger("vllm.micro_engram")
@@ -41,11 +42,11 @@ class EngramGemma4DecoderLayer(Gemma4DecoderLayer):
 
 
 def _resolve_engram(vllm_config: VllmConfig):
-    """Which engram to load: (config, path to separate weights or None) or (None, None).
+    """Which engram(s) to load: (config, config path, separate weights?) or (None, None, False).
 
     1. --additional-config '{"micro_engram": "<micro_engram_config.json or its folder>"}'
-       (or the MICRO_ENGRAM_CONFIG environment variable): the weights come from the
-       file the config's "weights" field points to; the base model is left untouched.
+       (or the MICRO_ENGRAM_CONFIG environment variable): each engram's weights come from
+       the file its "weights" field points to; the base model is left untouched.
     2. A micro_engram_config.json next to the model weights (an assembled folder):
        the weights come from the checkpoint itself.
     3. Neither: plain Gemma 4.
@@ -60,33 +61,35 @@ def _resolve_engram(vllm_config: VllmConfig):
             raise ValueError(f"[micro_engram] engram config not found: {path}")
         with open(path) as f:
             conf = json.load(f)
-        weights = resolve_weights_path(conf, path)
-        if weights is None or not os.path.exists(weights):
-            raise ValueError(
-                f"[micro_engram] {path} must say where the engram is: add \"weights\": "
-                f"\"<file or folder, relative to the config>\" (found: {weights})"
-            )
-        return conf, weights
+        for spec in engram_specs(conf, path):
+            if not spec["weights"] or not os.path.exists(spec["weights"]):
+                raise ValueError(
+                    f"[micro_engram] {path}: the engram at layer {spec['layer']} must say where its "
+                    f"weights are: \"weights\": \"<file or folder, relative to the config>\" "
+                    f"(found: {spec['weights']})"
+                )
+        return conf, path, True
 
     path = os.path.join(vllm_config.model_config.model, CONFIG_NAME)
     if os.path.isfile(path):
         with open(path) as f:
-            return json.load(f), None
-    return None, None
+            return json.load(f), path, False
+    return None, None, False
 
 
 class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self.micro_engram_layer = None
-        self.micro_engram_weights = None  # separate engram file, or None: it is in the checkpoint
+        self.micro_engram_slots = []      # [(spec, layer)] for the engrams on this rank
+        self.micro_engram_separate = False  # True: weights from files, not the checkpoint
+        self._micro_engram_ids = None
         self.micro_engram_conf = None
 
-        conf, weights = _resolve_engram(vllm_config)
+        conf, conf_path, separate = _resolve_engram(vllm_config)
         if conf is None:
             logger.info("[micro_engram] no engram configured: plain Gemma 4")
             return
-        self.micro_engram_weights = weights
+        self.micro_engram_separate = separate
         self.micro_engram_conf = conf
         if (msg := base_mismatch(conf, vllm_config.model_config.model)):
             logger.warning("[micro_engram] %s", msg)
@@ -102,50 +105,39 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
                 "V1, e.g. VLLM_USE_V2_MODEL_RUNNER=0 or a feature V2 does not support."
             )
 
-        layer_idx = conf.get("layer", 0)
-        layer = self.model.layers[layer_idx]
-        if isinstance(layer, PPMissingLayer):
-            return  # pipeline parallel: layer 0 lives on another rank
-
-        engram = MicroEngram(
-            model_dim=self.config.hidden_size,
-            table_size=conf["table_size"],
-            engram_dim=conf["engram_dim"],
-            num_heads=conf["num_heads"],
-            orders=tuple(conf.get("orders", (2, 3))),
-            pad_id=conf.get("pad_id", self.config.pad_token_id or 0),
-            vocab_size=self.config.vocab_size,
-            gate=conf.get("gate", "scalar"),  # runs from before the gate option are scalar
-        )
-        ref = next(layer.parameters())
-        engram.to(device=ref.device, dtype=ref.dtype)  # ints (canon, mults) keep their dtype
-        layer.add_module("micro_engram", engram)
-        layer.register_buffer(
-            "micro_engram_ids",
-            torch.full(
-                (vllm_config.scheduler_config.max_num_batched_tokens, max(engram.orders)),
-                -1,
-                dtype=torch.int32,
-                device=ref.device,
-            ),
-            persistent=False,
-        )
-        # MICRO_ENGRAM_OFF=1 loads the engram weights but skips it, for A/B tests.
-        layer.micro_engram_on = os.environ.get("MICRO_ENGRAM_OFF", "0") != "1"
-        layer.__class__ = EngramGemma4DecoderLayer
-        self.micro_engram_layer = layer
-        logger.info(
-            "[micro_engram] attached at layer %d: %s gate, %d tables x %d rows x %d dims%s, from %s",
-            layer_idx, engram.gate, len(engram.tables), engram.table_size,
-            engram.tables[0].embedding_dim,
-            "" if layer.micro_engram_on else " (OFF: MICRO_ENGRAM_OFF=1)",
-            weights or "the model checkpoint",
-        )
+        specs = engram_specs(conf, conf_path)
+        max_order = max(max(s["orders"]) for s in specs)
+        on = os.environ.get("MICRO_ENGRAM_OFF", "0") != "1"  # =1: load but skip, for A/B tests
+        for spec in specs:
+            layer = self.model.layers[spec["layer"]]
+            if isinstance(layer, PPMissingLayer):
+                continue  # pipeline parallel: this layer lives on another rank
+            engram = engram_from_spec(spec, self.config.hidden_size, self.config.vocab_size,
+                                      self.config.pad_token_id or 0)
+            ref = next(layer.parameters())
+            engram.to(device=ref.device, dtype=ref.dtype)  # ints (canon, mults) keep their dtype
+            layer.add_module("micro_engram", engram)
+            if self._micro_engram_ids is None:
+                # one buffer for every engram layer: filled once per step, read in place
+                self._micro_engram_ids = torch.full(
+                    (vllm_config.scheduler_config.max_num_batched_tokens, max_order),
+                    -1, dtype=torch.int32, device=ref.device,
+                )
+            layer.register_buffer("micro_engram_ids", self._micro_engram_ids, persistent=False)
+            layer.micro_engram_on = on
+            layer.__class__ = EngramGemma4DecoderLayer
+            self.micro_engram_slots.append((spec, layer))
+            logger.info(
+                "[micro_engram] attached at layer %d: %s gate, %d tables x %d rows x %d dims, seed %d%s, from %s",
+                spec["layer"], engram.gate, len(engram.tables), engram.table_size,
+                engram.tables[0].embedding_dim, spec["seed"],
+                "" if on else " (OFF: MICRO_ENGRAM_OFF=1)",
+                spec["weights"] if separate else "the model checkpoint",
+            )
 
     @property
     def micro_engram_ids(self) -> torch.Tensor | None:
-        layer = self.micro_engram_layer
-        return None if layer is None else layer.micro_engram_ids
+        return self._micro_engram_ids
 
     def get_model_state_cls(self):
         from .model_state import EngramModelState
@@ -154,10 +146,10 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
 
     def load_weights(self, weights):
         weights = ((name.replace(_WRAP, "."), w) for name, w in weights)
-        if self.micro_engram_weights is None or self.micro_engram_layer is None:
+        if not self.micro_engram_separate or not self.micro_engram_slots:
             return super().load_weights(weights)
 
-        # Separate engram: ignore any engram already in the checkpoint, then load the chosen one.
+        # Separate engrams: ignore any engram already in the checkpoint, then load the chosen ones.
         skipped = []
 
         def without_engram():
@@ -170,25 +162,24 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
         loaded = super().load_weights(without_engram())
         if skipped:
             logger.warning("[micro_engram] the checkpoint has its own engram (%d tensors); "
-                           "using %s instead", len(skipped), self.micro_engram_weights)
-        return loaded | self._load_separate_engram()
+                           "using the configured engram weights instead", len(skipped))
+        for spec, layer in self.micro_engram_slots:
+            loaded |= self._load_separate_engram(spec, layer)
+        return loaded
 
-    def _load_separate_engram(self) -> set[str]:
-        engram = self.micro_engram_layer.micro_engram
-        sd = load_engram_weights(self.micro_engram_weights)
+    def _load_separate_engram(self, spec, layer) -> set[str]:
+        engram = layer.micro_engram
+        sd = load_engram_weights(spec["weights"], layer=spec["layer"])
         if not any(k.startswith("tables.") for k in sd):
-            raise ValueError(f"[micro_engram] no engram weights in {self.micro_engram_weights}")
-        if "canon" not in sd and self.micro_engram_conf.get("token_merge"):
-            canon_path = self.micro_engram_conf.get("canon_path")
+            raise ValueError(f"[micro_engram] no engram weights for layer {spec['layer']} in {spec['weights']}")
+        if "canon" not in sd and spec.get("token_merge"):
+            canon_path = spec.get("canon_path")
             if not canon_path or not os.path.isfile(canon_path):
                 raise ValueError("[micro_engram] the run used token merging but the weights have no "
                                  f"'canon' and the canon file is missing ({canon_path})")
             sd["canon"] = torch.load(canon_path, map_location="cpu")
-        result = engram.load_state_dict(sd, strict=False)  # copies onto the GPU, in its dtype
-        problems = [k for k in result.missing_keys if k != "mults"] + list(result.unexpected_keys)
-        if problems:  # mults is rebuilt from its seed; anything else is a wrong file
-            raise ValueError(f"[micro_engram] {self.micro_engram_weights} does not match the "
-                             f"config: {problems[:10]}")
+        check_loaded(engram, sd, spec["weights"])  # copies onto the GPU, in its dtype
         prefix = next(n for n, m in self.named_modules() if m is engram)
-        logger.info("[micro_engram] loaded %d engram tensors from %s", len(sd), self.micro_engram_weights)
+        logger.info("[micro_engram] layer %d: loaded %d engram tensors from %s",
+                    spec["layer"], len(sd), spec["weights"])
         return {f"{prefix}.{n}" for n, _ in engram.named_parameters()}

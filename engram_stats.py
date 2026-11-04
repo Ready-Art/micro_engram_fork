@@ -26,7 +26,7 @@ import sys
 import time
 
 from micro_engram.stats import format_stats, weight_stats
-from micro_engram.weights import load_engram_weights, resolve_weights_path
+from micro_engram.weights import engram_specs, load_engram_weights, resolve_weights_path
 
 CONFIG_NAME = "micro_engram_config.json"
 _CKPT = re.compile(r"checkpoint-(\d+)$")
@@ -77,15 +77,29 @@ def find_snapshots(path):
 
 
 def stats_line(step, weights, conf_path, override_conf):
-    conf = _read_config(override_conf) or _read_config(conf_path) or \
-        _read_config(os.path.join(os.path.dirname(os.path.dirname(weights)), CONFIG_NAME))
-    sd = load_engram_weights(weights)
-    if not any(k.startswith("tables.") for k in sd):
-        return f"{'step ' + str(step) if step is not None else weights}: no engram tensors found"
-    orders = tuple(conf.get("orders", (2, 3)))
-    stats = weight_stats(sd, orders, conf.get("num_heads"))
+    """One line per trained engram (frozen ones are skipped: they never change)."""
+    path = override_conf or conf_path
+    conf = _read_config(override_conf) or _read_config(conf_path)
+    if not conf:
+        path = os.path.join(os.path.dirname(os.path.dirname(weights)), CONFIG_NAME)
+        conf = _read_config(path)
     label = f"step {step:>6}" if step is not None else os.path.basename(weights)
-    return f"{label}  {format_stats(stats)}"
+    specs = engram_specs(conf, path) if conf else [{"layer": None, "orders": (2, 3), "num_heads": None,
+                                                     "weights": None, "frozen": False}]
+    several = len(specs) > 1
+    lines = []
+    for spec in specs:
+        if spec.get("frozen"):
+            continue
+        src = (spec["weights"] or weights) if several else weights
+        sd = load_engram_weights(src, layer=spec["layer"] if several else None)
+        tag = f"{label} L{spec['layer']}" if several else label
+        if not any(k.startswith("tables.") for k in sd):
+            lines.append(f"{tag}: no engram tensors found")
+            continue
+        stats = weight_stats(sd, tuple(spec.get("orders") or (2, 3)), spec.get("num_heads"))
+        lines.append(f"{tag}  {format_stats(stats)}")
+    return "\n".join(lines) or f"{label}: every engram is frozen"
 
 
 def main():

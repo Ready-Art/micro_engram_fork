@@ -30,7 +30,7 @@ import sys
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from micro_engram.weights import base_mismatch, load_engram_weights
+from micro_engram.weights import base_mismatch, engram_specs, load_engram_weights
 
 CONFIG_NAME = "micro_engram_config.json"
 INDEX_NAME = "model.safetensors.index.json"
@@ -92,19 +92,26 @@ def main():
     if os.path.exists(out) and os.listdir(out) and not args.force:
         sys.exit(f"{out} is not empty (use --force to write into it)")
 
-    sd = load_engram_weights(args.engram)
-    if not any(k.startswith("tables.") for k in sd):
-        sys.exit(f"no micro_engram weights found in {args.engram}")
     config_path = find_config(args)
     with open(config_path) as f:
         conf = json.load(f)
+    specs = engram_specs(conf, config_path)
 
     if (msg := base_mismatch(conf, base)):
         print(f"WARNING: {msg}")
     index = base_weight_map(base)
     weight_map = {k: v for k, v in index["weight_map"].items() if TAG not in k}  # replace any old engram
-    prefix = layer_prefix(weight_map, conf.get("layer", 0)) + TAG
-    engram = {prefix + k: v.contiguous() for k, v in sd.items()}
+    engram = {}
+    for spec in specs:
+        # one engram: --engram; several: each from its config "weights" (a frozen one points to
+        # the run it came from), else from --engram, read by layer
+        src = args.engram if len(specs) == 1 else (spec["weights"] or args.engram)
+        sd = load_engram_weights(src, layer=spec["layer"] if len(specs) > 1 else None)
+        if not any(k.startswith("tables.") for k in sd):
+            sys.exit(f"no micro_engram weights for layer {spec['layer']} in {src}")
+        prefix = layer_prefix(weight_map, spec["layer"]) + TAG
+        engram.update({prefix + k: v.contiguous() for k, v in sd.items()})
+        print(f"layer {spec['layer']}: {len(sd)} tensors from {src}")
 
     os.makedirs(out, exist_ok=True)
     for src in sorted(glob.glob(os.path.join(base, "*"))):
@@ -126,12 +133,16 @@ def main():
     with open(os.path.join(out, INDEX_NAME), "w") as f:
         json.dump({"metadata": meta, "weight_map": dict(sorted(weight_map.items()))}, f, indent=2)
     # the engram is now inside this folder, so the config must not point elsewhere
+    out_conf = {k: v for k, v in conf.items() if k != "weights"}
+    if "engrams" in out_conf:
+        out_conf["engrams"] = [{k: v for k, v in e.items() if k != "weights"} for e in out_conf["engrams"]]
     with open(os.path.join(out, CONFIG_NAME), "w") as f:
-        json.dump({k: v for k, v in conf.items() if k != "weights"}, f, indent=2)
+        json.dump(out_conf, f, indent=2)
 
     size = sum(v.numel() * v.element_size() for v in engram.values()) / 2**30
     print(f"engram: {len(engram)} tensors, {size:.2f} GiB, keys like {next(iter(engram))}")
-    print(f"config: {config_path} (layer {conf.get('layer', 0)}, gate {conf.get('gate', 'scalar')})")
+    print(f"config: {config_path} (" + "; ".join(f"layer {sp['layer']}, {sp['gate']} gate, seed {sp['seed']}"
+                                                for sp in specs) + ")")
     print(f"wrote {out} ({'copied' if args.copy else 'symlinked'} base files from {base})")
 
 

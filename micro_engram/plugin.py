@@ -8,14 +8,33 @@ from transformers import TrainerCallback
 
 from axolotl.integrations.base import BasePlugin
 
-from .module import MicroEngram, attach_engram
+from .module import attach_engram, check_loaded, engram_from_spec
 from .stats import module_stats
-from .weights import base_fingerprint
+from .weights import (base_fingerprint, default_seed, load_engram_weights,
+                      resolve_engram_source)
 
 LOG = logging.getLogger(__package__)  # keeps the old "[micro_engram...]" logger name
 
 _WRAP = "._checkpoint_wrapped_module."
 CONFIG_NAME = "micro_engram_config.json"
+
+
+@dataclasses.dataclass
+class _Slot:
+    """One engram of the run."""
+    spec: dict                    # settings as written to micro_engram_config.json
+    engram: torch.nn.Module
+    frozen: bool = False
+    source: str | None = None     # weights it was loaded from (init_from), absolute
+
+    @property
+    def layer(self):
+        return self.spec["layer"]
+
+    def file_name(self, step=None):
+        """Non-FSDP .pt name: the first engram keeps the old name, others get their layer."""
+        base = "micro_engram" if self.spec.get("_main") else f"micro_engram_L{self.layer}"
+        return f"{base}-step{step}.pt" if step is not None else f"{base}.pt"
 
 
 def save_engram(engram, out_dir, fname="micro_engram.pt"):
@@ -26,17 +45,39 @@ def save_engram(engram, out_dir, fname="micro_engram.pt"):
 
 
 class _SaveEngramCallback(TrainerCallback):
-    def __init__(self, engram, every):
-        self.engram, self.every = engram, every
+    def __init__(self, slots, every):
+        self.slots, self.every = slots, every
 
     def on_step_end(self, args, state, control, **kwargs):
         if self.every and state.global_step % self.every == 0 and state.is_world_process_zero:
-            save_engram(self.engram, args.output_dir, f"micro_engram-step{state.global_step}.pt")
+            for slot in self.slots:
+                if not slot.frozen:
+                    save_engram(slot.engram, args.output_dir, slot.file_name(state.global_step))
+
+
+def build_config(base, slots, trainable_weights):
+    """micro_engram_config.json content: the first engram at the top level (older loaders
+    read only that) plus every engram under "engrams", each with its own "weights".
+
+    `trainable_weights(slot)` says where a trained engram's tensors are relative to the
+    config's folder (None: inside the model checkpoint there). A frozen engram is not in
+    trainable-only checkpoints, so it points to the file it was loaded from.
+    """
+    entries = []
+    for slot in slots:
+        entry = {k: v for k, v in slot.spec.items() if not k.startswith("_")}
+        entry["weights"] = slot.source if slot.frozen else trainable_weights(slot)
+        entries.append(entry)
+    first = entries[0]
+    conf = {**base, **{k: v for k, v in first.items() if k != "weights"}, "engrams": entries}
+    if first["weights"]:
+        conf["weights"] = first["weights"]
+    return conf
 
 
 def write_config(conf, folder, weights=None):
-    """micro_engram_config.json in `folder`; `weights` (relative to it) says where the
-    engram tensors are, so vLLM / assemble_engram_model.py can load them from the config."""
+    """micro_engram_config.json in `folder`. `weights` (old single-engram form) sets the
+    top-level "weights"; build_config output already has per-engram weights."""
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, CONFIG_NAME)
     with open(path, "w") as f:
@@ -47,41 +88,54 @@ def write_config(conf, folder, weights=None):
 class _WriteConfigCallback(TrainerCallback):
     """Writes the engram settings next to the output and next to every checkpoint."""
 
-    def __init__(self, conf, checkpoint_weights=None):
-        self.conf = conf
+    def __init__(self, base, slots, checkpoint_weights=None):
+        self.base, self.slots = base, slots
         self.checkpoint_weights = checkpoint_weights  # e.g. the FSDP checkpoint folder
-
-    def _write(self, folder, weights=None):
-        write_config(self.conf, folder, weights)
 
     def on_train_begin(self, args, state, control, **kwargs):
         if state.is_world_process_zero:
-            self._write(args.output_dir)
+            write_config(build_config(self.base, self.slots, lambda s: None), args.output_dir)
 
     def on_save(self, args, state, control, **kwargs):
         if state.is_world_process_zero:
-            self._write(os.path.join(args.output_dir, f"checkpoint-{state.global_step}"),
-                        self.checkpoint_weights)
+            conf = build_config(self.base, self.slots, lambda s: self.checkpoint_weights)
+            write_config(conf, os.path.join(args.output_dir, f"checkpoint-{state.global_step}"))
+
+
+def _freeze_frozen(slots):
+    for slot in slots:
+        if slot.frozen:
+            for p in slot.engram.parameters():
+                p.requires_grad_(False)
 
 
 class _ReportTrainableCallback(TrainerCallback):
     """Logs the real trainable count at train start, after Axolotl has applied its freezing."""
 
-    def __init__(self, engram):
-        self.engram = engram
+    def __init__(self, slots):
+        self.slots = slots
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if not state.is_world_process_zero or model is None:
             return
         n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        n_eng = sum(p.numel() for p in self.engram.parameters())
-        n_eng_train = sum(p.numel() for p in self.engram.parameters() if p.requires_grad)
-        LOG.warning(f"[micro_engram] at train start: {n_train / 1e6:.1f}M trainable in total, "
-                    f"engram {n_eng_train / 1e6:.1f}M of {n_eng / 1e6:.1f}M trainable")
-        if n_eng_train == 0:
-            LOG.error("[micro_engram] the engram is FROZEN: check that unfrozen_parameters matches "
-                      "the engram's parameter names (with an adapter, PEFT adds a 'base_model.model.' "
-                      "prefix: use '.+micro_engram')")
+        parts, n_eng_train = [], 0
+        for slot in self.slots:
+            n = sum(p.numel() for p in slot.engram.parameters())
+            t = sum(p.numel() for p in slot.engram.parameters() if p.requires_grad)
+            n_eng_train += t
+            parts.append(f"layer {slot.layer}: {t / 1e6:.1f}M of {n / 1e6:.1f}M"
+                         + (" (frozen)" if slot.frozen else ""))
+        LOG.warning(f"[micro_engram] at train start: {n_train / 1e6:.1f}M trainable in total; "
+                    f"engram {', '.join(parts)}")
+        for slot in self.slots:
+            t = sum(p.numel() for p in slot.engram.parameters() if p.requires_grad)
+            if slot.frozen and t:
+                LOG.error(f"[micro_engram] engram at layer {slot.layer} should be frozen but is training")
+            if not slot.frozen and t == 0:
+                LOG.error(f"[micro_engram] the engram at layer {slot.layer} is FROZEN: check that "
+                          "unfrozen_parameters matches the engram's parameter names (with an adapter, "
+                          "PEFT adds a 'base_model.model.' prefix: use '.+micro_engram')")
         others = [n for n, p in model.named_parameters() if p.requires_grad and "micro_engram" not in n]
         if others:
             LOG.warning(f"[micro_engram] {len(others)} non-engram tensors are ALSO training "
@@ -91,7 +145,7 @@ class _ReportTrainableCallback(TrainerCallback):
         n_4bit = sum(1 for m in model.modules() if type(m).__name__ == "Linear4bit")
         if n_4bit:
             LOG.warning(f"[micro_engram] base is 4-bit ({n_4bit} quantized linear layers); the engram "
-                        f"trains in {next(self.engram.parameters()).dtype} against it")
+                        f"trains in {next(self.slots[0].engram.parameters()).dtype} against it")
 
 
 class _StatsCallback(TrainerCallback):
@@ -99,27 +153,33 @@ class _StatsCallback(TrainerCallback):
 
     Rank 0 only, from its own FSDP shard (a random sample of rows), so there is no
     communication and no risk of a hang. Never raises: stats must not stop a run.
+    One engram: keys "engram/..."; several: "engram_L<layer>/...".
     """
 
-    def __init__(self, engram, every):
-        self.engram, self.every = engram, every
+    def __init__(self, slots, every):
+        self.slots, self.every = slots, every
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if not self.every or not state.is_world_process_zero:
             return
         if logs is None or "loss" not in logs:
             return  # only training-step logs (not eval or the end-of-training summary)
-        gate = self.engram.pop_gate_stats()  # pop every log so the mean covers the recent steps
+        gates = [s.engram.pop_gate_stats() for s in self.slots]  # pop every log: recent steps only
         if state.global_step % self.every:
             return
-        try:
-            stats = module_stats(self.engram)
-            if gate is not None:
-                stats["engram/gate_mean"], stats["engram/gate_saturated"] = gate
-        except Exception as e:  # noqa: BLE001
-            LOG.warning(f"[micro_engram] stats failed (training continues): {e}")
-            return
-        logs.update(stats)  # shown in the normal log line, and reaches wandb / tensorboard
+        for slot, gate in zip(self.slots, gates):
+            if slot.frozen:
+                continue  # unchanged since it was loaded
+            try:
+                stats = module_stats(slot.engram)
+                if gate is not None:
+                    stats["engram/gate_mean"], stats["engram/gate_saturated"] = gate
+            except Exception as e:  # noqa: BLE001
+                LOG.warning(f"[micro_engram] stats failed (training continues): {e}")
+                continue
+            if len(self.slots) > 1:
+                stats = {k.replace("engram/", f"engram_L{slot.layer}/", 1): v for k, v in stats.items()}
+            logs.update(stats)  # shown in the normal log line, and reaches wandb / tensorboard
 
 
 def _safe_fingerprint(path):
@@ -279,16 +339,111 @@ def _patch_save_trainable_only():
                 "a full model: build a servable folder with assemble_engram_model.py")
 
 
+def _engram_requests(cfg):
+    """[(spec settings, init_from, frozen)] for the main engram and every micro_engram_extra."""
+    main = {
+        "layer": cfg.micro_engram_layer,
+        "table_size": cfg.micro_engram_table_size,
+        "engram_dim": cfg.micro_engram_dim,
+        "num_heads": cfg.micro_engram_heads,
+        "gate": cfg.micro_engram_gate,
+        "seed": cfg.micro_engram_seed,
+        "_main": True,
+    }
+    reqs = [(main, cfg.micro_engram_init_from, bool(cfg.micro_engram_frozen))]
+    for e in cfg.micro_engram_extra or []:
+        e = dict(e) if not hasattr(e, "model_dump") else e.model_dump()
+        spec = {
+            "layer": int(e["layer"]),
+            "table_size": e.get("table_size") or main["table_size"],
+            "engram_dim": e.get("dim") or main["engram_dim"],
+            "num_heads": e.get("heads") or main["num_heads"],
+            "gate": e.get("gate") or main["gate"],
+            "seed": e.get("seed"),
+        }
+        reqs.append((spec, e.get("init_from"), bool(e.get("frozen"))))
+    layers = [r[0]["layer"] for r in reqs]
+    if len(set(layers)) != len(layers):
+        raise ValueError(f"[micro_engram] one engram per layer, got layers {layers}")
+    for spec, init_from, frozen in reqs:
+        if frozen and not init_from:
+            raise ValueError(f"[micro_engram] the engram at layer {spec['layer']} is frozen but has no "
+                             "init_from: a frozen untrained engram does nothing")
+        if spec["seed"] is None:
+            spec["seed"] = default_seed(spec["layer"])
+    return reqs
+
+
+_ARCH_KEYS = ("table_size", "engram_dim", "num_heads", "orders", "gate", "seed")
+
+
 class MicroEngramPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
-        self.engram = None
-        self.conf = None
+        self.slots = []
+        self.base_conf = None
+
+    @property
+    def engram(self):  # the main engram (older code paths)
+        return self.slots[0].engram if self.slots else None
 
     def get_input_args(self):
         # Relative to this package, so it resolves however the package was imported
         # (pip-installed `micro_engram`, or the repo folder as `micro_engram.micro_engram`).
         return f"{__package__}.args.MicroEngramArgs"
+
+    def _build_slot(self, spec, init_from, frozen, model, text_cfg, canon):
+        pad = text_cfg.pad_token_id or 0
+        source, sd = None, None
+        if init_from:
+            source, src_spec = resolve_engram_source(init_from, spec["layer"])
+            source = os.path.abspath(source)
+            if src_spec is not None:
+                # rebuild it exactly as trained (sizes, gate, seed); the YAML can't change those
+                def norm(v):
+                    return tuple(v) if isinstance(v, (list, tuple)) else v
+
+                changed = {k: (spec[k], src_spec[k]) for k in _ARCH_KEYS
+                           if spec.get(k) is not None and src_spec.get(k) is not None
+                           and norm(spec[k]) != norm(src_spec[k])}
+                if changed:
+                    LOG.warning(f"[micro_engram] layer {spec['layer']}: using the trained engram's "
+                                f"settings, not the YAML's: " + ", ".join(
+                                    f"{k} {a} -> {b}" for k, (a, b) in changed.items()))
+                spec.update({k: src_spec[k] for k in _ARCH_KEYS if src_spec.get(k) is not None})
+            sd = load_engram_weights(source, layer=spec["layer"])
+            if not any(k.startswith("tables.") for k in sd):
+                raise ValueError(f"[micro_engram] no engram weights for layer {spec['layer']} in {source}")
+            t0 = sd["tables.0.weight"]
+            if src_spec is None:  # bare weights: sizes from the tensors, the rest from the YAML
+                spec["table_size"], spec["engram_dim"] = int(t0.shape[0]), int(t0.shape[1])
+                spec["gate"] = "ple" if "up.weight" in sd else (
+                    "scalar_sqrt" if "q_scale" in sd else "scalar")
+
+        engram = engram_from_spec(spec, text_cfg.hidden_size, text_cfg.vocab_size, pad, canon)
+        if sd is not None:
+            if "canon" in sd and canon is not None and not torch.equal(sd["canon"].long(), canon):
+                LOG.warning(f"[micro_engram] layer {spec['layer']}: keeps the token-merge map it was "
+                            f"trained with, which differs from micro_engram_canon_path")
+            if "canon" not in sd and canon is None and spec.get("token_merge"):
+                raise ValueError(f"[micro_engram] layer {spec['layer']} was trained with token merging "
+                                 f"but its weights have no canon; set micro_engram_canon_path")
+            check_loaded(engram, sd, source)
+            LOG.warning(f"[micro_engram] layer {spec['layer']}: loaded trained engram from {source}"
+                        + (" (frozen)" if frozen else " (continues training)"))
+        has_canon = not torch.equal(engram.canon, torch.arange(engram.canon.numel()))
+        spec.update({
+            "orders": list(engram.orders),
+            "pad_id": engram.pad_id,
+            "token_merge": has_canon,
+            "frozen": frozen,
+            "init_from": source,
+        })
+        where, _ = attach_engram(model, engram, spec["layer"])
+        n = sum(p.numel() for p in engram.parameters())
+        LOG.warning(f"[micro_engram] attached at {where}: {n / 1e6:.1f}M params, {spec['gate']} gate, "
+                    f"seed {spec['seed']}" + (", FROZEN" if frozen else ""))
+        return _Slot(spec=spec, engram=engram, frozen=frozen, source=source)
 
     def post_model_load(self, cfg, model):
         text_cfg = getattr(model.config, "text_config", model.config)
@@ -303,35 +458,19 @@ class MicroEngramPlugin(BasePlugin):
         else:
             LOG.warning("[micro_engram] token merging OFF (no micro_engram_canon_path)")
 
-        self.engram = MicroEngram(
-            model_dim=text_cfg.hidden_size,  # 5376 for Gemma 4 31B
-            table_size=cfg.micro_engram_table_size,
-            engram_dim=cfg.micro_engram_dim,
-            num_heads=cfg.micro_engram_heads,
-            pad_id=text_cfg.pad_token_id or 0,
-            vocab_size=vocab_size,
-            canon=canon,
-            gate=cfg.micro_engram_gate,
-        )
-        LOG.warning(f"[micro_engram] gate: {cfg.micro_engram_gate}")
-        where, _ = attach_engram(model, self.engram, cfg.micro_engram_layer)
+        self.slots = []
+        for spec, init_from, frozen in _engram_requests(cfg):
+            spec["canon_path"] = cfg.micro_engram_canon_path
+            self.slots.append(self._build_slot(spec, init_from, frozen, model, text_cfg, canon))
 
-        self.conf = {
-            "layer": cfg.micro_engram_layer,
-            "table_size": cfg.micro_engram_table_size,
-            "engram_dim": cfg.micro_engram_dim,
-            "num_heads": cfg.micro_engram_heads,
-            "orders": list(self.engram.orders),
+        self.base_conf = {
             "model_dim": text_cfg.hidden_size,
-            "pad_id": text_cfg.pad_token_id or 0,
             "vocab_size": vocab_size,
-            "token_merge": canon is not None,
             "canon_path": cfg.micro_engram_canon_path,
             # which base weights the engram belongs to (folder-name independent), so loaders
             # can warn when it is put on a different model
             "base_model": cfg.base_model,
             "base_fingerprint": _safe_fingerprint(cfg.base_model),
-            "gate": cfg.micro_engram_gate,
         }
 
         model._register_load_state_dict_pre_hook(_strip_wrapper_prefix)
@@ -349,23 +488,31 @@ class MicroEngramPlugin(BasePlugin):
         if not cfg.unfrozen_parameters and not cfg.adapter:
             for p in model.parameters():
                 p.requires_grad_(False)
-            for p in self.engram.parameters():
-                p.requires_grad_(True)
+            for slot in self.slots:
+                for p in slot.engram.parameters():
+                    p.requires_grad_(True)
+        _freeze_frozen(self.slots)
+        if all(s.frozen for s in self.slots):
+            LOG.warning("[micro_engram] every engram is frozen: nothing of the engrams will train")
+        LOG.warning("[micro_engram] trainable count is logged at train start, after Axolotl's freezing")
 
-        n_eng = sum(p.numel() for p in self.engram.parameters())
-        LOG.warning(f"[micro_engram] attached at {where}: {n_eng / 1e6:.1f}M engram params "
-                    f"(trainable count is logged at train start, after Axolotl's freezing)")
+    def post_trainer_create(self, cfg, trainer):
+        # Axolotl applies unfrozen_parameters after post_model_load, and '.+micro_engram'
+        # matches every engram: freeze the frozen ones again before the optimizer is built.
+        _freeze_frozen(self.slots)
 
     def add_callbacks_post_trainer(self, cfg, trainer):
+        _freeze_frozen(self.slots)  # in case post_trainer_create is not called by this Axolotl
         # FSDP checkpoints hold the engram in their DCP folder (Accelerate's name for model 0)
         ckpt_weights = "pytorch_model_fsdp_0" if _uses_fsdp(cfg) else None
-        callbacks = [_WriteConfigCallback(self.conf, ckpt_weights), _ReportTrainableCallback(self.engram)]
+        callbacks = [_WriteConfigCallback(self.base_conf, self.slots, ckpt_weights),
+                     _ReportTrainableCallback(self.slots)]
         if cfg.micro_engram_stats_steps:
             # first in line, so the stats are in `logs` before the printer/loggers see it
             trainer.callback_handler.callbacks.insert(
-                0, _StatsCallback(self.engram, cfg.micro_engram_stats_steps))
+                0, _StatsCallback(self.slots, cfg.micro_engram_stats_steps))
         if not _uses_fsdp(cfg):  # under FSDP the checkpoint already contains the engram
-            callbacks.append(_SaveEngramCallback(self.engram, cfg.micro_engram_save_steps))
+            callbacks.append(_SaveEngramCallback(self.slots, cfg.micro_engram_save_steps))
         return callbacks
 
     def post_train(self, cfg, model):
@@ -373,5 +520,7 @@ class MicroEngramPlugin(BasePlugin):
             LOG.info("[micro_engram] FSDP run: each checkpoint's micro_engram_config.json points to its "
                      "engram; load it in vLLM with --additional-config, or use assemble_engram_model.py")
             return
-        save_engram(self.engram, cfg.output_dir)
-        write_config(self.conf, cfg.output_dir, "micro_engram.pt")
+        for slot in self.slots:
+            if not slot.frozen:
+                save_engram(slot.engram, cfg.output_dir, slot.file_name())
+        write_config(build_config(self.base_conf, self.slots, lambda s: s.file_name()), cfg.output_dir)
