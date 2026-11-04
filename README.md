@@ -55,6 +55,7 @@ plugins:
 | `micro_engram_canon_path` | `null` | Token-merge map from `build_canon.py`. `null` turns merging off |
 | `micro_engram_save_trainable_only` | `false` | FSDP2 only: checkpoints hold only the trainable weights (the engram, ~0.5–3 GB) instead of the whole model. Resuming reads them back and takes the frozen weights from `base_model`. See *Outputs* |
 | `micro_engram_gate` | `scalar` | How the memory is mixed in: `scalar` (the paper's sigmoid gate), `scalar_sqrt` (DeepSeek's released code: signed-sqrt gate with learnable norm scales, recommended for new runs) or `ple` (a Gemma 3n PLE-style per-dimension gate). See below |
+| `micro_engram_lr_epoch_decay` | `null` | LR schedule: linear warmup (`warmup_ratio`/`warmup_steps` as usual), then the LR is multiplied by this factor at the start of every epoch (`0.5` = halve each epoch). Replaces `lr_scheduler` / `lr_scheduler_kwargs`. Epoch boundaries come from the step count, and resume continues the curve |
 | `micro_engram_stats_steps` | `10` | Every N steps, add engram stats to the training log line (output-weight size, table RMS and share of rows trained per n-gram order, gate mean and saturation). `0` = off. See *Watching training* |
 
 The engram has `2 × heads × table_size × dim` table parameters plus two `(2·heads·dim) × hidden_size` projections. With the settings below on Gemma 4 31B, that is about 268M table parameters and 11M projection parameters.

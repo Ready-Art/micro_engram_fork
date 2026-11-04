@@ -34,3 +34,6 @@ class MicroEngramArgs(BaseModel):
     micro_engram_init_from: Optional[str] = None  # start the main engram from trained weights
     micro_engram_frozen: bool = False  # load the main engram but don't train it (needs init_from)
     micro_engram_extra: Optional[List[MicroEngramExtraArgs]] = None  # more engrams at other layers
+    # LR schedule: linear warmup (warmup_steps / warmup_ratio as usual), then the LR is multiplied
+    # by this factor at the start of every epoch (0.5 = halve each epoch). Replaces lr_scheduler.
+    micro_engram_lr_epoch_decay: Optional[float] = None

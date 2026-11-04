@@ -401,6 +401,27 @@ def _patch_save_trainable_only():
                 "a full model: build a servable folder with assemble_engram_model.py")
 
 
+def epoch_step_scheduler(optimizer, num_training_steps, warmup_steps, epochs, factor):
+    """Linear warmup from 0 (like Axolotl's schedulers), then factor ** epoch.
+
+    Epoch boundaries come from the step count: num_training_steps / epochs steps each.
+    Resuming restores the step, so the LR picks up where it was.
+    """
+    from torch.optim.lr_scheduler import LambdaLR
+
+    per_epoch = max(1, round(num_training_steps / max(epochs, 1e-9)))
+
+    def lr_lambda(step):
+        if warmup_steps and step < warmup_steps:
+            return step / warmup_steps
+        return factor ** (step // per_epoch)
+
+    drops = list(range(per_epoch, num_training_steps, per_epoch))
+    LOG.warning(f"[micro_engram] LR schedule: warmup {warmup_steps} steps, then x{factor} at the start of each "
+                f"epoch (steps {drops}), {per_epoch} steps per epoch")
+    return LambdaLR(optimizer, lr_lambda)
+
+
 def _engram_requests(cfg):
     """[(spec settings, init_from, frozen)] for the main engram and every micro_engram_extra."""
     main = {
@@ -585,6 +606,15 @@ class MicroEngramPlugin(BasePlugin):
         if not _uses_fsdp(cfg):  # under FSDP the checkpoint already contains the engram
             callbacks.append(_SaveEngramCallback(self.slots, cfg.micro_engram_save_steps))
         return callbacks
+
+    def create_lr_scheduler(self, cfg, trainer, optimizer, num_training_steps):
+        """micro_engram_lr_epoch_decay: warmup, then LR x factor at the start of each epoch."""
+        factor = cfg.micro_engram_lr_epoch_decay
+        if not factor:
+            return None  # Axolotl's own lr_scheduler
+        return epoch_step_scheduler(optimizer, num_training_steps,
+                                    trainer.args.get_warmup_steps(num_training_steps),
+                                    float(cfg.num_epochs or trainer.args.num_train_epochs or 1), factor)
 
     def post_train(self, cfg, model):
         if _uses_fsdp(cfg):
