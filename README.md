@@ -297,6 +297,40 @@ vllm serve /path/to/base_model --tensor-parallel-size 4 \
 
 ---
 
+### Serving with llama.cpp (Gemma 4)
+
+llama.cpp has no plugin mechanism for models, so support comes as a small patch set in `llama_cpp/`: one new file (`src/llama-micro-engram.{h,cpp}`) plus 5 small edits to existing files (`micro-engram.patch`, ~25 changed lines). The engram goes **inside the GGUF**, so `llama-server` and the other tools need no new flags.
+
+1. **Patch and build llama.cpp** (tested on llama.cpp `13ec8f6`):
+   ```bash
+   ./llama_cpp/apply.sh /path/to/llama.cpp
+   cd /path/to/llama.cpp && cmake -B build -DGGML_CUDA=ON && cmake --build build --config Release -j --target llama-server
+   ```
+   Only `libllama` changes (no CUDA code). To ship a prebuilt `libllama.so`, it must come from the same llama.cpp commit as the `llama-server` and ggml libraries it is used with.
+2. **Add the engram to a GGUF** (any quantization; the engram is stored as BF16):
+   ```bash
+   pip install gguf    # or PYTHONPATH=/path/to/llama.cpp/gguf-py
+   python llama_cpp/gguf_add_engram.py --gguf gemma-4-31B-it-Q4_K_M.gguf \
+       --engram /path/to/output/checkpoint-400 --out gemma-4-31B-it-Q4_K_M-engram.gguf
+   ```
+   `--engram` takes a checkpoint folder, an assembled folder or a `micro_engram_config.json`; every engram it lists is added (all must share one token-merge map). Split GGUFs must be merged first.
+3. **Run it as usual:** `llama-server -m gemma-4-31B-it-Q4_K_M-engram.gguf`. The load log shows `micro_engram: N engram(s)`.
+
+How it works: on every batch, each token's previous two tokens come from llama.cpp's KV cache, which already stores token ids per sequence (added upstream for DeepSeek-V4.1's Engram). That covers chunked prompts, token-by-token generation, parallel slots and prompt-cache reuse. The patch also keeps that history in saved/restored slot states. The hash runs on the CPU (same formula as training), and the tables are looked up on the GPU.
+
+Notes:
+- A patched llama.cpp still loads every other GGUF normally. An **unpatched** llama.cpp refuses a GGUF that contains an engram (unknown tensors).
+- Use the same tokenizer as training: the token-merge map is per token id.
+- Image tokens (multimodal input) get no engram.
+
+Tested on CPU against the PyTorch engram (`llama_cpp/test/compare.py`, a tiny random Gemma 4 with two engrams per model, all three gates, f32 and bf16 storage):
+- the logits match within the drift that llama.cpp shows even without an engram (~2e-2 on a tiny model)
+- the same check also passes for a chunked prompt, token-by-token decoding, two sequences in one batch, and a state save/restore
+- a negative control (hashing without token merging) misses by ~100x more, so a hashing bug cannot pass
+- without the patch's cache fix, decoding after a state restore misses by 1.5, so the history check catches that too
+
+Not yet tested on a GPU or with the real 31B model.
+
 ## Watching training
 
 With `micro_engram_stats_steps` (default every 10 steps) the training log line gets `engram/...` entries, which also reach wandb/tensorboard:
@@ -327,6 +361,7 @@ python test_resume_keys.py                    # checkpoint-wrapper key renaming 
 python test_vllm_ids.py                       # vLLM path: previous tokens per batch type, same output as training
 python test_quant.py                          # 4-bit (NF4) base + placeholder QLoRA: dtype, freezing pattern, gradients (needs bitsandbytes, peft)
 python test_multi.py                          # several engrams, init_from + frozen, config, inference == training, assemble, stats (needs transformers)
+python llama_cpp/test/compare.py --llama-cpp <patched llama.cpp> --driver <engram_logits>   # llama.cpp patch vs PyTorch (needs a build; see the file)
 ```
 
 ---
