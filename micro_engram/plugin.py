@@ -2,6 +2,7 @@ import dataclasses
 import json
 import logging
 import os
+from collections.abc import Mapping
 
 import torch
 from transformers import TrainerCallback
@@ -352,7 +353,14 @@ def _engram_requests(cfg):
     }
     reqs = [(main, cfg.micro_engram_init_from, bool(cfg.micro_engram_frozen))]
     for e in cfg.micro_engram_extra or []:
-        e = dict(e) if not hasattr(e, "model_dump") else e.model_dump()
+        # Axolotl hands these over as DictDefault, which answers every attribute with None:
+        # check for a mapping first, never hasattr()
+        if isinstance(e, Mapping):
+            e = dict(e)
+        elif callable(getattr(e, "model_dump", None)):
+            e = e.model_dump()
+        else:
+            e = dict(vars(e))
         spec = {
             "layer": int(e["layer"]),
             "table_size": e.get("table_size") or main["table_size"],

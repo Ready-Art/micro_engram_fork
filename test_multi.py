@@ -72,6 +72,13 @@ class Toy(nn.Module):
         return h
 
 
+class DictDefault(dict):
+    """Like Axolotl's DictDefault: every missing attribute is None (so hasattr() is always True)."""
+
+    def __getattr__(self, name):
+        return self.get(name)
+
+
 class Cfg(types.SimpleNamespace):
     def __getattr__(self, name):  # unset settings are None, like Axolotl's DictDefault
         return None
@@ -133,7 +140,7 @@ model_b = Toy()
 plug_b = MicroEngramPlugin()
 cfg_b = cfg(unfrozen_parameters=[".+micro_engram"], micro_engram_init_from=run_a, micro_engram_frozen=True,
             micro_engram_table_size=999,  # wrong on purpose: the trained engram's settings win
-            micro_engram_extra=[{"layer": 2, "gate": "scalar"}])
+            micro_engram_extra=[DictDefault(layer=2, gate="scalar")])  # as Axolotl passes it
 plug_b.post_model_load(cfg_b, model_b)
 e0, e2 = plug_b.slots[0].engram, plug_b.slots[1].engram
 check("run B: frozen layer-0 engram equals run A's (trained settings used, not the YAML's)",
