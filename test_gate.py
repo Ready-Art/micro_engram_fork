@@ -117,6 +117,16 @@ results.append(("stats from saved tensors == stats from the module",
                 weight_stats(big.state_dict(), big.orders, 2) == st2))
 print("   example line:", format_stats({**st2, "engram/gate_mean": 0.42, "engram/gate_saturated": 0.03}))
 
+# keep mask (multimodal serving): False rows unchanged, True rows as without the mask
+eng = make("ple")
+with torch.no_grad():
+    eng.up.weight.normal_(std=0.05)
+idx = eng.hash_ids(ids)
+keep = torch.tensor([[True] * 6 + [False] * 6] * 2)
+masked, full = eng.inject(hidden, idx, keep), eng.inject(hidden, idx)
+results.append(("inject keep=False rows are unchanged, keep=True rows match",
+                torch.equal(masked[:, 6:], hidden[:, 6:]) and torch.equal(masked[:, :6], full[:, :6])))
+
 try:
     make("bogus")
     results.append(("unknown gate is rejected", False))

@@ -115,6 +115,32 @@ for gate in MicroEngram.GATES:
     results.append((f"{gate}: chunked prefill + decode == training forward",
                     torch.allclose(torch.cat(served), train, atol=1e-5)))
 
+# 4. multimodal: media placeholder tokens get no engram, and count as missing history
+from micro_engram_vllm.ids import mask_media  # noqa: E402
+
+IMG = 900  # a media placeholder id in this test vocab
+eng = make("scalar_sqrt")
+text1, text2 = hist[0][:6], hist[0][6:14]
+seq = text1 + [IMG] * 4 + text2  # text, image (4 soft tokens), text
+hidden = torch.randn(len(seq), D) * 30
+h = {0: seq}
+out, n, _ = run_step([(0, 0, len(seq))], h, {0: 3})
+ids, keep = mask_media(out[:n], torch.tensor([IMG, 901]))
+served = eng.inject(hidden, eng.hash_prev(ids), keep)
+media = slice(len(text1), len(text1) + 4)
+results.append(("multimodal: image positions get no engram (hidden unchanged)",
+                torch.equal(served[media], hidden[media]) and not keep[media].any() and keep[:len(text1)].all()))
+results.append(("multimodal: text before the image == plain text",
+                torch.allclose(served[:len(text1)], eng(hidden[:len(text1)].unsqueeze(0),
+                                                        torch.tensor([text1]))[0], atol=1e-5)))
+after = slice(len(text1) + 4, len(seq))
+alone = eng(hidden[after].unsqueeze(0), torch.tensor([text2]))[0]  # text after the image, as if a new start
+results.append(("multimodal: text right after the image sees no history (like llama.cpp)",
+                torch.allclose(served[after], alone, atol=1e-5)))
+plain_ids, plain_keep = mask_media(out[:n], torch.tensor([7777]))  # no media in this vocab range
+results.append(("multimodal: without media tokens the mask changes nothing",
+                torch.equal(plain_ids, out[:n]) and bool(plain_keep.all())))
+
 bad = 0
 for name, ok in results:
     print(f"[{'PASS' if ok else 'FAIL'}] {name}")

@@ -15,9 +15,12 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4ForCausalLM
+from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from micro_engram.module import check_loaded, engram_from_spec
+
+from .ids import mask_media
 from micro_engram.weights import base_mismatch, engram_specs, load_engram_weights
 
 # Under "vllm." so vLLM's log handler prints it (other logger names are dropped).
@@ -37,8 +40,11 @@ class EngramGemma4DecoderLayer(Gemma4DecoderLayer):
         if not self.micro_engram_on:  # fixed at load time, so compile sees a constant
             return hidden_states, residual
         ids = self.micro_engram_ids[: hidden_states.shape[0]]
+        keep = None
+        if self.micro_engram_media is not None:  # multimodal model: set at load time
+            ids, keep = mask_media(ids, self.micro_engram_media)
         idx = self.micro_engram.hash_prev(ids)
-        return self.micro_engram.inject(hidden_states, idx), residual
+        return self.micro_engram.inject(hidden_states, idx, keep), residual
 
 
 def _resolve_engram(vllm_config: VllmConfig):
@@ -94,10 +100,13 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
         if (msg := base_mismatch(conf, vllm_config.model_config.model)):
             logger.warning("[micro_engram] %s", msg)
 
-        if vllm_config.model_config.architecture != "Gemma4ForCausalLM":
+        # Inside the multimodal model the language model sees the top-level architecture;
+        # EngramGemma4ForConditionalGeneration feeds it. Other wrappers would not.
+        arch = vllm_config.model_config.architecture
+        if arch not in ("Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"):
             raise ValueError(
-                "[micro_engram] serve the text-only architecture, otherwise the engram is "
-                "never fed: add --hf-overrides '{\"architectures\": [\"Gemma4ForCausalLM\"]}'"
+                f"[micro_engram] {arch} is not supported (the engram would never be fed); "
+                "serve Gemma4ForConditionalGeneration or Gemma4ForCausalLM"
             )
         if not vllm_config.use_v2_model_runner:
             raise ValueError(
@@ -125,6 +134,7 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
                 )
             layer.register_buffer("micro_engram_ids", self._micro_engram_ids, persistent=False)
             layer.micro_engram_on = on
+            layer.micro_engram_media = None  # set by the multimodal wrapper
             layer.__class__ = EngramGemma4DecoderLayer
             self.micro_engram_slots.append((spec, layer))
             logger.info(
@@ -183,3 +193,39 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
         logger.info("[micro_engram] layer %d: loaded %d engram tensors from %s",
                     spec["layer"], len(sd), spec["weights"])
         return {f"{prefix}.{n}" for n, _ in engram.named_parameters()}
+
+
+class EngramGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
+    """Multimodal Gemma 4 with the engram.
+
+    The language model inside is built through the registry as "Gemma4ForCausalLM", so
+    it is already EngramGemma4ForCausalLM. vLLM takes the model state from the top-level
+    model, so this class hands it the engram's model state and token-id buffer, and
+    tells the engram layers which token ids are media placeholders (no engram there).
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        slots = getattr(self.language_model, "micro_engram_slots", None)
+        if not slots:
+            return
+        media = sorted({int(t) for t in (getattr(self.config, n, None)
+                                         for n in ("image_token_id", "video_token_id", "audio_token_id"))
+                        if t is not None})
+        for _, layer in slots:
+            layer.__dict__.pop("micro_engram_media", None)  # the None placeholder; register_buffer refuses existing names
+            layer.register_buffer(
+                "micro_engram_media",
+                torch.tensor(media, dtype=torch.int32, device=layer.micro_engram_ids.device),
+                persistent=False,
+            )
+        logger.info("[micro_engram] multimodal model: no engram on media placeholder tokens %s", media)
+
+    @property
+    def micro_engram_ids(self) -> torch.Tensor | None:
+        return getattr(self.language_model, "micro_engram_ids", None)
+
+    def get_model_state_cls(self):
+        from .model_state import EngramModelState
+
+        return EngramModelState

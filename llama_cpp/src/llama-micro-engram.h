@@ -76,4 +76,5 @@ private:
     llm_graph_context & g;
     const llama_micro_engram & me;
     std::vector<ggml_tensor *> mem; // [n_tables*dim, n_tokens] per engram
+    ggml_tensor * keep = nullptr;   // F32 [1, n_tokens], 0 for embedding rows (mixed ubatch only)
 };

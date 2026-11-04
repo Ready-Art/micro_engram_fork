@@ -189,6 +189,15 @@ public:
                 ggml_backend_tensor_set(ids[e], rows.data(), 0, rows.size()*sizeof(int32_t));
             }
         }
+
+        // embedding (image) rows of a mixed ubatch get no engram
+        if (keep && keep->buffer) {
+            std::vector<float> k(ubatch->n_tokens);
+            for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+                k[i] = ubatch->is_mixed() && ubatch->type[i] ? 0.0f : 1.0f;
+            }
+            ggml_backend_tensor_set(keep, k.data(), 0, k.size()*sizeof(float));
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -197,6 +206,10 @@ public:
             return ids.empty();
         }
         if (ids.size() != me.engrams.size()) {
+            return false;
+        }
+        if ((keep != nullptr) != (params.ubatch.embd != nullptr) ||
+                (keep && keep->ne[1] != (int64_t) params.ubatch.n_tokens)) {
             return false;
         }
         for (size_t e = 0; e < ids.size(); ++e) {
@@ -208,6 +221,7 @@ public:
     }
 
     std::vector<ggml_tensor *> ids; // I32 [n_tables*n_tokens] per engram
+    ggml_tensor * keep = nullptr;   // F32 [1, n_tokens], mixed ubatch only
 
     const llama_micro_engram & me;
     const llama_memory_context_i * mctx;
@@ -230,6 +244,12 @@ llm_micro_engram_graph::llm_micro_engram_graph(llm_graph_context & g, const llam
             rows = ggml_reshape_2d(g.ctx0, rows, e.mem_dim(), g.n_tokens);
             g.cb(rows, "mengram_rows", e.layer);
             mem.push_back(rows);
+        }
+        if (g.ubatch.embd) {
+            keep = ggml_new_tensor_2d(g.ctx0, GGML_TYPE_F32, 1, g.n_tokens);
+            ggml_set_name(keep, "mengram_keep");
+            ggml_set_input(keep);
+            inp->keep = keep;
         }
     }
     g.res->add_input(std::move(inp));
@@ -267,6 +287,9 @@ ggml_tensor * llm_micro_engram_graph::inject(ggml_tensor * cur, int il, ggml_ten
         }
         g.cb(s, "mengram_score", il);
         out = ggml_mul(ctx0, ggml_mul_mat(ctx0, e.value, m), ggml_sigmoid(ctx0, s));
+    }
+    if (keep) {
+        out = ggml_mul(ctx0, out, keep->ne[1] == cur->ne[1] ? keep : ggml_get_rows(ctx0, keep, inp_out_ids));
     }
     g.cb(out, "mengram_out", il);
 

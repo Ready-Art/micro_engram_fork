@@ -57,3 +57,14 @@ def fill_engram_ids(
                 out[:num_tokens, k] = torch.where(q >= start, from_chunk, from_hist)
     if num_tokens_padded > num_tokens:
         out[num_tokens:num_tokens_padded] = -1  # CUDA-graph padding rows
+
+
+def mask_media(ids: torch.Tensor, media_ids: torch.Tensor):
+    """Media (image/video/audio placeholder) tokens get no engram, and as history they
+    count as missing, like the start of a sequence (same as the llama.cpp patch).
+
+    ids: [n, max_order] from fill_engram_ids. Returns (ids with media ids set to -1,
+    keep [n] bool: False where the token itself is a media placeholder).
+    """
+    is_media = (ids.unsqueeze(-1) == media_ids.to(ids.dtype)).any(-1)
+    return torch.where(is_media, torch.full_like(ids, -1), ids), ~is_media[:, 0]

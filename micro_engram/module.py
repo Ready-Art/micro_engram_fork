@@ -123,8 +123,11 @@ class MicroEngram(nn.Module):
             out.append((x % _PRIME) % self.table_size)
         return out
 
-    def inject(self, hidden, idx):
-        """Look up the hashed rows `idx` and add the gated memory to `hidden`."""
+    def inject(self, hidden, idx, keep=None):
+        """Look up the hashed rows `idx` and add the gated memory to `hidden`.
+
+        keep: optional [n_tokens] bool; False tokens get no memory (e.g. image/audio
+        placeholders in multimodal serving, which training never saw)."""
         mem = torch.cat([tab(i) for tab, i in zip(self.tables, idx)], dim=-1)
         d = hidden.shape[-1]
         h = F.rms_norm(hidden.float(), (d,))
@@ -145,6 +148,8 @@ class MicroEngram(nn.Module):
             # Normalising h keeps the gate well-scaled (Gemma's residual stream is large).
             g = F.gelu(self.down(h.to(self.down.weight.dtype)), approximate="tanh")
             out = self.up(g * mem).float()
+        if keep is not None:
+            out = out * keep.reshape(*out.shape[:-1], 1).to(out.dtype)
         return hidden + out.to(hidden.dtype)
 
     def forward(self, hidden, input_ids, position_ids=None):

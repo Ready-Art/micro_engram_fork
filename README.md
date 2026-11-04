@@ -257,7 +257,7 @@ Engram settings are resolved in this order: explicit flag (`--layer`, `--table-s
 
 ### Serving with vLLM
 
-`micro_engram_vllm` is a vLLM plugin (no vLLM fork). Installing this package registers it automatically; it replaces vLLM's text-only Gemma 4 class with one that runs the engram at its layer. Models without a `micro_engram_config.json` keep running as plain Gemma 4.
+`micro_engram_vllm` is a vLLM plugin (no vLLM fork). Installing this package registers it automatically; it replaces vLLM's Gemma 4 classes (text-only and multimodal) with ones that run the engram at its layer(s). Models without a `micro_engram_config.json` keep running as plain Gemma 4.
 
 Install the package **in the vLLM environment** (Axolotl is not needed there):
 
@@ -269,11 +269,10 @@ Serve the **merged** model folder, with `micro_engram_config.json` copied into i
 
 ```bash
 vllm serve /path/to/merged_model --tensor-parallel-size 4 \
-    --hf-overrides '{"architectures": ["Gemma4ForCausalLM"]}' \
     --reasoning-parser gemma4        # optional: thinking in reasoning_content
 ```
 
-- **`--hf-overrides` is required.** The plugin runs on the text-only architecture; without it, vLLM starts the multimodal one and the plugin stops with an error.
+- **Images, video and audio:** the multimodal model is served as usual. Media placeholder tokens get no engram (training never saw them), and the text right after an image sees no earlier tokens through the engram, like the start of a sequence. Text-only serving with `--hf-overrides '{"architectures": ["Gemma4ForCausalLM"]}'` also works. (Multimodal serving is tested on CPU only, not yet on GPUs.)
 - **Model Runner V2 is required.** It is vLLM's default; the plugin stops with an error if something forces the old runner.
 - **A/B test:** start with `MICRO_ENGRAM_OFF=1` to load the same weights with the engram switched off.
 - **vLLM version:** the plugin uses internal vLLM APIs and was written against commit `64175d3827`. Other versions may need changes.
@@ -285,7 +284,6 @@ The engram doesn't have to live in the model folder. Serve the **plain base mode
 
 ```bash
 vllm serve /path/to/base_model --tensor-parallel-size 4 \
-    --hf-overrides '{"architectures": ["Gemma4ForCausalLM"]}' \
     --additional-config '{"micro_engram": "/path/to/run/checkpoint-400/micro_engram_config.json"}'
 ```
 
@@ -321,7 +319,7 @@ How it works: on every batch, each token's previous two tokens come from llama.c
 Notes:
 - A patched llama.cpp still loads every other GGUF normally. An **unpatched** llama.cpp refuses a GGUF that contains an engram (unknown tensors).
 - Use the same tokenizer as training: the token-merge map is per token id.
-- Image tokens (multimodal input) get no engram.
+- Image tokens (multimodal input) get no engram, and text right after an image sees no earlier tokens through the engram (same as vLLM).
 
 Tested on CPU against the PyTorch engram (`llama_cpp/test/compare.py`, a tiny random Gemma 4 with two engrams per model, all three gates, f32 and bf16 storage):
 - the logits match within the drift that llama.cpp shows even without an engram (~2e-2 on a tiny model)

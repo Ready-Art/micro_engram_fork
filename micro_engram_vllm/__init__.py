@@ -10,3 +10,8 @@ def register():
     ModelRegistry.register_model(
         "Gemma4ForCausalLM", "micro_engram_vllm.model:EngramGemma4ForCausalLM"
     )
+    # The multimodal model builds its language model through the registry (so it gets the
+    # class above); this override hands vLLM the engram's model state.
+    ModelRegistry.register_model(
+        "Gemma4ForConditionalGeneration", "micro_engram_vllm.model:EngramGemma4ForConditionalGeneration"
+    )
