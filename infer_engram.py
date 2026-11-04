@@ -24,7 +24,7 @@ import torch
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from micro_engram.module import MicroEngram, find_text_layers
+from micro_engram.module import MicroEngram, find_text_layers, layer_device_dtype
 from micro_engram.weights import load_engram_weights as load_engram_file
 from micro_engram.weights import base_mismatch, resolve_weights_path
 
@@ -146,8 +146,8 @@ class EngramRunner:
 
         _, layers = find_text_layers(model)
         target = layers[layer_idx]
-        ref = next(target.parameters())
-        engram.to(device=ref.device, dtype=ref.dtype)
+        device, dtype = layer_device_dtype(target)  # also right on a 4-bit base
+        engram.to(device=device, dtype=dtype)
         target.add_module("micro_engram", engram)
 
         model.register_forward_pre_hook(self._grab_ids, with_kwargs=True)

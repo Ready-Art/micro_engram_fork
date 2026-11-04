@@ -183,6 +183,30 @@ def find_text_layers(model):
     raise RuntimeError("Could not find text decoder layers; print(model) and set the path by hand.")
 
 
+_QUANTIZED_PARAMS = ("Params4bit", "Int8Params")  # bitsandbytes packed weights
+
+
+def layer_device_dtype(layer):
+    """(device, compute dtype) for an engram placed in `layer`.
+
+    The first parameter is not enough on a quantized base: a bitsandbytes 4-bit weight is
+    a packed tensor whose dtype is the storage type (uint8, or bf16 with Axolotl's QLoRA
+    settings), not the compute dtype. Use the first real floating-point weight (e.g. a
+    norm), else the quantized layer's compute dtype, else bf16.
+    """
+    params = list(layer.parameters())
+    if not params:
+        raise RuntimeError("decoder layer has no parameters")
+    for p in params:
+        if p.is_floating_point() and type(p).__name__ not in _QUANTIZED_PARAMS:
+            return p.device, p.dtype
+    for m in layer.modules():
+        cd = getattr(m, "compute_dtype", None)
+        if isinstance(cd, torch.dtype) and cd.is_floating_point:
+            return params[0].device, cd
+    return params[0].device, torch.bfloat16
+
+
 def attach_engram(model, engram, layer_idx):
     """Nest the engram inside decoder layer `layer_idx` and inject after its forward.
 
@@ -191,9 +215,9 @@ def attach_engram(model, engram, layer_idx):
     """
     name, layers = find_text_layers(model)
     target = layers[layer_idx]
-    ref = next(target.parameters())
+    device, dtype = layer_device_dtype(target)
     # FSDP2 requires a single dtype within one wrapped unit; ints (mults, canon) are untouched.
-    engram.to(device=ref.device, dtype=ref.dtype)
+    engram.to(device=device, dtype=dtype)
     target.add_module("micro_engram", engram)
     state = {}
 

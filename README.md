@@ -94,6 +94,38 @@ sample_packing: true     # supported, as long as position_ids restart at 0 per d
 
 Hashed tables usually want a **higher learning rate** than normal fine-tuning (we use `1e-3`) and `weight_decay: 0.0`.
 
+### Training on a 4-bit base (NF4, experimental)
+
+The frozen base can be loaded in 4-bit (bitsandbytes NF4, as in QLoRA) while the engram trains in bf16. Gemma 4 31B drops from ~62 GB to ~17 GB, so FSDP no longer needs `offload_params` and training gets much faster, with room for bigger tables. The engram is still served on the normal bf16 base.
+
+Axolotl only loads a 4-bit base for `adapter: qlora`, so the config uses a **placeholder LoRA**: rank 1 on one module. LoRA starts as an exact no-op (its B matrix is zero), and `unfrozen_parameters` keeps it frozen, so it stays a no-op and only the engram trains:
+
+```yaml
+base_model: /path/to/bf16/model        # quantized on the fly; serve the engram on this same folder
+load_in_4bit: true
+adapter: qlora
+lora_r: 1
+lora_alpha: 1
+lora_dropout: 0.0
+lora_target_modules:
+  - model.language_model.layers.59.self_attn.o_proj   # any single module; it stays frozen at zero
+
+unfrozen_parameters:
+  - '.+micro_engram'     # PEFT renames everything to base_model.model...; '.+' is a wildcard here
+
+fsdp_config:
+  offload_params: false              # the point of 4-bit
+  cpu_ram_efficient_loading: false   # Axolotl rejects true with FSDP2 + 4-bit
+micro_engram_save_trainable_only: true
+```
+
+Notes:
+- **Change the `unfrozen_parameters` pattern.** The old `model.language_model.layers.0...` pattern matches nothing under PEFT (Axolotl matches from the start of the name), so the engram would stay frozen. The plugin logs an error at train start if that happens, and a warning if anything besides the engram is training (e.g. the LoRA).
+- Don't set a PEFT init option (`peft_init_lora_weights` / PiSSA / OLoRA etc.): only the default init starts the LoRA at exactly zero.
+- Don't merge the LoRA; it is zero. The engram is in the checkpoint as usual (`assemble_engram_model.py`, vLLM `--additional-config`).
+- The engram learns against the 4-bit model's hidden states and is served on bf16 ones. Like QLoRA adapters this is usually fine, but measure it: `eval_logprob.py` on the bf16 base, engram on vs off.
+- Tested on CPU only (`test_quant.py`: real bitsandbytes NF4 layers plus a PEFT LoRA). Not yet run on GPUs with FSDP2.
+
 ### Full example (Gemma 4 31B, FSDP2)
 
 ```yaml
@@ -263,6 +295,7 @@ python test_gate.py                           # all gate modes: no-op start, gra
 python test_canon.py                          # token-merge hashing and state-dict compatibility
 python test_resume_keys.py                    # checkpoint-wrapper key renaming on resume
 python test_vllm_ids.py                       # vLLM path: previous tokens per batch type, same output as training
+python test_quant.py                          # 4-bit (NF4) base + placeholder QLoRA: dtype, freezing pattern, gradients (needs bitsandbytes, peft)
 ```
 
 ---

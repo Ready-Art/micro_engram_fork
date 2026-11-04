@@ -80,7 +80,18 @@ class _ReportTrainableCallback(TrainerCallback):
                     f"engram {n_eng_train / 1e6:.1f}M of {n_eng / 1e6:.1f}M trainable")
         if n_eng_train == 0:
             LOG.error("[micro_engram] the engram is FROZEN: check that unfrozen_parameters matches "
-                      "layers.<micro_engram_layer>...micro_engram")
+                      "the engram's parameter names (with an adapter, PEFT adds a 'base_model.model.' "
+                      "prefix: use '.+micro_engram')")
+        others = [n for n, p in model.named_parameters() if p.requires_grad and "micro_engram" not in n]
+        if others:
+            LOG.warning(f"[micro_engram] {len(others)} non-engram tensors are ALSO training "
+                        f"(e.g. {others[0]}). Fine if intended (engram + LoRA); for an engram-only run "
+                        f"on a 4-bit base, set unfrozen_parameters: ['.+micro_engram']")
+        # module class, not parameter class: FSDP2 turns the weights into DTensors
+        n_4bit = sum(1 for m in model.modules() if type(m).__name__ == "Linear4bit")
+        if n_4bit:
+            LOG.warning(f"[micro_engram] base is 4-bit ({n_4bit} quantized linear layers); the engram "
+                        f"trains in {next(self.engram.parameters()).dtype} against it")
 
 
 class _StatsCallback(TrainerCallback):
