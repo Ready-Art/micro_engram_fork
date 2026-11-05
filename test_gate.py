@@ -182,6 +182,29 @@ moved = (bf.state_dict()["q_scale"].float() - 1).abs()
 results.append((f"bf16 + AdamW lr 1e-3: the scales learn now ({(moved > 0).float().mean():.0%} of q_scale moved)",
                 (moved > 0).float().mean() > 0.5))
 
+# norm_scales() is the one place that turns the stored delta into the scale (in fp32)
+ns = make("scalar_sqrt").to(torch.bfloat16)
+with torch.no_grad():
+    ns.q_scale.fill_(0.003)
+qs, ks = ns.norm_scales()
+results.append(("norm_scales(): 1 + delta in fp32 (1.003 survives, not rounded to bf16)",
+                qs.dtype == torch.float32 and abs(float(qs[0]) - 1.003) < 1e-4 and float(ks[0]) == 1.0))
+
+# guard: code outside module.py must not read the delta parameters as if they were scales
+import pathlib, re  # noqa: E402
+
+root = pathlib.Path(__file__).resolve().parent
+direct = []
+for f in root.rglob("*.py"):
+    rel = f.relative_to(root).as_posix()
+    if rel == "micro_engram/module.py" or f.name.startswith("test_") or "/test/" in f"/{rel}" or ".venv" in rel:
+        continue
+    for i, line in enumerate(f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        if re.search(r"\.(q|k)_scale\b", line):
+            direct.append(f"{rel}:{i}")
+results.append(("no code outside module.py reads .q_scale/.k_scale directly (they hold scale - 1)"
+                + (f": {direct}" if direct else ""), not direct))
+
 try:
     make("bogus")
     results.append(("unknown gate is rejected", False))

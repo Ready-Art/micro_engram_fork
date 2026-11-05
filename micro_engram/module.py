@@ -81,8 +81,15 @@ class MicroEngram(nn.Module):
                 raise ValueError(f"canon must have shape ({vocab_size},), got {tuple(canon.shape)}")
         self.register_buffer("canon", canon)
 
-    # q_scale / k_scale hold scale - 1 in the module, the scale itself in state dicts
+    # q_scale / k_scale hold scale - 1 in the module, the scale itself in state dicts.
+    # Read the scales through norm_scales() or state_dict(), never the parameters directly
+    # (test_gate.py checks that no code outside this file does).
     DELTA_SCALES = ("q_scale", "k_scale")
+
+    def norm_scales(self):
+        """(q scale, k scale) of the scalar_sqrt gate in fp32: 1 + delta, with delta made fp32
+        first (1 + a small delta in bf16 rounds back to 1.0)."""
+        return 1 + self.q_scale.float(), 1 + self.k_scale.float()
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         super()._save_to_state_dict(destination, prefix, keep_vars)
@@ -156,8 +163,9 @@ class MicroEngram(nn.Module):
         h = F.rms_norm(hidden.float(), (d,))
         if self.gate in self.SCALAR_GATES:
             if self.gate == "scalar_sqrt":
-                h = F.rms_norm(hidden.float(), (d,), weight=1 + self.q_scale.float())
-                k = F.rms_norm(self.key(mem).float(), (d,), weight=1 + self.k_scale.float())
+                q_scale, k_scale = self.norm_scales()
+                h = F.rms_norm(hidden.float(), (d,), weight=q_scale)
+                k = F.rms_norm(self.key(mem).float(), (d,), weight=k_scale)
             else:
                 k = F.rms_norm(self.key(mem).float(), (d,))
             s = (h * k).sum(-1, keepdim=True) / d ** 0.5
