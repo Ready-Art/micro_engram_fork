@@ -90,8 +90,9 @@ def engram_tensors(layer, eng: MicroEngram, dtype):
         out[kv + "mengram_key"] = as_dtype(eng.key.weight, dtype)
         out[kv + "mengram_value"] = as_dtype(eng.value.weight, dtype)
         if eng.gate == "scalar_sqrt":
-            out[vec + "mengram_q_scale"] = as_dtype(eng.q_scale, "f32")
-            out[vec + "mengram_k_scale"] = as_dtype(eng.k_scale, "f32")
+            sd = eng.state_dict()  # holds the scales themselves (the parameters hold scale - 1)
+            out[vec + "mengram_q_scale"] = as_dtype(sd["q_scale"], "f32")
+            out[vec + "mengram_k_scale"] = as_dtype(sd["k_scale"], "f32")
     return out
 
 

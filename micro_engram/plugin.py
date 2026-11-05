@@ -9,7 +9,7 @@ from transformers import TrainerCallback
 
 from axolotl.integrations.base import BasePlugin
 
-from .module import attach_engram, check_loaded, engram_from_spec
+from .module import MicroEngram, attach_engram, check_loaded, engram_from_spec
 from .stats import module_stats
 from .weights import (base_fingerprint, default_seed, load_engram_weights,
                       resolve_engram_source)
@@ -277,6 +277,8 @@ def _patch_accelerate_resume():
                     raise RuntimeError("[micro_engram] resume: the token-merge map in the checkpoint differs "
                                        "from micro_engram_canon_path in the YAML. Use the same canon file.")
                 continue
+            if k.rsplit(".", 1)[-1] in MicroEngram.DELTA_SCALES:
+                v = v - 1  # checkpoints hold the scale; the parameter holds scale - 1
             with torch.no_grad():
                 target.copy_(v)
             loaded += 1

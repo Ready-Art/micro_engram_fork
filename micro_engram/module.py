@@ -54,9 +54,12 @@ class MicroEngram(nn.Module):
             self.value = nn.Linear(mem_dim, model_dim, bias=False)  # what gets injected
             nn.init.zeros_(self.value.weight)  # step 0: exact no-op
             if gate == "scalar_sqrt":
-                # learnable RMSNorm scales for the query (hidden state) and the key
-                self.q_scale = nn.Parameter(torch.ones(model_dim))
-                self.k_scale = nn.Parameter(torch.ones(model_dim))
+                # Learnable RMSNorm scales for the query (hidden state) and the key, stored as
+                # delta from 1 (scale = 1 + q_scale): near 1.0 bf16 has a 1/128 step, so an Adam
+                # step (~lr) would round away and the scale could never move. Saved state dicts
+                # still hold the scale itself (see _save_to_state_dict / _load_from_state_dict).
+                self.q_scale = nn.Parameter(torch.zeros(model_dim))
+                self.k_scale = nn.Parameter(torch.zeros(model_dim))
         else:
             self.down = nn.Linear(model_dim, mem_dim, bias=False)   # hidden -> per-dim gate
             self.up = nn.Linear(mem_dim, model_dim, bias=False)     # gated memory -> hidden
@@ -77,6 +80,26 @@ class MicroEngram(nn.Module):
             if canon.shape != (vocab_size,):
                 raise ValueError(f"canon must have shape ({vocab_size},), got {tuple(canon.shape)}")
         self.register_buffer("canon", canon)
+
+    # q_scale / k_scale hold scale - 1 in the module, the scale itself in state dicts
+    DELTA_SCALES = ("q_scale", "k_scale")
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        for name in self.DELTA_SCALES:
+            key = prefix + name
+            if key in destination:
+                # fp32: 1 + a small delta in bf16 would round back to exactly 1.0
+                destination[key] = destination[key].detach().float() + 1
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        for name in self.DELTA_SCALES:
+            key = prefix + name
+            if key in state_dict:
+                state_dict[key] = state_dict[key].float() - 1  # load_state_dict's own copy of the dict
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
 
     def hash_ids(self, input_ids, position_ids=None):
         ids = input_ids.long()
@@ -133,8 +156,8 @@ class MicroEngram(nn.Module):
         h = F.rms_norm(hidden.float(), (d,))
         if self.gate in self.SCALAR_GATES:
             if self.gate == "scalar_sqrt":
-                h = F.rms_norm(hidden.float(), (d,), weight=self.q_scale.float())
-                k = F.rms_norm(self.key(mem).float(), (d,), weight=self.k_scale.float())
+                h = F.rms_norm(hidden.float(), (d,), weight=1 + self.q_scale.float())
+                k = F.rms_norm(self.key(mem).float(), (d,), weight=1 + self.k_scale.float())
             else:
                 k = F.rms_norm(self.key(mem).float(), (d,))
             s = (h * k).sum(-1, keepdim=True) / d ** 0.5

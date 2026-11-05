@@ -95,8 +95,11 @@ def cfg(**kw):
 def fake_checkpoint(model, plugin, out_dir, step):
     """What an FSDP2 trainable-only save leaves: DCP of the trainable weights + config."""
     ckpt = os.path.join(out_dir, f"checkpoint-{step}")
-    sd = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
-    sd.update({n: b.clone() for n, b in model.named_buffers() if "micro_engram" in n})
+    # through state_dict(), as FSDP's get_model_state_dict does (it writes the scales, not their deltas)
+    full = model.state_dict()
+    keep = {n for n, p in model.named_parameters() if p.requires_grad}
+    keep |= {n for n, _ in model.named_buffers() if "micro_engram" in n}
+    sd = {k: v.detach().clone() for k, v in full.items() if k in keep}
     dcp.save(sd, checkpoint_id=os.path.join(ckpt, "pytorch_model_fsdp_0"), no_dist=True)
     cb = _WriteConfigCallback(plugin.base_conf, plugin.slots, "pytorch_model_fsdp_0")
     state = types.SimpleNamespace(is_world_process_zero=True, global_step=step)
@@ -123,7 +126,7 @@ eng_a = plug_a.slots[0].engram
 with torch.no_grad():  # "training"
     eng_a.value.weight.normal_(std=0.05)
     eng_a.tables[1].weight.add_(0.3)
-    eng_a.q_scale.mul_(1.7)
+    eng_a.q_scale.add_(0.7)  # delta: the scale becomes 1.7
 check("run A: one engram at layer 0, seed 0 (same hashing as before multi-engram)",
       len(plug_a.slots) == 1 and plug_a.slots[0].spec["seed"] == 0)
 fake_checkpoint(model_a, plug_a, run_a, 10)
@@ -145,7 +148,7 @@ plug_b.post_model_load(cfg_b, model_b)
 e0, e2 = plug_b.slots[0].engram, plug_b.slots[1].engram
 check("run B: frozen layer-0 engram equals run A's (trained settings used, not the YAML's)",
       e0.table_size == 257 and torch.equal(e0.tables[1].weight, eng_a.tables[1].weight)
-      and torch.equal(e0.q_scale, eng_a.q_scale) and torch.equal(e0.mults, eng_a.mults))
+      and torch.allclose(e0.q_scale, eng_a.q_scale, atol=1e-6) and torch.equal(e0.mults, eng_a.mults))
 check("run B: layer-2 engram is new, its own gate, seed 10007*2, starts as a no-op",
       e2.gate == "scalar" and plug_b.slots[1].spec["seed"] == 20014
       and not torch.equal(e2.mults, e0.mults) and e2.value.weight.abs().sum() == 0)
@@ -305,14 +308,17 @@ if have_peft:
     with torch.no_grad():
         pe.value.weight.normal_(std=0.05)
         pe.tables[0].weight.add_(0.5)
+        pe.q_scale.add_(0.25)  # stored as delta; files hold 1.25
     ck = os.path.join(TMP, "adapter_ckpt")
     dcp.save(fsdp_utils._get_model_state_dict(pm, adapter_only=True, sd_options=opts), checkpoint_id=ck, no_dist=True)
     pm2, pe2 = peft_with_engram()  # fresh run resuming: same steps as load_fsdp_model
     template = fsdp_utils._get_model_state_dict(pm2, adapter_only=True, sd_options=opts)
     dcp.load(template, checkpoint_id=ck, no_dist=True)
     fsdp_utils._set_model_state_dict(pm2, template, adapter_only=True, sd_options=opts)
-    check("resume from an adapter_only checkpoint restores the engram",
-          torch.equal(pe2.tables[0].weight, pe.tables[0].weight) and torch.equal(pe2.value.weight, pe.value.weight))
+    check("resume from an adapter_only checkpoint restores the engram (scales too)",
+          torch.equal(pe2.tables[0].weight, pe.tables[0].weight) and torch.equal(pe2.value.weight, pe.value.weight)
+          and torch.allclose(pe2.q_scale, pe.q_scale)
+          and torch.allclose(load_engram_weights(ck, layer=0)["q_scale"], pe.q_scale + 1))
     check("assemble/inference loaders read the engram from it (PEFT key prefix stripped)",
           torch.equal(load_engram_weights(ck, layer=0)["value.weight"], pe.value.weight))
 

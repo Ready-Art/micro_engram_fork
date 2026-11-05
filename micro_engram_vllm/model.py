@@ -18,7 +18,7 @@ from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4ForCausa
 from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 from vllm.model_executor.models.utils import PPMissingLayer
 
-from micro_engram.module import check_loaded, engram_from_spec
+from micro_engram.module import MicroEngram, check_loaded, engram_from_spec
 
 from .ids import mask_media
 from micro_engram.weights import base_mismatch, engram_specs, load_engram_weights
@@ -28,6 +28,14 @@ logger = init_logger("vllm.micro_engram")
 
 CONFIG_NAME = "micro_engram_config.json"
 _WRAP = "._checkpoint_wrapped_module."  # can appear in keys saved with checkpointing
+
+
+def _scale_to_delta(name, w):
+    """Checkpoints hold the gate norm scales; MicroEngram stores them as scale - 1. vLLM's own
+    loader copies by name (no load_state_dict hook), so convert here."""
+    if ".micro_engram." in name and name.rsplit(".", 1)[-1] in MicroEngram.DELTA_SCALES:
+        return name, w - 1
+    return name, w
 
 
 class EngramGemma4DecoderLayer(Gemma4DecoderLayer):
@@ -155,7 +163,7 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
         return EngramModelState
 
     def load_weights(self, weights):
-        weights = ((name.replace(_WRAP, "."), w) for name, w in weights)
+        weights = (_scale_to_delta(name.replace(_WRAP, "."), w) for name, w in weights)
         if not self.micro_engram_separate or not self.micro_engram_slots:
             return super().load_weights(weights)
 

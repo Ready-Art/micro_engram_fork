@@ -4,6 +4,7 @@ Checks both gate modes on CPU. Run in the venv:  python test_gate.py
 import sys
 
 import torch
+import torch.nn.functional as F
 
 from micro_engram.module import MicroEngram
 
@@ -58,9 +59,10 @@ results.append(("both modes have the same parameter count",
 results.append(("an old scalar checkpoint still loads strictly",
                 not make("scalar").load_state_dict(s.state_dict(), strict=True).missing_keys))
 q = make("scalar_sqrt")
-results.append(("scalar_sqrt has key/value plus learnable q_scale/k_scale (init 1)",
+results.append(("scalar_sqrt has key/value plus learnable q_scale/k_scale (scale 1: stored as delta 0)",
                 {"key.weight", "value.weight", "q_scale", "k_scale"} <= set(q.state_dict())
-                and torch.equal(q.q_scale, torch.ones(D)) and q.q_scale.requires_grad))
+                and torch.equal(q.q_scale, torch.zeros(D)) and q.q_scale.requires_grad
+                and torch.equal(q.state_dict()["q_scale"], torch.ones(D))))
 results.append(("scalar_sqrt: old scalar checkpoint has no scales (so it never loads by accident)",
                 set(make("scalar_sqrt").load_state_dict(s.state_dict(), strict=False).missing_keys)
                 == {"q_scale", "k_scale"}))
@@ -126,6 +128,52 @@ keep = torch.tensor([[True] * 6 + [False] * 6] * 2)
 masked, full = eng.inject(hidden, idx, keep), eng.inject(hidden, idx)
 results.append(("inject keep=False rows are unchanged, keep=True rows match",
                 torch.equal(masked[:, 6:], hidden[:, 6:]) and torch.equal(masked[:, :6], full[:, :6])))
+
+# scales stored as delta (bf16 can't move a value at 1.0 by an Adam step)
+torch.manual_seed(3)
+old = make("scalar_sqrt").state_dict()
+old["q_scale"] = 1 + 0.3 * torch.rand(D)  # a checkpoint from before: holds the scale itself
+old["k_scale"] = 1 - 0.2 * torch.rand(D)
+old["value.weight"] = torch.randn_like(old["value.weight"]) * 0.05
+new = make("scalar_sqrt")
+new.load_state_dict(old)
+results.append(("old checkpoint (scale) loads as delta = scale - 1",
+                torch.allclose(new.q_scale, old["q_scale"] - 1) and torch.allclose(new.k_scale, old["k_scale"] - 1)))
+results.append(("saved state dict holds the scale itself (unchanged file format)",
+                torch.allclose(new.state_dict()["q_scale"], old["q_scale"])))
+idx_ = new.hash_ids(ids)
+mem_ = torch.cat([t(i) for t, i in zip(new.tables, idx_)], dim=-1)
+h_ = F.rms_norm(hidden.float(), (D,), weight=old["q_scale"])
+k_ = F.rms_norm(new.key(mem_).float(), (D,), weight=old["k_scale"])
+s_ = (h_ * k_).sum(-1, keepdim=True) / D ** 0.5
+want = hidden + torch.sigmoid(s_.sign() * s_.abs().clamp_min(1e-6).sqrt()) * new.value(mem_)
+results.append(("forward with delta storage == the scale formula", torch.allclose(new.inject(hidden, idx_), want, atol=1e-5)))
+st_ = module_stats(new)
+results.append(("live stats report the scale, not the delta",
+                abs(st_["engram/q_scale_mean"] - float(old["q_scale"].mean())) < 1e-5))
+
+# bf16 round trip: a small learned delta must survive save + load (1 + 0.003 in bf16 would be 1.0)
+rt = make("scalar_sqrt").to(torch.bfloat16)
+with torch.no_grad():
+    rt.q_scale.copy_(torch.linspace(-0.01, 0.01, D))
+saved = rt.state_dict()
+back = make("scalar_sqrt").to(torch.bfloat16)
+back.load_state_dict(saved)
+results.append(("bf16: small deltas survive save + load exactly",
+                torch.equal(back.q_scale, rt.q_scale) and saved["q_scale"].dtype == torch.float32))
+
+bf = make("scalar_sqrt").to(torch.bfloat16)
+with torch.no_grad():
+    bf.value.weight.normal_(std=0.05)
+opt = torch.optim.AdamW(bf.parameters(), lr=1e-3, weight_decay=0.0)
+hb = hidden.to(torch.bfloat16)
+for _ in range(50):
+    opt.zero_grad()
+    bf(hb, ids).float().pow(2).mean().backward()
+    opt.step()
+moved = (bf.state_dict()["q_scale"].float() - 1).abs()
+results.append((f"bf16 + AdamW lr 1e-3: the scales learn now ({(moved > 0).float().mean():.0%} of q_scale moved)",
+                (moved > 0).float().mean() > 0.5))
 
 try:
     make("bogus")
