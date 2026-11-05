@@ -48,7 +48,10 @@ def weight_stats(named, orders=(2, 3), num_heads=None):
             out[f"engram/{name}"] = float(_local(named[key]).float().abs().mean())
     for name in ("q_scale", "k_scale"):
         if name in named:
-            out[f"engram/{name}_mean"] = float(_local(named[name]).float().mean())
+            v = _local(named[name]).float()
+            out[f"engram/{name}_mean"] = float(v.mean())
+            # ups and downs cancel in the mean; the distance from 1 shows whether the scales learn
+            out[f"engram/{name}_dev"] = float((v - 1).abs().mean())
     return out
 
 
@@ -75,5 +78,5 @@ def format_stats(stats):
     if "engram/gate_mean" in stats:
         parts.append(f"gate {stats['engram/gate_mean']:.3f} (>0.99: {stats['engram/gate_saturated']:.0%})")
     if "engram/q_scale_mean" in stats:
-        parts.append(f"scales q {stats['engram/q_scale_mean']:.3f} k {stats['engram/k_scale_mean']:.3f}")
+        parts.append(f"scales |q-1| {stats['engram/q_scale_dev']:.2e} |k-1| {stats['engram/k_scale_dev']:.2e}")
     return "  ".join(parts)

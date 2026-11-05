@@ -150,7 +150,14 @@ want = hidden + torch.sigmoid(s_.sign() * s_.abs().clamp_min(1e-6).sqrt()) * new
 results.append(("forward with delta storage == the scale formula", torch.allclose(new.inject(hidden, idx_), want, atol=1e-5)))
 st_ = module_stats(new)
 results.append(("live stats report the scale, not the delta",
-                abs(st_["engram/q_scale_mean"] - float(old["q_scale"].mean())) < 1e-5))
+                abs(st_["engram/q_scale_mean"] - float(old["q_scale"].mean())) < 1e-5
+                and abs(st_["engram/q_scale_dev"] - float((old["q_scale"] - 1).abs().mean())) < 1e-5))
+sym = make("scalar_sqrt")
+with torch.no_grad():
+    sym.q_scale.copy_(torch.tensor([0.1, -0.1] * (D // 2)))  # learned, but symmetric: mean stays 1
+st_s = module_stats(sym)
+results.append(("scale deviation shows learning that the mean hides",
+                abs(st_s["engram/q_scale_mean"] - 1) < 1e-6 and abs(st_s["engram/q_scale_dev"] - 0.1) < 1e-6))
 
 # bf16 round trip: a small learned delta must survive save + load (1 + 0.003 in bf16 would be 1.0)
 rt = make("scalar_sqrt").to(torch.bfloat16)
