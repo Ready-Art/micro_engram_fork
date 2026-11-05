@@ -37,3 +37,7 @@ class MicroEngramArgs(BaseModel):
     # LR schedule: linear warmup (warmup_steps / warmup_ratio as usual), then the LR is multiplied
     # by this factor at the start of every epoch (0.5 = halve each epoch). Replaces lr_scheduler.
     micro_engram_lr_epoch_decay: Optional[float] = None
+    # Engram weight dtype. Unset: same as its layer (bf16). fp32: fp32 master weights (Adam's small
+    # steps no longer round away in bf16; ~2x the engram's weight/grad/optimizer memory); under
+    # FSDP2 the compute stays bf16 (mixed-precision policy).
+    micro_engram_dtype: Optional[Literal["bf16", "fp32"]] = None

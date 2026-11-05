@@ -373,6 +373,26 @@ if have_peft and bnb is not None:
         resumed = False
     check("a checkpoint saved by the first fix (with quant state) now resumes, engram restored", resumed)
 
+# ----------------------------------------------------------------------------- micro_engram_dtype
+bf_model = Toy().to(torch.bfloat16)
+pd = MicroEngramPlugin()
+pd.post_model_load(cfg(micro_engram_dtype="fp32", micro_engram_extra=[DictDefault(layer=2)]), bf_model)
+check("micro_engram_dtype fp32: engrams keep fp32 weights in a bf16 model",
+      all(next(s.engram.parameters()).dtype == torch.float32 for s in pd.slots)
+      and next(bf_model.model.language_model.layers[0].lin.parameters()).dtype == torch.bfloat16)
+with torch.no_grad():
+    out_bf = bf_model(input_ids=ids)
+check("fp32 engram in a bf16 model: forward works, output stays bf16", out_bf.dtype == torch.bfloat16)
+pb = MicroEngramPlugin()
+pb.post_model_load(cfg(), Toy().to(torch.bfloat16))
+check("micro_engram_dtype unset: engram follows its layer (bf16)", next(pb.slots[0].engram.parameters()).dtype == torch.bfloat16)
+grab.msgs.clear()
+_ReportTrainableCallback(pd.slots, "fp32").on_train_begin(None, types.SimpleNamespace(is_world_process_zero=True), None, model=bf_model)
+check("train-start report states the engram dtype", any("engram weights are float32" in m for m in grab.msgs))
+grab.msgs.clear()
+_ReportTrainableCallback(pb.slots, "fp32").on_train_begin(None, types.SimpleNamespace(is_world_process_zero=True), None, model=bf_model)
+check("report flags a dtype that differs from micro_engram_dtype", any("something cast them" in m for m in grab.msgs))
+
 # ----------------------------------------------------------------------------- legacy
 legacy = {"layer": 1, "table_size": 64, "engram_dim": 8, "num_heads": 2, "weights": "micro_engram.pt"}
 sp = engram_specs(legacy, "/x/micro_engram_config.json")

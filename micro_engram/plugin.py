@@ -113,12 +113,19 @@ def _freeze_frozen(slots):
 class _ReportTrainableCallback(TrainerCallback):
     """Logs the real trainable count at train start, after Axolotl has applied its freezing."""
 
-    def __init__(self, slots):
-        self.slots = slots
+    def __init__(self, slots, dtype=None):
+        self.slots, self.dtype = slots, dtype
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if not state.is_world_process_zero or model is None:
             return
+        dtypes = {str(next(s.engram.parameters()).dtype).replace("torch.", "") for s in self.slots}
+        want = {"fp32": "float32", "bf16": "bfloat16"}.get(self.dtype)
+        LOG.warning(f"[micro_engram] engram weights are {', '.join(sorted(dtypes))}"
+                    + (f" (micro_engram_dtype: {self.dtype})" if self.dtype else ""))
+        if want and dtypes != {want}:
+            LOG.error(f"[micro_engram] micro_engram_dtype is {self.dtype} but the engram weights are "
+                      f"{', '.join(sorted(dtypes))}: something cast them after loading")
         n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
         parts, n_eng_train = [], 0
         for slot in self.slots:
@@ -145,8 +152,7 @@ class _ReportTrainableCallback(TrainerCallback):
         # module class, not parameter class: FSDP2 turns the weights into DTensors
         n_4bit = sum(1 for m in model.modules() if type(m).__name__ == "Linear4bit")
         if n_4bit:
-            LOG.warning(f"[micro_engram] base is 4-bit ({n_4bit} quantized linear layers); the engram "
-                        f"trains in {next(self.slots[0].engram.parameters()).dtype} against it")
+            LOG.warning(f"[micro_engram] base is 4-bit ({n_4bit} quantized linear layers)")
 
 
 class _StatsCallback(TrainerCallback):
@@ -474,6 +480,7 @@ class MicroEngramPlugin(BasePlugin):
         super().__init__()
         self.slots = []
         self.base_conf = None
+        self.dtype = None
 
     @property
     def engram(self):  # the main engram (older code paths)
@@ -531,7 +538,8 @@ class MicroEngramPlugin(BasePlugin):
             "frozen": frozen,
             "init_from": source,
         })
-        where, _ = attach_engram(model, engram, spec["layer"])
+        dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}.get(self.dtype)
+        where, _ = attach_engram(model, engram, spec["layer"], dtype=dtype)
         n = sum(p.numel() for p in engram.parameters())
         LOG.warning(f"[micro_engram] attached at {where}: {n / 1e6:.1f}M params, {spec['gate']} gate, "
                     f"seed {spec['seed']}" + (", FROZEN" if frozen else ""))
@@ -550,6 +558,7 @@ class MicroEngramPlugin(BasePlugin):
         else:
             LOG.warning("[micro_engram] token merging OFF (no micro_engram_canon_path)")
 
+        self.dtype = cfg.micro_engram_dtype
         self.slots = []
         for spec, init_from, frozen in _engram_requests(cfg):
             spec["canon_path"] = cfg.micro_engram_canon_path
@@ -600,7 +609,7 @@ class MicroEngramPlugin(BasePlugin):
         # FSDP checkpoints hold the engram in their DCP folder (Accelerate's name for model 0)
         ckpt_weights = "pytorch_model_fsdp_0" if _uses_fsdp(cfg) else None
         callbacks = [_WriteConfigCallback(self.base_conf, self.slots, ckpt_weights),
-                     _ReportTrainableCallback(self.slots)]
+                     _ReportTrainableCallback(self.slots, self.dtype)]
         if cfg.micro_engram_stats_steps:
             # first in line, so the stats are in `logs` before the printer/loggers see it
             trainer.callback_handler.callbacks.insert(

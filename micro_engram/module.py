@@ -265,7 +265,7 @@ def layer_device_dtype(layer):
     return params[0].device, torch.bfloat16
 
 
-def attach_engram(model, engram, layer_idx):
+def attach_engram(model, engram, layer_idx, dtype=None):
     """Nest the engram inside decoder layer `layer_idx` and inject after its forward.
 
     Living inside the layer means FSDP2 shards, gathers, offloads and checkpoints it
@@ -273,9 +273,11 @@ def attach_engram(model, engram, layer_idx):
     """
     name, layers = find_text_layers(model)
     target = layers[layer_idx]
-    device, dtype = layer_device_dtype(target)
-    # FSDP2 requires a single dtype within one wrapped unit; ints (mults, canon) are untouched.
-    engram.to(device=device, dtype=dtype)
+    device, layer_dtype = layer_device_dtype(target)
+    # dtype None: the layer's (bf16). fp32 works too: FSDP2 only requires one dtype among the
+    # *trainable* params of a unit, and the engram is the only trainable part of its layer.
+    # Ints (mults, canon) are untouched.
+    engram.to(device=device, dtype=dtype or layer_dtype)
     target.add_module("micro_engram", engram)
     state = {}
 
