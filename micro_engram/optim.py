@@ -16,8 +16,10 @@ row-wise Adam, as FBGEMM / TorchRec use for big embedding tables. The momentum s
 value; the second moment is ONE fp32 number per row, the running mean of the row's g^2,
 so the optimizer state is ~half of Adam's. It is kept in fp32 whatever the weights'
 dtype: in bf16, v = 0.999 v + 0.001 g^2 is a change below bf16's precision once v has
-grown, so a bf16 second moment stops updating (test_optim.py: with a constant gradient it
-freezes at ~1/3 of its true value, and the steps come out ~1.8x too large).
+grown, so a bf16 second moment can never decay and only moves up on big gradient spikes (a
+ratchet). With a constant gradient it gets stuck low (steps ~1.8x too large, test_optim.py);
+with noisy, shrinking or sparse gradients, as engram rows get, it gets stuck high: steps
+~0.6-0.9x of the correct size, like training at a lower learning rate.
 """
 import torch
 

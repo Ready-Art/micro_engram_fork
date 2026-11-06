@@ -160,7 +160,7 @@ micro_engram_optimizer: rowwise_adam
 
 For the tables only: lazy row updates (as `lazy_adam`), and **one second moment per row** instead of one per value: the running mean of the row's g². This is "partial row-wise Adam" as FBGEMM/TorchRec use for big embedding tables. The momentum stays per value. The tables' optimizer state drops from 2× to ~1× their size. For example, a 2M-row fp32 engram pair on 5 GPUs goes from ~6.9 GB to ~5.2 GB per GPU (weights + gradients + state).
 
-- The second moment is always fp32, also with bf16 weights. A bf16 second moment stops updating: `v = 0.999·v + 0.001·g²` changes by less than bf16's precision once `v` has grown. `test_optim.py` shows it freezing at ~1/3 of its true value with a constant gradient, which makes the steps ~1.8× too large. Plain AdamW on bf16 weights keeps its state in bf16 too, so this applies to bf16 engram runs with any per-value Adam.
+- The second moment is always fp32, also with bf16 weights. In bf16, `v = 0.999·v + 0.001·g²` changes by less than bf16's precision, so `v` can never decay and only moves up on big gradient spikes. With a constant gradient it gets stuck low (steps ~1.8× too large, shown in `test_optim.py`). With noisy, shrinking or sparse gradients, which is what engram rows get, it gets stuck high: steps come out ~0.6–0.9× of the correct size, like a lower learning rate. Plain AdamW on bf16 weights keeps its state in bf16 too, so this applies to bf16 engram runs with any per-value Adam.
 - It equals AdamW whenever a row's gradient values have the same size, and approximates it otherwise.
 - Key/value/scales keep the YAML `optimizer`.
 - Resume works across `lazy_adam` ↔ `rowwise_adam`: per value → per row is exact (the row mean), per row → per value copies the row's value.
