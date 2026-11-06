@@ -56,6 +56,7 @@ plugins:
 | `micro_engram_save_trainable_only` | `false` | FSDP2 only: checkpoints hold only the trainable weights (the engram, ~0.5–3 GB) instead of the whole model. Resuming reads them back and takes the frozen weights from `base_model`. See *Outputs* |
 | `micro_engram_gate` | `scalar` | How the memory is mixed in: `scalar` (the paper's sigmoid gate), `scalar_sqrt` (DeepSeek's released code: signed-sqrt gate with learnable norm scales, recommended for new runs) or `ple` (a Gemma 3n PLE-style per-dimension gate). See below |
 | `micro_engram_dtype` | unset | Engram weight dtype. Unset: same as its layer (bf16). `fp32`: fp32 master weights, so Adam's small steps don't round away in bf16 (matters most late in training, at low LR); costs ~2x the engram's share of memory (weights, gradients, Adam state). Under FSDP2 the compute stays bf16. FSDP2 only needs one dtype among the *trainable* params of a unit, so this works inside a frozen bf16 or 4-bit layer (checked on PyTorch 2.15; older versions may differ, the train-start log states the dtype). Without a 4-bit base, recent Accelerate versions may already upcast trainable params to fp32 on their own |
+| `micro_engram_optimizer` | unset | Unset: Axolotl's `optimizer`. `lazy_adam`: AdamW, except that a table row whose gradient is zero this step is left exactly as it is (no drift from leftover momentum), like `SparseAdam` but on ordinary gradients, so it works with FSDP2 (rows are sharded, each GPU decides for its own rows). Other trainable params (key/value/scales) use plain AdamW. Uses `learning_rate`, `adam_beta1/2`, `adam_epsilon`, `weight_decay`; the YAML `optimizer` is ignored. Same memory and speed as AdamW: it changes how rarely-seen rows learn, not the cost. State names match AdamW, so you can switch on resume |
 | `micro_engram_lr_epoch_decay` | `null` | LR schedule: linear warmup (`warmup_ratio`/`warmup_steps` as usual), then the LR is multiplied by this factor at the start of every epoch (`0.5` = halve each epoch). Replaces `lr_scheduler` / `lr_scheduler_kwargs`. Epoch boundaries come from the step count, and resume continues the curve |
 | `micro_engram_stats_steps` | `10` | Every N steps, add engram stats to the training log line (output-weight size, table RMS and share of rows trained per n-gram order, gate mean and saturation). `0` = off. See *Watching training* |
 
@@ -356,6 +357,7 @@ Run them from the repo root:
 ```bash
 python test_gate.py                           # all gate modes: no-op start, gradients, bf16, checkpoint names; weight stats
 python test_canon.py                          # token-merge hashing and state-dict compatibility
+python test_optim.py                          # lazy_adam: equals AdamW when every row is used, freezes unused rows, FSDP2 + state save/load
 python test_resume_keys.py                    # checkpoint-wrapper key renaming on resume
 python test_vllm_ids.py                       # vLLM path: previous tokens per batch type, same output as training
 python test_quant.py                          # 4-bit (NF4) base + placeholder QLoRA: dtype, freezing pattern, gradients (needs bitsandbytes, peft)

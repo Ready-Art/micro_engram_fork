@@ -224,6 +224,39 @@ class _MemorySnapshotCallback(TrainerCallback):
             torch.cuda.memory._record_memory_history(enabled=None)
 
 
+def _install_lazy_adam(trainer):
+    """Make the trainer build LazyAdamW when it creates its optimizer.
+
+    It must stay lazy: with FSDP the Trainer creates the optimizer only after sharding,
+    which replaces every parameter object, so an optimizer built earlier would hold stale
+    parameters. Engram tables get lazy row updates; other trainable params plain AdamW.
+    """
+    import types
+
+    from .optim import LazyAdamW
+
+    if getattr(trainer, "_micro_engram_lazy_adam", False):
+        return
+
+    def create_optimizer(self, model=None):
+        if self.optimizer is None:
+            lazy, dense = [], []
+            for name, p in (model or self.model).named_parameters():
+                if p.requires_grad:
+                    (lazy if ".micro_engram.tables." in name.replace(_WRAP, ".") else dense).append(p)
+            groups = [g for g in ({"params": lazy, "lazy": True}, {"params": dense, "lazy": False}) if g["params"]]
+            a = self.args
+            self.optimizer = LazyAdamW(groups, lr=a.learning_rate, betas=(a.adam_beta1, a.adam_beta2),
+                                       eps=a.adam_epsilon, weight_decay=a.weight_decay)
+            LOG.warning(f"[micro_engram] optimizer: LazyAdamW ({sum(p.numel() for p in lazy) / 1e6:.1f}M table "
+                        f"params with lazy row updates, {sum(p.numel() for p in dense) / 1e6:.1f}M as AdamW); "
+                        f"the YAML `optimizer` is not used")
+        return self.optimizer
+
+    trainer.create_optimizer = types.MethodType(create_optimizer, trainer)
+    trainer._micro_engram_lazy_adam = True
+
+
 def _safe_fingerprint(path):
     try:
         return base_fingerprint(path) if path and os.path.isdir(path) else None
@@ -638,9 +671,13 @@ class MicroEngramPlugin(BasePlugin):
         # Axolotl applies unfrozen_parameters after post_model_load, and '.+micro_engram'
         # matches every engram: freeze the frozen ones again before the optimizer is built.
         _freeze_frozen(self.slots)
+        if cfg.micro_engram_optimizer == "lazy_adam":
+            _install_lazy_adam(trainer)
 
     def add_callbacks_post_trainer(self, cfg, trainer):
         _freeze_frozen(self.slots)  # in case post_trainer_create is not called by this Axolotl
+        if cfg.micro_engram_optimizer == "lazy_adam":
+            _install_lazy_adam(trainer)
         # FSDP checkpoints hold the engram in their DCP folder (Accelerate's name for model 0)
         ckpt_weights = "pytorch_model_fsdp_0" if _uses_fsdp(cfg) else None
         callbacks = [_WriteConfigCallback(self.base_conf, self.slots, ckpt_weights),

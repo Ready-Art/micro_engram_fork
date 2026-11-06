@@ -45,3 +45,7 @@ class MicroEngramArgs(BaseModel):
     # <output_dir>/memory_snapshot/rank<R>_step<S>.pickle (open at https://pytorch.org/memory_viz).
     # Slows those steps down; for a short diagnostic run only.
     micro_engram_memory_snapshot: Optional[int] = None
+    # Optimizer for the trainable params. Unset: Axolotl's `optimizer`. lazy_adam: AdamW, but a table
+    # row whose gradient is zero this step is not touched (no leftover-momentum drift), like
+    # SparseAdam; works with FSDP2. Uses learning_rate, adam_beta1/2, adam_epsilon, weight_decay.
+    micro_engram_optimizer: Optional[Literal["lazy_adam"]] = None
