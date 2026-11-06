@@ -506,6 +506,12 @@ try:
 except ValueError:
     no_fsdp = True
 check("rows: refused without FSDP", no_fsdp)
+try:
+    MicroEngramPlugin().post_model_load(cfg(micro_engram_optimizer="rowwise_adam"), Toy())
+    rw_alone = False
+except ValueError:
+    rw_alone = True
+check("rowwise_adam is refused without micro_engram_sharding: rows", rw_alone)
 
 shutil.rmtree(TMP, ignore_errors=True)
 bad = 0

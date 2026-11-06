@@ -129,6 +129,29 @@ def worker(rank, world, port, tmp):
               all(torch.allclose(p, t.weight[start:start + count], atol=1e-5) for p, t in zip(s2.row_shards, f2.tables)))
         check(f"{'lazy' if lazy else 'AdamW'}: gradients cleared after the step", all(p.grad is None for p in s2.row_shards))
 
+    # 5b. rowwise_adam: same as the full tables with the same optimizer
+    f3 = make_full()
+    for p in f3.parameters():
+        p.requires_grad_(False)
+    for t in f3.tables:
+        t.weight.requires_grad_(True)
+    s3 = sharded_copy(f3, rank, world)
+    opt_f3 = LazyAdamW([{"params": [t.weight for t in f3.tables], "lazy": True, "rowwise": True}], lr=0.05)
+    rt_rw = RowTables([(PREFIX, s3)], lr=0.05, lazy=True, rowwise=True)
+    for step in range(3):
+        hh, ii = batch(rank, step)
+        f3(hh, ii).pow(2).sum().backward()
+        for t, g in zip(f3.tables, avg_table_grads(f3, world)):
+            t.weight.grad = g
+        opt_f3.step()
+        opt_f3.zero_grad()
+        s3(hh, ii).pow(2).sum().backward()
+        rt_rw.step(0.05)
+    check("3 steps of rowwise_adam: same tables as the full engram",
+          all(torch.allclose(p, t.weight[start:start + count], atol=1e-5) for p, t in zip(s3.row_shards, f3.tables)))
+    rw_dir = os.path.join(tmp, "rw")
+    rt_rw.save(os.path.join(rw_dir, ROWS_DIR), os.path.join(rw_dir, ROWS_OPTIM_DIR))
+
     # 6. save: one DCP folder with the complete engram, read by the normal loaders
     folder, ofolder = os.path.join(tmp, "ckpt", ROWS_DIR), os.path.join(tmp, "ckpt", ROWS_OPTIM_DIR)
     rt2.save(folder, ofolder)
@@ -158,6 +181,35 @@ def worker(rank, world, port, tmp):
     check("load: optimizer state back (exp_avg, exp_avg_sq, step)",
           opt_ok and torch.equal(st2["exp_avg"], st3["exp_avg"]) and torch.equal(st2["exp_avg_sq"], st3["exp_avg_sq"])
           and float(st3["step"]) == 3)
+
+    # 7a. rowwise state round trip, and switching optimizers on resume (second moment converted)
+    def fresh_rows():
+        e = MicroEngram(model_dim=D, table_size=N, engram_dim=E, num_heads=2, vocab_size=50,
+                        gate="scalar_sqrt", build_tables=False)
+        e.shard_rows(rank, world)
+        return e
+
+    e_rw = fresh_rows()
+    rt_back = RowTables([(PREFIX, e_rw)], lazy=True, rowwise=True)
+    rt_back.load(os.path.join(rw_dir, ROWS_DIR), os.path.join(rw_dir, ROWS_OPTIM_DIR))
+    a_st, b_st = rt_rw.optimizer.state[s3.row_shards[2]], rt_back.optimizer.state[e_rw.row_shards[2]]
+    check("rowwise: optimizer state saves and loads (per-row second moment)",
+          torch.equal(a_st["exp_avg_sq"], b_st["exp_avg_sq"]) and b_st["exp_avg_sq"].dim() == 1
+          and torch.equal(a_st["exp_avg"], b_st["exp_avg"]) and rt_back.converted == 0)
+    e_cv = fresh_rows()
+    rt_cv = RowTables([(PREFIX, e_cv)], lazy=True, rowwise=True)
+    rt_cv.load(folder, ofolder)  # saved by lazy AdamW (per-value second moment)
+    lz_st, cv_st = rt2.optimizer.state[s2.row_shards[1]], rt_cv.optimizer.state[e_cv.row_shards[1]]
+    check("lazy_adam checkpoint -> rowwise_adam: second moment = the row mean (exact), momentum kept",
+          rt_cv.converted == 4 and torch.allclose(cv_st["exp_avg_sq"], lz_st["exp_avg_sq"].mean(dim=1))
+          and torch.equal(cv_st["exp_avg"], lz_st["exp_avg"]))
+    e_bk = fresh_rows()
+    rt_bk = RowTables([(PREFIX, e_bk)], lazy=True)
+    rt_bk.load(os.path.join(rw_dir, ROWS_DIR), os.path.join(rw_dir, ROWS_OPTIM_DIR))
+    bk_st = rt_bk.optimizer.state[e_bk.row_shards[2]]
+    check("rowwise_adam checkpoint -> lazy_adam: every value gets its row's second moment",
+          rt_bk.converted == 4 and bk_st["exp_avg_sq"].shape == e_bk.row_shards[2].shape
+          and torch.equal(bk_st["exp_avg_sq"][:, 0], a_st["exp_avg_sq"]))
 
     # 7b. switching a run on: tables from an FSDP checkpoint of a run without row sharding
     import torch.distributed.checkpoint as dcp

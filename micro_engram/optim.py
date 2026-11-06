@@ -10,6 +10,14 @@ rows (dim 0), so each rank decides on its own rows with no communication.
 Everything else is plain AdamW (decoupled weight decay, the same bias correction with a
 global step count). State names match torch.optim.AdamW (step, exp_avg, exp_avg_sq), so
 checkpoints can switch between the two.
+
+`rowwise=True` (micro_engram_optimizer: rowwise_adam, row-sharded tables only): partial
+row-wise Adam, as FBGEMM / TorchRec use for big embedding tables. The momentum stays per
+value; the second moment is ONE fp32 number per row, the running mean of the row's g^2,
+so the optimizer state is ~half of Adam's. It is kept in fp32 whatever the weights'
+dtype: in bf16, v = 0.999 v + 0.001 g^2 is a change below bf16's precision once v has
+grown, so a bf16 second moment stops updating (test_optim.py: with a constant gradient it
+freezes at ~1/3 of its true value, and the steps come out ~1.8x too large).
 """
 import torch
 
@@ -21,8 +29,19 @@ def _local(t):
 
 
 class LazyAdamW(torch.optim.Optimizer):
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, lazy=False):
-        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, lazy=lazy))
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, lazy=False, rowwise=False):
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, lazy=lazy,
+                                      rowwise=rowwise))
+
+    @staticmethod
+    def init_state(state, p, group):
+        """Fresh state for `p`: exp_avg like p; exp_avg_sq like p, or [rows] in fp32 when row-wise."""
+        state["step"] = torch.zeros((), dtype=torch.float32)
+        state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+        if group.get("rowwise") and p.dim() >= 2:
+            state["exp_avg_sq"] = torch.zeros(p.shape[0], dtype=torch.float32, device=p.device)
+        else:
+            state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -38,9 +57,7 @@ class LazyAdamW(torch.optim.Optimizer):
                     continue
                 state = self.state[p]
                 if not state:
-                    state["step"] = torch.zeros((), dtype=torch.float32)
-                    state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    self.init_state(state, p, group)
                 state["step"] += 1
                 step = float(state["step"])
                 bc1, bc2 = 1 - beta1 ** step, 1 - beta2 ** step
@@ -60,8 +77,12 @@ class LazyAdamW(torch.optim.Optimizer):
                 if wd:
                     p_.mul_(1 - lr * wd)
                 m.mul_(beta1).add_(g, alpha=1 - beta1)
-                v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
-                denom = (v.sqrt() / bc2 ** 0.5).add_(eps)
+                if v.dim() < g.dim():  # row-wise second moment: one per row
+                    v.mul_(beta2).add_(g.pow(2).flatten(1).mean(dim=1), alpha=1 - beta2)
+                    denom = (v.sqrt() / bc2 ** 0.5).add_(eps).reshape(-1, *([1] * (g.dim() - 1)))
+                else:
+                    v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+                    denom = (v.sqrt() / bc2 ** 0.5).add_(eps)
                 p_.addcdiv_(m, denom, value=-lr / bc1)
 
                 if rows is None:

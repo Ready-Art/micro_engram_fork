@@ -22,7 +22,8 @@ def run(opt_cls, grads, init, lazy=True, wd=0.0, dtype=torch.float32, **kw):
     p = nn.Parameter(init.clone().to(dtype))
     if opt_cls is LazyAdamW:
         kw["lazy"] = lazy  # (an earlier version forgot this, so "lazy" runs were plain AdamW)
-    opt = opt_cls([p], lr=1e-2, betas=(0.9, 0.999), eps=1e-8, weight_decay=wd, **kw)
+    kw.setdefault("lr", 1e-2)
+    opt = opt_cls([p], betas=(0.9, 0.999), eps=1e-8, weight_decay=wd, **kw)
     for g in grads:
         opt.zero_grad()
         p.grad = g.clone().to(dtype)
@@ -70,6 +71,39 @@ stb = optb.state[optb.param_groups[0]["params"][0]]
 check("bf16: untouched rows bit-identical, touched rows move, state bf16",
       torch.equal(d[4:], init[4:].bfloat16().float()) and not torch.equal(d[1:4], init[1:4].bfloat16().float())
       and stb["exp_avg"].dtype == torch.bfloat16)
+
+# 4b. partial row-wise Adam (rowwise_adam): one fp32 second moment per row
+row_scale = torch.rand(R, 1) + 0.5
+uniform = [row_scale * torch.sign(torch.randn(R, C)) * (i + 1) for i in range(5)]  # |g| equal within each row
+a, _ = run(torch.optim.AdamW, uniform, init, wd=0.1, foreach=False)
+b, optr = run(LazyAdamW, uniform, init, wd=0.1, lazy=False, rowwise=True)
+check("rowwise: == AdamW when |g| is the same across each row (then the row mean is every value's g^2)",
+      torch.allclose(a, b, atol=1e-6))
+str_ = optr.state[optr.param_groups[0]["params"][0]]
+check("rowwise: exp_avg per value, exp_avg_sq one fp32 number per row",
+      str_["exp_avg"].shape == (R, C) and str_["exp_avg_sq"].shape == (R,) and str_["exp_avg_sq"].dtype == torch.float32)
+c2, optl = run(LazyAdamW, sparse_grads, init, lazy=True, rowwise=True)
+stl = optl.state[optl.param_groups[0]["params"][0]]
+check("rowwise + lazy: rows without a gradient untouched (weights and both moments)",
+      torch.equal(c2[4:], init[4:]) and torch.equal(stl["exp_avg_sq"][4:], torch.zeros(R - 4))
+      and not torch.equal(c2[1:4], init[1:4]))
+a_s, _ = run(torch.optim.AdamW, sparse_grads, init, foreach=False)
+check("rowwise: differs from AdamW for uneven gradients (it is an approximation)", not torch.allclose(c2[1:4], a_s[1:4]))
+
+# the bf16 second-moment freeze: constant gradient 1, so the true bias-corrected v is exactly 1
+pb = nn.Parameter(init.clone().bfloat16())
+pr = nn.Parameter(init.clone().bfloat16())
+ob, orw = LazyAdamW([pb], lr=0.0), LazyAdamW([pr], lr=0.0, rowwise=True)
+for _ in range(1500):
+    for p_, o_ in ((pb, ob), (pr, orw)):
+        p_.grad = torch.ones_like(p_)
+        o_.step()
+bc2 = 1 - 0.999 ** 1500
+v_bf = float(ob.state[pb]["exp_avg_sq"].float().mean()) / bc2
+v_rw = float(orw.state[pr]["exp_avg_sq"].mean()) / bc2
+check(f"bf16 weights: a per-value bf16 second moment freezes (v_hat {v_bf:.2f} instead of 1, steps "
+      f"{v_bf ** -0.5:.1f}x too large); the fp32 row-wise one doesn't ({v_rw:.4f})",
+      v_bf < 0.5 and abs(v_rw - 1) < 1e-4)
 
 # 5. under FSDP2 (single process, gloo): sharded params, optimizer state save/load
 try:

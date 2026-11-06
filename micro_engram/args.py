@@ -48,7 +48,10 @@ class MicroEngramArgs(BaseModel):
     # Optimizer for the trainable params. Unset: Axolotl's `optimizer`. lazy_adam: AdamW, but a table
     # row whose gradient is zero this step is not touched (no leftover-momentum drift), like
     # SparseAdam; works with FSDP2. Uses learning_rate, adam_beta1/2, adam_epsilon, weight_decay.
-    micro_engram_optimizer: Optional[Literal["lazy_adam"]] = None
+    # rowwise_adam (needs micro_engram_sharding: rows): for the tables, lazy updates as above plus ONE
+    # fp32 second moment per row instead of one per value (FBGEMM/TorchRec partial row-wise Adam):
+    # the tables' optimizer state is ~half of Adam's. Key/value/scales keep the YAML `optimizer`.
+    micro_engram_optimizer: Optional[Literal["lazy_adam", "rowwise_adam"]] = None
     # rows: each GPU keeps its own rows of the tables outside FSDP and fetches only the rows a
     # batch uses (all_to_all), instead of FSDP gathering whole tables and reduce-scattering
     # full-size gradients. Needs FSDP. Tables get their own optimizer (AdamW, or lazy with

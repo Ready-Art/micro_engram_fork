@@ -56,7 +56,7 @@ plugins:
 | `micro_engram_save_trainable_only` | `false` | FSDP2 only: checkpoints hold only the trainable weights (the engram, ~0.5–3 GB) instead of the whole model. Resuming reads them back and takes the frozen weights from `base_model`. See *Outputs* |
 | `micro_engram_gate` | `scalar` | How the memory is mixed in: `scalar` (the paper's sigmoid gate), `scalar_sqrt` (DeepSeek's released code: signed-sqrt gate with learnable norm scales, recommended for new runs) or `ple` (a Gemma 3n PLE-style per-dimension gate). See below |
 | `micro_engram_dtype` | unset | Engram weight dtype. Unset: same as its layer (bf16). `fp32`: fp32 master weights, so Adam's small steps don't round away in bf16 (matters most late in training, at low LR); costs ~2x the engram's share of memory (weights, gradients, Adam state). Under FSDP2 the compute stays bf16. FSDP2 only needs one dtype among the *trainable* params of a unit, so this works inside a frozen bf16 or 4-bit layer (checked on PyTorch 2.15; older versions may differ, the train-start log states the dtype). Without a 4-bit base, recent Accelerate versions may already upcast trainable params to fp32 on their own |
-| `micro_engram_optimizer` | unset | Unset: Axolotl's `optimizer`. `lazy_adam`: AdamW, except that a table row whose gradient is zero this step is left exactly as it is (no drift from leftover momentum), like `SparseAdam` but on ordinary gradients, so it works with FSDP2 (rows are sharded, each GPU decides for its own rows). Other trainable params (key/value/scales) use plain AdamW. Uses `learning_rate`, `adam_beta1/2`, `adam_epsilon`, `weight_decay`; the YAML `optimizer` is ignored. Same memory and speed as AdamW: it changes how rarely-seen rows learn, not the cost. State names match AdamW, so you can switch on resume |
+| `micro_engram_optimizer` | unset | Unset: Axolotl's `optimizer`. `lazy_adam`: AdamW, except that a table row whose gradient is zero this step is left exactly as it is (no drift from leftover momentum), like `SparseAdam` but on ordinary gradients, so it works with FSDP2 (rows are sharded, each GPU decides for its own rows). Other trainable params (key/value/scales) use plain AdamW. Uses `learning_rate`, `adam_beta1/2`, `adam_epsilon`, `weight_decay`; the YAML `optimizer` is ignored. Same memory and speed as AdamW: it changes how rarely-seen rows learn, not the cost. State names match AdamW, so you can switch on resume. `rowwise_adam` (needs `micro_engram_sharding: rows`): see [Row-wise Adam](#row-wise-adam-rowwise_adam) |
 | `micro_engram_sharding` | unset | `rows`: the tables are split by rows across the GPUs, outside FSDP, and a batch fetches only the rows it uses. See [Row-sharded tables](#row-sharded-tables). Needs FSDP |
 | `micro_engram_lr_epoch_decay` | `null` | LR schedule: linear warmup (`warmup_ratio`/`warmup_steps` as usual), then the LR is multiplied by this factor at the start of every epoch (`0.5` = halve each epoch). Replaces `lr_scheduler` / `lr_scheduler_kwargs`. Epoch boundaries come from the step count, and resume continues the curve |
 | `micro_engram_stats_steps` | `10` | Every N steps, add engram stats to the training log line (output-weight size, table RMS and share of rows trained per n-gram order, gate mean and saturation). `0` = off. See *Watching training* |
@@ -139,7 +139,7 @@ With `rows`, each GPU keeps only its own share of the rows (1/number of GPUs), o
 - **Forward:** each GPU sends the row numbers its batch needs to the GPUs that own them, and gets just those rows back (`all_to_all`, a few MB per micro-batch). Rows used several times are sent once.
 - **Backward:** the gradients of those rows go back to their owners, which add up every GPU's share and divide by the number of GPUs, exactly as FSDP averages gradients.
 - **Memory:** the table costs 1/GPUs of its size plus its Adam state (also 1/GPUs), with no full-table gather or gradient buffer. So a bigger table is cheap.
-- **Optimizer:** the tables get their own AdamW (or lazy AdamW with `micro_engram_optimizer: lazy_adam`), stepped right after the Trainer's. It uses `learning_rate`, `adam_beta1/2`, `adam_epsilon` and `weight_decay`, and follows the Trainer's LR schedule (warmup, decay, `micro_engram_lr_epoch_decay`). Key/value/scales stay in FSDP with Axolotl's `optimizer`.
+- **Optimizer:** the tables get their own AdamW (lazy AdamW with `micro_engram_optimizer: lazy_adam`, partial row-wise Adam with `rowwise_adam`), stepped right after the Trainer's. It uses `learning_rate`, `adam_beta1/2`, `adam_epsilon` and `weight_decay`, and follows the Trainer's LR schedule (warmup, decay, `micro_engram_lr_epoch_decay`). Key/value/scales stay in FSDP with Axolotl's `optimizer`.
 - **Gradient clipping:** the tables are clipped on their own to `max_grad_norm`. The Trainer's `grad_norm` no longer includes them, so their norm is logged as `engram/table_grad_norm`.
 - **Checkpoints:** each checkpoint gets `micro_engram_rows/` (the **complete** engram: tables, key/value, scales, buffers, under the usual names) and `micro_engram_rows_optim/` (the tables' Adam state). Both are written before `trainer_state.json`, so a checkpoint that counts as complete has them. The checkpoint's `micro_engram_config.json` points to `micro_engram_rows`, so vLLM, llama.cpp, `assemble_engram_model.py`, `engram_stats.py` and `init_from` read it like any checkpoint. At the end of training it is also written to `output_dir/micro_engram_rows`.
 - **Resume:** the rows come back from `micro_engram_rows/`, re-split if the number of GPUs changed. A checkpoint from a run *without* row sharding also works: the tables are read from `pytorch_model_fsdp_0`, but the tables' Adam state starts over (logged).
@@ -150,6 +150,20 @@ The results are the same as without sharding. `test_rows.py` checks this with 3 
 Notes:
 - `offload_params` doesn't move the tables to the CPU (they aren't FSDP's), so they stay on the GPU.
 - Stats (`rows_learned`, ...) come from rank 0's rows, as before with FSDP shards.
+
+#### Row-wise Adam (`rowwise_adam`)
+
+```yaml
+micro_engram_sharding: rows
+micro_engram_optimizer: rowwise_adam
+```
+
+For the tables only: lazy row updates (as `lazy_adam`), and **one second moment per row** instead of one per value: the running mean of the row's g². This is "partial row-wise Adam" as FBGEMM/TorchRec use for big embedding tables. The momentum stays per value. The tables' optimizer state drops from 2× to ~1× their size. For example, a 2M-row fp32 engram pair on 5 GPUs goes from ~6.9 GB to ~5.2 GB per GPU (weights + gradients + state).
+
+- The second moment is always fp32, also with bf16 weights. A bf16 second moment stops updating: `v = 0.999·v + 0.001·g²` changes by less than bf16's precision once `v` has grown. `test_optim.py` shows it freezing at ~1/3 of its true value with a constant gradient, which makes the steps ~1.8× too large. Plain AdamW on bf16 weights keeps its state in bf16 too, so this applies to bf16 engram runs with any per-value Adam.
+- It equals AdamW whenever a row's gradient values have the same size, and approximates it otherwise.
+- Key/value/scales keep the YAML `optimizer`.
+- Resume works across `lazy_adam` ↔ `rowwise_adam`: per value → per row is exact (the row mean), per row → per value copies the row's value.
 
 ### Training on a 4-bit base (NF4, experimental)
 
@@ -383,7 +397,7 @@ Run them from the repo root:
 ```bash
 python test_gate.py                           # all gate modes: no-op start, gradients, bf16, checkpoint names; weight stats
 python test_canon.py                          # token-merge hashing and state-dict compatibility
-python test_optim.py                          # lazy_adam: equals AdamW when every row is used, freezes unused rows, FSDP2 + state save/load
+python test_optim.py                          # lazy_adam / rowwise_adam: vs AdamW, unused rows untouched, bf16 second-moment freeze, FSDP2 + state save/load
 python test_rows.py                           # micro_engram_sharding: rows, 3 processes: == full tables (forward, gradients, training, clipping), save/resume/reshard
 python test_resume_keys.py                    # checkpoint-wrapper key renaming on resume
 python test_vllm_ids.py                       # vLLM path: previous tokens per batch type, same output as training

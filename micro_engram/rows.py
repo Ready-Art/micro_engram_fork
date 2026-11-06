@@ -150,13 +150,15 @@ class RowTables:
     (any name containing layers.<n>.micro_engram. works for the loaders).
     """
 
-    def __init__(self, entries, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, lazy=False):
+    def __init__(self, entries, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, lazy=False,
+                 rowwise=False):
         self.entries = entries
         self.world = dist_rank_world()[1]
         train = [p for _, e in entries for p in e.row_shards if p.requires_grad]
-        self.optimizer = LazyAdamW([{"params": train, "lazy": lazy}], lr=lr, betas=betas, eps=eps,
-                                   weight_decay=weight_decay) if train else None
+        self.optimizer = LazyAdamW([{"params": train, "lazy": lazy, "rowwise": rowwise}], lr=lr, betas=betas,
+                                   eps=eps, weight_decay=weight_decay) if train else None
         self.last_grad_norm = None
+        self.converted = 0  # tables whose second moment was converted on load (other optimizer)
 
     def params(self):
         return [p for _, e in self.entries for p in e.row_shards]
@@ -248,19 +250,35 @@ class RowTables:
         optim_loaded = False
         if optim_folder and self.optimizer is not None and os.path.isdir(optim_folder):
             ometa = dcp.FileSystemReader(optim_folder).read_metadata().state_dict_metadata
-            otempl, steps = {}, {}
+            otempl, steps, convert = {}, {}, {}
+            group = self.optimizer.param_groups[0]
             for key, e, p in self._table_items():
                 if f"{key}.exp_avg" not in ometa:
                     continue
                 st = self.optimizer.state[p]
-                st.setdefault("exp_avg", torch.zeros_like(p))
-                st.setdefault("exp_avg_sq", torch.zeros_like(p))
+                if not st:
+                    LazyAdamW.init_state(st, p, group)
                 otempl[f"{key}.exp_avg"] = _dtensor(st["exp_avg"], e.table_size, self.world)
-                otempl[f"{key}.exp_avg_sq"] = _dtensor(st["exp_avg_sq"], e.table_size, self.world)
+                saved = len(ometa[f"{key}.exp_avg_sq"].size)
+                sq = st["exp_avg_sq"]
+                if saved != sq.dim():  # saved by the other optimizer (lazy_adam <-> rowwise_adam)
+                    sq = torch.zeros(p.shape if saved == p.dim() else p.shape[:1], dtype=torch.float32,
+                                     device=p.device)
+                    convert[p] = sq
+                otempl[f"{key}.exp_avg_sq"] = _dtensor(sq, e.table_size, self.world)
                 otempl[f"{key}.step"] = steps[p] = torch.zeros((), dtype=torch.float32)
             if otempl:
                 dcp.load(otempl, checkpoint_id=optim_folder)
                 for p, s in steps.items():
                     self.optimizer.state[p]["step"] = s
+                for p, sq in convert.items():
+                    st = self.optimizer.state[p]
+                    if sq.dim() > st["exp_avg_sq"].dim():
+                        # per value -> per row: the row-wise v is the mean of g^2 over the row, and
+                        # v is linear in g^2, so the mean of the per-value v's is exactly it
+                        st["exp_avg_sq"].copy_(sq.flatten(1).mean(dim=1))
+                    else:  # per row -> per value: every value of a row gets the row's v
+                        st["exp_avg_sq"].copy_(sq.reshape(-1, *([1] * (p.dim() - 1))).expand_as(p))
+                self.converted = len(convert)
                 optim_loaded = True
         return len(want), optim_loaded

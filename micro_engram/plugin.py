@@ -304,7 +304,7 @@ class _RowShardCallback(TrainerCallback):
             self.on_final(args.output_dir)
 
 
-def _install_row_sharding(trainer, slots, lazy, on_final):
+def _install_row_sharding(trainer, slots, lazy, on_final, rowwise=False):
     """Table optimizer + checkpoint save/resume for row-sharded tables. Returns the callback.
 
     Checkpoints: Trainer._save_checkpoint calls save_model on every rank before it writes
@@ -320,7 +320,7 @@ def _install_row_sharding(trainer, slots, lazy, on_final):
     a = trainer.args
     rows = RowTables([(f"{s.where}.micro_engram.", s.engram) for s in slots],
                      lr=a.learning_rate, betas=(a.adam_beta1, a.adam_beta2), eps=a.adam_epsilon,
-                     weight_decay=a.weight_decay, lazy=lazy)
+                     weight_decay=a.weight_decay, lazy=lazy, rowwise=rowwise)
     orig_save, orig_load = trainer.save_model, trainer._load_optimizer_and_scheduler
 
     def save_model(self, output_dir=None, _internal_call=False):
@@ -341,15 +341,19 @@ def _install_row_sharding(trainer, slots, lazy, on_final):
                                    f"(neither {ROWS_DIR}/ nor pytorch_model_fsdp_0/)")
             n, opt = rows.load(src, os.path.join(checkpoint, ROWS_OPTIM_DIR))
             LOG.warning(f"[micro_engram] resume: loaded {n} row-sharded tables from {src}"
-                        + ("" if opt else "; NO table optimizer state there, the tables' Adam restarts"))
+                        + ("" if opt else "; NO table optimizer state there, the tables' Adam restarts")
+                        + (f"; second moment of {rows.converted} tables converted from the other optimizer "
+                           f"(lazy_adam <-> rowwise_adam)" if rows.converted else ""))
         return out
 
     trainer.save_model = types.MethodType(save_model, trainer)
     trainer._load_optimizer_and_scheduler = types.MethodType(load_optimizer_and_scheduler, trainer)
     trainer._micro_engram_rows = _RowShardCallback(rows, trainer, on_final)
     n = sum(p.numel() for p in rows.params())
+    kind = "partial row-wise Adam (one fp32 second moment per row)" if rowwise else (
+        "lazy AdamW" if lazy else "AdamW")
     LOG.warning(f"[micro_engram] row-sharded tables: {n / 1e6:.1f}M rows' params on this GPU, own optimizer "
-                f"({'lazy ' if lazy else ''}AdamW) and clipping (logged as engram/table_grad_norm)")
+                f"({kind}) and clipping (logged as engram/table_grad_norm)")
     return trainer._micro_engram_rows
 
 
@@ -741,6 +745,9 @@ class MicroEngramPlugin(BasePlugin):
         self.sharding = cfg.micro_engram_sharding
         if self.sharding and not _uses_fsdp(cfg):
             raise ValueError("[micro_engram] micro_engram_sharding: rows needs FSDP (fsdp_config)")
+        if cfg.micro_engram_optimizer == "rowwise_adam" and not self.sharding:
+            raise ValueError("[micro_engram] micro_engram_optimizer: rowwise_adam needs micro_engram_sharding: rows "
+                             "(the tables then have their own optimizer)")
         self.slots = []
         for spec, init_from, frozen in _engram_requests(cfg):
             spec["canon_path"] = cfg.micro_engram_canon_path
@@ -789,8 +796,9 @@ class MicroEngramPlugin(BasePlugin):
         def on_final(output_dir):
             write_config(build_config(self.base_conf, self.slots, lambda s: ROWS_DIR), output_dir)
 
-        self.rows_cb = _install_row_sharding(trainer, self.slots, cfg.micro_engram_optimizer == "lazy_adam",
-                                             on_final)
+        opt = cfg.micro_engram_optimizer
+        self.rows_cb = _install_row_sharding(trainer, self.slots, opt in ("lazy_adam", "rowwise_adam"), on_final,
+                                             rowwise=opt == "rowwise_adam")
         return self.rows_cb
 
     def post_trainer_create(self, cfg, trainer):
