@@ -415,6 +415,25 @@ except ValueError:
     check("frozen without init_from is rejected", True)
 
 shutil.rmtree(TMP, ignore_errors=True)
+# base fingerprint inside a server: vLLM builds models with CUDA as the default device, and
+# safetensors' get_slice follows it ("can't convert cuda tensor to numpy"). meta stands in.
+from micro_engram.weights import base_fingerprint  # noqa: E402
+
+fp_dir = os.path.join(TMP, "fp_base")
+os.makedirs(fp_dir)
+save_file({"model.embed_tokens.weight": torch.randn(64, 8),
+           "model.layers.0.self_attn.q_proj.weight": torch.randn(8, 8)},
+          os.path.join(fp_dir, "model.safetensors"))
+fp_cpu = base_fingerprint(fp_dir)
+torch.set_default_device("meta")
+try:
+    fp_meta = base_fingerprint(fp_dir)
+except Exception as e:  # noqa: BLE001
+    fp_meta = f"{type(e).__name__}: {e}"
+finally:
+    torch.set_default_device("cpu")
+check(f"base fingerprint is the same with a non-CPU default device ({fp_meta})", fp_cpu and fp_meta == fp_cpu)
+
 bad = 0
 for name, ok in results:
     print(f"[{'PASS' if ok else 'FAIL'}] {name}")

@@ -284,8 +284,9 @@ def base_fingerprint(model_dir):
     h = hashlib.sha256()
     for role in sorted(chosen):
         k = chosen[role]
-        with safe_open(files[k], framework="pt", device="cpu") as fh:
-            t = fh.get_slice(k)[:_FP_ROWS].contiguous()
+        # get_slice follows torch's default device, which servers (vLLM) set to CUDA
+        with torch.device("cpu"), safe_open(files[k], framework="pt", device="cpu") as fh:
+            t = fh.get_slice(k)[:_FP_ROWS].contiguous().cpu()
         h.update(role.encode())
         h.update(str((t.dtype, tuple(t.shape))).encode())
         h.update(t.view(torch.uint8).numpy().tobytes())
@@ -297,7 +298,10 @@ def base_mismatch(conf, model_dir):
     want = conf.get("base_fingerprint")
     if not want:
         return None  # older engram: nothing recorded to compare with
-    have = base_fingerprint(model_dir)
+    try:
+        have = base_fingerprint(model_dir)
+    except Exception as e:  # noqa: BLE001  -- a warning check must never stop loading
+        return f"could not check which base weights this engram was trained on ({type(e).__name__}: {e})"
     if have is None or have == want:
         return None
     return (f"this engram was trained on different base weights (trained on {conf.get('base_model', '?')}, "
