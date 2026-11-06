@@ -41,3 +41,7 @@ class MicroEngramArgs(BaseModel):
     # steps no longer round away in bf16; ~2x the engram's weight/grad/optimizer memory); under
     # FSDP2 the compute stays bf16 (mixed-precision policy).
     micro_engram_dtype: Optional[Literal["bf16", "fp32"]] = None
+    # Diagnostics: record every CUDA allocation for this many optimizer steps, then write
+    # <output_dir>/memory_snapshot/rank<R>_step<S>.pickle (open at https://pytorch.org/memory_viz).
+    # Slows those steps down; for a short diagnostic run only.
+    micro_engram_memory_snapshot: Optional[int] = None

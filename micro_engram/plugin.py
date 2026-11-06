@@ -189,6 +189,41 @@ class _StatsCallback(TrainerCallback):
             logs.update(stats)  # shown in the normal log line, and reaches wandb / tensorboard
 
 
+class _MemorySnapshotCallback(TrainerCallback):
+    """Records CUDA allocations for `steps` optimizer steps on every rank, then dumps a
+    snapshot per rank for https://pytorch.org/memory_viz. Never stops the run on error."""
+
+    def __init__(self, steps):
+        self.steps, self.start, self.done = steps, None, False
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if not torch.cuda.is_available():
+            LOG.warning("[micro_engram] memory snapshot needs CUDA; skipped")
+            self.done = True
+            return
+        self.start = state.global_step
+        torch.cuda.memory._record_memory_history(max_entries=200_000)
+        if state.is_world_process_zero:
+            LOG.warning(f"[micro_engram] recording CUDA memory for {self.steps} step(s) (slower steps)")
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.done or self.start is None or state.global_step - self.start < self.steps:
+            return
+        self.done = True
+        rank = int(os.environ.get("RANK", 0))
+        folder = os.path.join(args.output_dir, "memory_snapshot")
+        path = os.path.join(folder, f"rank{rank}_step{state.global_step}.pickle")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            torch.cuda.memory._dump_snapshot(path)
+            LOG.warning(f"[micro_engram] memory snapshot written: {path} (open it at https://pytorch.org/memory_viz); "
+                        f"you can stop this run now")
+        except Exception as e:  # noqa: BLE001
+            LOG.warning(f"[micro_engram] memory snapshot failed (training continues): {e}")
+        finally:
+            torch.cuda.memory._record_memory_history(enabled=None)
+
+
 def _safe_fingerprint(path):
     try:
         return base_fingerprint(path) if path and os.path.isdir(path) else None
@@ -616,6 +651,8 @@ class MicroEngramPlugin(BasePlugin):
                 0, _StatsCallback(self.slots, cfg.micro_engram_stats_steps))
         if not _uses_fsdp(cfg):  # under FSDP the checkpoint already contains the engram
             callbacks.append(_SaveEngramCallback(self.slots, cfg.micro_engram_save_steps))
+        if cfg.micro_engram_memory_snapshot:
+            callbacks.append(_MemorySnapshotCallback(int(cfg.micro_engram_memory_snapshot)))
         return callbacks
 
     def create_lr_scheduler(self, cfg, trainer, optimizer, num_training_steps):
