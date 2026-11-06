@@ -189,13 +189,18 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
         if skipped:
             logger.warning("[micro_engram] the checkpoint has its own engram (%d tensors); "
                            "using the configured engram weights instead", len(skipped))
-        for spec, layer in self.micro_engram_slots:
-            loaded |= self._load_separate_engram(spec, layer)
+        # vLLM's AutoWeightsLoader groups names with itertools.groupby, so with vision weights
+        # between the shards this runs once per run of language-model names: load only once
+        if not getattr(self, "_micro_engram_loaded", False):
+            self._micro_engram_loaded = True
+            for spec, layer in self.micro_engram_slots:
+                loaded |= self._load_separate_engram(spec, layer)
         return loaded
 
     def _load_separate_engram(self, spec, layer) -> set[str]:
         engram = layer.micro_engram
-        sd = load_engram_weights(spec["weights"], layer=spec["layer"])
+        shared = sum(s["weights"] == spec["weights"] for s, _ in self.micro_engram_slots) > 1
+        sd = load_engram_weights(spec["weights"], layer=spec["layer"], need_layer=shared)
         if not any(k.startswith("tables.") for k in sd):
             raise ValueError(f"[micro_engram] no engram weights for layer {spec['layer']} in {spec['weights']}")
         if "canon" not in sd and spec.get("token_merge"):

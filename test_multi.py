@@ -434,6 +434,23 @@ finally:
     torch.set_default_device("cpu")
 check(f"base fingerprint is the same with a non-CPU default device ({fp_meta})", fp_cpu and fp_meta == fp_cpu)
 
+# one file shared by several engrams must carry layer numbers (else both get the same tensors)
+local_pt = os.path.join(TMP, "local_names.pt")
+torch.save({"tables.0.weight": torch.zeros(4, 2), "value.weight": torch.zeros(2, 2)}, local_pt)
+full_pt = os.path.join(TMP, "full_names.pt")
+torch.save({f"model.layers.{i}.micro_engram.tables.0.weight": torch.full((4, 2), float(i)) for i in (0, 29)}, full_pt)
+try:
+    load_engram_weights(local_pt, layer=29, need_layer=True)
+    shared_err = None
+except ValueError as e:
+    shared_err = str(e)
+check("shared file with local names: error instead of the same weights for every engram",
+      shared_err is not None and "layer number" in shared_err
+      and "tables.0.weight" in load_engram_weights(local_pt, layer=29))  # alone: still loads
+check("shared file with full names: each engram gets its own layer's tensors",
+      float(load_engram_weights(full_pt, layer=29, need_layer=True)["tables.0.weight"][0, 0]) == 29.0
+      and float(load_engram_weights(full_pt, layer=0, need_layer=True)["tables.0.weight"][0, 0]) == 0.0)
+
 bad = 0
 for name, ok in results:
     print(f"[{'PASS' if ok else 'FAIL'}] {name}")

@@ -109,12 +109,13 @@ def engram_layers_in(path):
     return sorted({lay for k in keys if _local_name(k) is not None and (lay := layer_of_key(k)) is not None})
 
 
-def load_engram_weights(path, layer=None):
+def load_engram_weights(path, layer=None, need_layer=False):
     """Engram tensors from `path`, keyed by their name inside the engram module.
 
     With `layer`, only the engram of that decoder layer is read (checkpoints of runs with
     several engrams hold one per layer). Files saved with local names (micro_engram.pt)
-    carry no layer and are returned as they are.
+    carry no layer and are returned as they are, unless `need_layer` (one file shared by
+    several engrams: without layer numbers every engram would get the same tensors).
     """
     path = os.path.abspath(path)
     if os.path.isdir(path):
@@ -126,11 +127,21 @@ def load_engram_weights(path, layer=None):
         if not sd:  # a file saved with local names already
             from safetensors.torch import load_file
 
-            sd = load_file(path)
+            sd = _no_layer(load_file(path), path, layer, need_layer)
         return sd
     sd = _flatten(torch.load(path, map_location="cpu", weights_only=True))
     full = _from_full_keys(sd, layer)
-    return full or {k: v for k, v in sd.items() if torch.is_tensor(v)}  # micro_engram.pt has local names
+    # micro_engram.pt has local names
+    return full or _no_layer({k: v for k, v in sd.items() if torch.is_tensor(v)}, path, layer, need_layer)
+
+
+def _no_layer(sd, path, layer, need_layer):
+    if need_layer and layer is not None and any(k.startswith("tables.") for k in sd):
+        raise ValueError(f"[micro_engram] {path} is used by several engrams, but its tensor names have no "
+                         f"layer number (e.g. {next(iter(sd))}), so it can't tell which is layer {layer}'s. "
+                         f"Give each engram its own file, or keep the full names "
+                         f"(...layers.{layer}.micro_engram.tables.0.weight)")
+    return sd
 
 
 def resolve_weights_path(conf, conf_path):
