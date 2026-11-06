@@ -270,9 +270,10 @@ def _install_lazy_adam(trainer):
             a = self.args
             self.optimizer = LazyAdamW(groups, lr=a.learning_rate, betas=(a.adam_beta1, a.adam_beta2),
                                        eps=a.adam_epsilon, weight_decay=a.weight_decay)
-            LOG.warning(f"[micro_engram] optimizer: LazyAdamW ({sum(p.numel() for p in lazy) / 1e6:.1f}M table "
-                        f"params with lazy row updates, {sum(p.numel() for p in dense) / 1e6:.1f}M as AdamW); "
-                        f"the YAML `optimizer` is not used")
+            tables = (f"{sum(p.numel() for p in lazy) / 1e6:.1f}M table params with lazy row updates" if lazy
+                      else "row-sharded tables have their own optimizer")
+            LOG.warning(f"[micro_engram] optimizer: LazyAdamW ({tables}, {sum(p.numel() for p in dense) / 1e6:.1f}M "
+                        f"as AdamW); the YAML `optimizer` is not used")
         return self.optimizer
 
     trainer.create_optimizer = types.MethodType(create_optimizer, trainer)
