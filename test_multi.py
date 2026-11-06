@@ -414,7 +414,6 @@ try:
 except ValueError:
     check("frozen without init_from is rejected", True)
 
-shutil.rmtree(TMP, ignore_errors=True)
 # base fingerprint inside a server: vLLM builds models with CUDA as the default device, and
 # safetensors' get_slice follows it ("can't convert cuda tensor to numpy"). meta stands in.
 from micro_engram.weights import base_fingerprint  # noqa: E402
@@ -451,6 +450,64 @@ check("shared file with full names: each engram gets its own layer's tensors",
       float(load_engram_weights(full_pt, layer=29, need_layer=True)["tables.0.weight"][0, 0]) == 29.0
       and float(load_engram_weights(full_pt, layer=0, need_layer=True)["tables.0.weight"][0, 0]) == 0.0)
 
+# micro_engram_sharding: rows, single process (the multi-GPU exchange is in test_rows.py)
+ids_r = torch.randint(5, V, (2, 12))
+plain = Toy()
+p_plain = MicroEngramPlugin()
+p_plain.post_model_load(cfg(micro_engram_init_from=run_a), plain)
+rowm = Toy()
+p_rows = MicroEngramPlugin()
+p_rows.post_model_load(cfg(micro_engram_init_from=run_a, micro_engram_sharding="rows",
+                           micro_engram_extra=[{"layer": 2}]), rowm)
+e_rows = p_rows.slots[0].engram
+check("rows: tables leave the model's parameters and state dict (FSDP never sees them)",
+      not any(".tables." in n for n, _ in rowm.named_parameters())
+      and not any(".tables." in k for k in rowm.state_dict()) and len(e_rows.row_shards) == 4)
+check("rows: init_from rows are the trained tables; trainable; same output as without sharding",
+      torch.equal(e_rows.row_shards[1], p_plain.slots[0].engram.tables[1].weight)
+      and all(p.requires_grad for p in e_rows.row_shards)
+      and torch.allclose(p_plain.slots[0].engram(torch.ones(2, 12, D), ids_r), e_rows(torch.ones(2, 12, D), ids_r)))
+x_rows = p_rows.slots[1].engram.row_shards[0]
+check(f"rows: a new engram's rows start at N(0, 0.02) (std {float(x_rows.std()):.4f}), where = its layer",
+      abs(float(x_rows.std()) - 0.02) < 0.004 and p_rows.slots[1].where == "model.language_model.layers.2")
+rowm(input_ids=ids_r).pow(2).sum().backward()
+check("rows: gradients reach the rows through the model", e_rows.row_shards[0].grad is not None
+      and e_rows.row_shards[0].grad.abs().sum() > 0)
+logs_r = {"loss": 1.0}
+_StatsCallback(p_rows.slots, 1, rows=types.SimpleNamespace(last_grad_norm=0.5)).on_log(
+    None, types.SimpleNamespace(is_world_process_zero=True, global_step=1), None, logs=logs_r)
+check("rows: stats line from this rank's rows, plus the tables' grad norm",
+      "engram_L0/rows_learned_3g" in logs_r and logs_r["engram/table_grad_norm"] == 0.5)
+grab.msgs.clear()
+_ReportTrainableCallback(p_rows.slots).on_train_begin(None, types.SimpleNamespace(is_world_process_zero=True),
+                                                      None, model=rowm)
+rep_r = " | ".join(grab.msgs)
+n_rows_params = sum(p.numel() for s_ in p_rows.slots for p in s_.engram.row_shards)
+check("rows: train-start report counts the rows, says which rows this GPU holds, no errors",
+      "holds rows 0..256 of 257" in rep_r and "FROZEN" not in rep_r
+      and f"{(sum(p.numel() for p in rowm.parameters() if p.requires_grad) + n_rows_params) / 1e6:.1f}M trainable" in rep_r)
+mixed = MicroEngram(model_dim=D, table_size=257, engram_dim=8, num_heads=2, vocab_size=V, gate="scalar_sqrt",
+                    build_tables=False)
+mixed.shard_rows(0, 1, dtype=torch.float32)
+mixed.to(torch.bfloat16)  # as FSDP's mixed precision computes key/value; the rows stay fp32
+try:
+    mixed(torch.randn(2, 12, D, dtype=torch.bfloat16), ids_r).float().pow(2).sum().backward()
+    mixed_ok = mixed.row_shards[0].dtype == torch.float32 and mixed.row_shards[0].grad.dtype == torch.float32
+except RuntimeError as e:
+    mixed_ok = False
+    print("   mixed:", e)
+check("rows: fp32 rows (micro_engram_dtype: fp32) with bf16 key/value compute; fp32 gradients", mixed_ok)
+p_fr = MicroEngramPlugin()
+p_fr.post_model_load(cfg(micro_engram_init_from=run_a, micro_engram_frozen=True, micro_engram_sharding="rows"), Toy())
+check("rows: a frozen engram's rows are frozen too", not any(p.requires_grad for p in p_fr.slots[0].engram.row_shards))
+try:
+    MicroEngramPlugin().post_model_load(cfg(micro_engram_sharding="rows", fsdp_config=None, fsdp_version=None), Toy())
+    no_fsdp = False
+except ValueError:
+    no_fsdp = True
+check("rows: refused without FSDP", no_fsdp)
+
+shutil.rmtree(TMP, ignore_errors=True)
 bad = 0
 for name, ok in results:
     print(f"[{'PASS' if ok else 'FAIL'}] {name}")

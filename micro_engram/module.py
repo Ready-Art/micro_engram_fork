@@ -33,20 +33,23 @@ class MicroEngram(nn.Module):
 
     def __init__(self, model_dim, table_size=65_536, engram_dim=128,
                  num_heads=4, orders=(2, 3), pad_id=0, seed=0,
-                 vocab_size=262_144, canon=None, gate="scalar"):
+                 vocab_size=262_144, canon=None, gate="scalar", build_tables=True):
         super().__init__()
         if gate not in self.GATES:
             raise ValueError(f"gate must be one of {self.GATES}, got {gate!r}")
         self.gate = gate
         self.orders = tuple(orders)
         self.table_size = table_size
+        self.engram_dim = engram_dim
+        self.seed = seed
         self.pad_id = pad_id
         self._table_orders = [n for n in self.orders for _ in range(num_heads)]
         n_tables = len(self._table_orders)
 
-        self.tables = nn.ModuleList(nn.Embedding(table_size, engram_dim) for _ in range(n_tables))
-        for t in self.tables:
-            nn.init.normal_(t.weight, std=0.02)
+        if build_tables:  # False: row-sharded training builds only its own rows (shard_rows)
+            self.tables = nn.ModuleList(nn.Embedding(table_size, engram_dim) for _ in range(n_tables))
+            for t in self.tables:
+                nn.init.normal_(t.weight, std=0.02)
 
         mem_dim = engram_dim * n_tables
         if gate in self.SCALAR_GATES:
@@ -80,6 +83,45 @@ class MicroEngram(nn.Module):
             if canon.shape != (vocab_size,):
                 raise ValueError(f"canon must have shape ({vocab_size},), got {tuple(canon.shape)}")
         self.register_buffer("canon", canon)
+
+    # --- row sharding (micro_engram_sharding: rows, see rows.py) ---
+    # The local rows live in a plain list, not as registered parameters, so FSDP, .to() and
+    # state_dict() never see them (each rank holds different rows).
+    row_shards = None  # [Parameter [rows on this rank, dim]] per table, when row-sharded
+    row_info = None    # (rank, world, first row, rows per rank)
+
+    def shard_rows(self, rank, world, device=None, dtype=None, requires_grad=True):
+        """Keep only this rank's rows of every table: sliced from the tables if they exist
+        (loaded weights), else freshly initialised like nn.Embedding tables (N(0, 0.02))."""
+        from .rows import row_range
+
+        start, count = row_range(self.table_size, rank, world)
+        per = -(-self.table_size // world)
+        n_tables = len(self._table_orders)
+        if "tables" in self._modules:
+            src = [t.weight.detach()[start:start + count] for t in self.tables]
+            dtype = dtype or src[0].dtype
+            del self.tables
+        else:
+            g = torch.Generator().manual_seed(self.seed * 1_000_003 + rank)  # differs per rank
+            src = [torch.randn(count, self.engram_dim, generator=g) * 0.02 for _ in range(n_tables)]
+        shards = [nn.Parameter(t.to(device=device, dtype=dtype).clone(), requires_grad=requires_grad)
+                  for t in src]
+        self.__dict__["row_shards"] = shards
+        self.__dict__["row_info"] = (rank, world, start, per)
+        return shards
+
+    def all_parameters(self):
+        """Registered parameters plus this rank's table rows when row-sharded."""
+        return list(self.parameters()) + list(self.row_shards or [])
+
+    def lookup(self, idx):
+        """The table rows for the hashed ids `idx` (one tensor per table)."""
+        if self.row_shards is not None:
+            from .rows import row_lookup
+
+            return row_lookup(self, idx)
+        return [tab(i) for tab, i in zip(self.tables, idx)]
 
     # q_scale / k_scale hold scale - 1 in the module, the scale itself in state dicts.
     # Read the scales through norm_scales() or state_dict(), never the parameters directly
@@ -158,7 +200,12 @@ class MicroEngram(nn.Module):
 
         keep: optional [n_tokens] bool; False tokens get no memory (e.g. image/audio
         placeholders in multimodal serving, which training never saw)."""
-        mem = torch.cat([tab(i) for tab, i in zip(self.tables, idx)], dim=-1)
+        mem = torch.cat(self.lookup(idx), dim=-1)
+        if self.row_shards is not None:
+            # rows live outside FSDP, so its mixed-precision policy doesn't cast them (fp32 rows,
+            # bf16 compute): match the layer that reads them; the gradient is cast back
+            reader = self.key if self.gate in self.SCALAR_GATES else self.up
+            mem = mem.to(reader.weight.dtype)
         d = hidden.shape[-1]
         h = F.rms_norm(hidden.float(), (d,))
         if self.gate in self.SCALAR_GATES:
@@ -219,7 +266,7 @@ def find_text_layers(model):
     raise RuntimeError("Could not find text decoder layers; print(model) and set the path by hand.")
 
 
-def engram_from_spec(spec, model_dim, vocab_size, pad_default=0, canon=None):
+def engram_from_spec(spec, model_dim, vocab_size, pad_default=0, canon=None, build_tables=True):
     """A MicroEngram built from one entry of weights.engram_specs (seed included: the seed
     decides the hash addresses, so a wrong one would silently scramble every lookup)."""
     return MicroEngram(
@@ -233,6 +280,7 @@ def engram_from_spec(spec, model_dim, vocab_size, pad_default=0, canon=None):
         vocab_size=vocab_size,
         canon=canon,
         gate=spec.get("gate") or "scalar",
+        build_tables=build_tables,
     )
 
 

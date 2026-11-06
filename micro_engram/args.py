@@ -49,3 +49,8 @@ class MicroEngramArgs(BaseModel):
     # row whose gradient is zero this step is not touched (no leftover-momentum drift), like
     # SparseAdam; works with FSDP2. Uses learning_rate, adam_beta1/2, adam_epsilon, weight_decay.
     micro_engram_optimizer: Optional[Literal["lazy_adam"]] = None
+    # rows: each GPU keeps its own rows of the tables outside FSDP and fetches only the rows a
+    # batch uses (all_to_all), instead of FSDP gathering whole tables and reduce-scattering
+    # full-size gradients. Needs FSDP. Tables get their own optimizer (AdamW, or lazy with
+    # micro_engram_optimizer: lazy_adam) and their own clipping; checkpoints add micro_engram_rows/.
+    micro_engram_sharding: Optional[Literal["rows"]] = None

@@ -58,6 +58,8 @@ def weight_stats(named, orders=(2, 3), num_heads=None):
 def module_stats(engram):
     """weight_stats for a live MicroEngram (parameters only, no buffers)."""
     named = dict(engram.named_parameters())
+    for k, p in enumerate(getattr(engram, "row_shards", None) or []):
+        named[f"tables.{k}.weight"] = p  # row-sharded: this rank's rows (a random sample, like FSDP's)
     for name in getattr(engram, "DELTA_SCALES", ()):
         if name in named:  # the parameter holds scale - 1; report the scale, as saved files do
             named[name] = _local(named[name]).float() + 1

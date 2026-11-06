@@ -27,6 +27,7 @@ class _Slot:
     engram: torch.nn.Module
     frozen: bool = False
     source: str | None = None     # weights it was loaded from (init_from), absolute
+    where: str | None = None      # decoder layer's module name, e.g. model.language_model.layers.0
 
     @property
     def layer(self):
@@ -109,10 +110,16 @@ class _WriteConfigCallback(TrainerCallback):
                                           lambda s: f"{ckpt}/{self.checkpoint_weights}"), args.output_dir)
 
 
+def _params(engram):
+    """Every parameter of an engram, including its row-sharded table rows."""
+    get = getattr(engram, "all_parameters", None)
+    return get() if get is not None else list(engram.parameters())
+
+
 def _freeze_frozen(slots):
     for slot in slots:
         if slot.frozen:
-            for p in slot.engram.parameters():
+            for p in _params(slot.engram):
                 p.requires_grad_(False)
 
 
@@ -133,17 +140,23 @@ class _ReportTrainableCallback(TrainerCallback):
             LOG.error(f"[micro_engram] micro_engram_dtype is {self.dtype} but the engram weights are "
                       f"{', '.join(sorted(dtypes))}: something cast them after loading")
         n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_train += sum(p.numel() for s in self.slots for p in (s.engram.row_shards or []) if p.requires_grad)
         parts, n_eng_train = [], 0
         for slot in self.slots:
-            n = sum(p.numel() for p in slot.engram.parameters())
-            t = sum(p.numel() for p in slot.engram.parameters() if p.requires_grad)
+            n = sum(p.numel() for p in _params(slot.engram))
+            t = sum(p.numel() for p in _params(slot.engram) if p.requires_grad)
             n_eng_train += t
             parts.append(f"layer {slot.layer}: {t / 1e6:.1f}M of {n / 1e6:.1f}M"
                          + (" (frozen)" if slot.frozen else ""))
         LOG.warning(f"[micro_engram] at train start: {n_train / 1e6:.1f}M trainable in total; "
                     f"engram {', '.join(parts)}")
         for slot in self.slots:
-            t = sum(p.numel() for p in slot.engram.parameters() if p.requires_grad)
+            info = slot.engram.row_info
+            if info is not None:
+                LOG.warning(f"[micro_engram] layer {slot.layer}: tables row-sharded, this GPU holds rows "
+                            f"{info[2]:,}..{info[2] + slot.engram.row_shards[0].shape[0] - 1:,} of "
+                            f"{slot.engram.table_size:,} (counts above are this GPU's share)")
+            t = sum(p.numel() for p in _params(slot.engram) if p.requires_grad)
             if slot.frozen and t:
                 LOG.error(f"[micro_engram] engram at layer {slot.layer} should be frozen but is training")
             if not slot.frozen and t == 0:
@@ -169,8 +182,8 @@ class _StatsCallback(TrainerCallback):
     One engram: keys "engram/..."; several: "engram_L<layer>/...".
     """
 
-    def __init__(self, slots, every):
-        self.slots, self.every = slots, every
+    def __init__(self, slots, every, rows=None):
+        self.slots, self.every, self.rows = slots, every, rows
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if not self.every or not state.is_world_process_zero:
@@ -193,6 +206,9 @@ class _StatsCallback(TrainerCallback):
             if len(self.slots) > 1:
                 stats = {k.replace("engram/", f"engram_L{slot.layer}/", 1): v for k, v in stats.items()}
             logs.update(stats)  # shown in the normal log line, and reaches wandb / tensorboard
+        rows = self.rows() if callable(self.rows) else self.rows
+        if rows is not None and rows.last_grad_norm is not None:
+            logs["engram/table_grad_norm"] = rows.last_grad_norm  # tables are not in grad_norm
 
 
 class _MemorySnapshotCallback(TrainerCallback):
@@ -261,6 +277,79 @@ def _install_lazy_adam(trainer):
 
     trainer.create_optimizer = types.MethodType(create_optimizer, trainer)
     trainer._micro_engram_lazy_adam = True
+
+
+class _RowShardCallback(TrainerCallback):
+    """Row-sharded tables: clip and step them with the Trainer's optimizer step, save the
+    final ones at the end of training (checkpoints are saved by the save_model wrapper)."""
+
+    def __init__(self, rows, trainer, on_final):
+        self.rows, self.trainer, self.on_final = rows, trainer, on_final
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        self.rows.clip(args.max_grad_norm)  # after the Trainer clipped the rest
+
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        # this step's LR (the scheduler steps right after), relative to the Trainer's first group
+        g0 = self.trainer.optimizer.param_groups[0]
+        base = g0.get("initial_lr") or args.learning_rate
+        self.rows.step(g0["lr"] * args.learning_rate / base if base else g0["lr"])
+
+    def on_train_end(self, args, state, control, **kwargs):
+        from .rows import ROWS_DIR
+
+        self.rows.save(os.path.join(args.output_dir, ROWS_DIR))
+        if state.is_world_process_zero:
+            self.on_final(args.output_dir)
+
+
+def _install_row_sharding(trainer, slots, lazy, on_final):
+    """Table optimizer + checkpoint save/resume for row-sharded tables. Returns the callback.
+
+    Checkpoints: Trainer._save_checkpoint calls save_model on every rank before it writes
+    trainer_state.json (what marks a checkpoint complete), so the rows are saved there.
+    Resume: _load_optimizer_and_scheduler gets the checkpoint path on every rank.
+    """
+    import types
+
+    from .rows import ROWS_DIR, ROWS_OPTIM_DIR, RowTables
+
+    if getattr(trainer, "_micro_engram_rows", None) is not None:
+        return trainer._micro_engram_rows
+    a = trainer.args
+    rows = RowTables([(f"{s.where}.micro_engram.", s.engram) for s in slots],
+                     lr=a.learning_rate, betas=(a.adam_beta1, a.adam_beta2), eps=a.adam_epsilon,
+                     weight_decay=a.weight_decay, lazy=lazy)
+    orig_save, orig_load = trainer.save_model, trainer._load_optimizer_and_scheduler
+
+    def save_model(self, output_dir=None, _internal_call=False):
+        out = orig_save(output_dir, _internal_call=_internal_call)
+        folder = output_dir or self.args.output_dir
+        if os.path.basename(os.path.normpath(folder)).startswith("checkpoint-"):
+            rows.save(os.path.join(folder, ROWS_DIR), os.path.join(folder, ROWS_OPTIM_DIR))
+        return out
+
+    def load_optimizer_and_scheduler(self, checkpoint):
+        out = orig_load(checkpoint)
+        if checkpoint:
+            src = os.path.join(checkpoint, ROWS_DIR)
+            if not os.path.isdir(src):  # a checkpoint from a run without row sharding
+                src = os.path.join(checkpoint, "pytorch_model_fsdp_0")
+            if not os.path.isdir(src):
+                raise RuntimeError(f"[micro_engram] resume: no engram tables in {checkpoint} "
+                                   f"(neither {ROWS_DIR}/ nor pytorch_model_fsdp_0/)")
+            n, opt = rows.load(src, os.path.join(checkpoint, ROWS_OPTIM_DIR))
+            LOG.warning(f"[micro_engram] resume: loaded {n} row-sharded tables from {src}"
+                        + ("" if opt else "; NO table optimizer state there, the tables' Adam restarts"))
+        return out
+
+    trainer.save_model = types.MethodType(save_model, trainer)
+    trainer._load_optimizer_and_scheduler = types.MethodType(load_optimizer_and_scheduler, trainer)
+    trainer._micro_engram_rows = _RowShardCallback(rows, trainer, on_final)
+    n = sum(p.numel() for p in rows.params())
+    LOG.warning(f"[micro_engram] row-sharded tables: {n / 1e6:.1f}M rows' params on this GPU, own optimizer "
+                f"({'lazy ' if lazy else ''}AdamW) and clipping (logged as engram/table_grad_norm)")
+    return trainer._micro_engram_rows
 
 
 def _safe_fingerprint(path):
@@ -555,6 +644,8 @@ class MicroEngramPlugin(BasePlugin):
         self.slots = []
         self.base_conf = None
         self.dtype = None
+        self.sharding = None
+        self.rows_cb = None
 
     @property
     def engram(self):  # the main engram (older code paths)
@@ -593,7 +684,8 @@ class MicroEngramPlugin(BasePlugin):
                 spec["gate"] = "ple" if "up.weight" in sd else (
                     "scalar_sqrt" if "q_scale" in sd else "scalar")
 
-        engram = engram_from_spec(spec, text_cfg.hidden_size, text_cfg.vocab_size, pad, canon)
+        engram = engram_from_spec(spec, text_cfg.hidden_size, text_cfg.vocab_size, pad, canon,
+                                  build_tables=not (self.sharding and sd is None))
         if sd is not None:
             if "canon" in sd and canon is not None and not torch.equal(sd["canon"].long(), canon):
                 LOG.warning(f"[micro_engram] layer {spec['layer']}: keeps the token-merge map it was "
@@ -613,11 +705,23 @@ class MicroEngramPlugin(BasePlugin):
             "init_from": source,
         })
         dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}.get(self.dtype)
+        if self.sharding:
+            from .module import find_text_layers, layer_device_dtype
+            from .rows import dist_rank_world
+
+            rank, world = dist_rank_world()
+            dev = (torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0))) if torch.cuda.is_available()
+                   else torch.device("cpu"))
+            _, layer_dtype = layer_device_dtype(find_text_layers(model)[1][spec["layer"]])
+            # Before attach_engram: that moves the engram to its layer's device, which is meta on
+            # ranks > 0 with cpu_ram_efficient_loading (rank 0's state dict is broadcast later, but
+            # the rows are not in it). The tables live outside FSDP, on this GPU from the start.
+            engram.shard_rows(rank, world, device=dev, dtype=dtype or layer_dtype, requires_grad=not frozen)
         where, _ = attach_engram(model, engram, spec["layer"], dtype=dtype)
-        n = sum(p.numel() for p in engram.parameters())
+        n = sum(p.numel() for p in _params(engram))
         LOG.warning(f"[micro_engram] attached at {where}: {n / 1e6:.1f}M params, {spec['gate']} gate, "
                     f"seed {spec['seed']}" + (", FROZEN" if frozen else ""))
-        return _Slot(spec=spec, engram=engram, frozen=frozen, source=source)
+        return _Slot(spec=spec, engram=engram, frozen=frozen, source=source, where=where)
 
     def post_model_load(self, cfg, model):
         text_cfg = getattr(model.config, "text_config", model.config)
@@ -633,6 +737,9 @@ class MicroEngramPlugin(BasePlugin):
             LOG.warning("[micro_engram] token merging OFF (no micro_engram_canon_path)")
 
         self.dtype = cfg.micro_engram_dtype
+        self.sharding = cfg.micro_engram_sharding
+        if self.sharding and not _uses_fsdp(cfg):
+            raise ValueError("[micro_engram] micro_engram_sharding: rows needs FSDP (fsdp_config)")
         self.slots = []
         for spec, init_from, frozen in _engram_requests(cfg):
             spec["canon_path"] = cfg.micro_engram_canon_path
@@ -673,29 +780,53 @@ class MicroEngramPlugin(BasePlugin):
             LOG.warning("[micro_engram] every engram is frozen: nothing of the engrams will train")
         LOG.warning("[micro_engram] trainable count is logged at train start, after Axolotl's freezing")
 
+    def _row_sharding(self, cfg, trainer):
+        if not self.sharding or self.rows_cb is not None:
+            return None
+        from .rows import ROWS_DIR
+
+        def on_final(output_dir):
+            write_config(build_config(self.base_conf, self.slots, lambda s: ROWS_DIR), output_dir)
+
+        self.rows_cb = _install_row_sharding(trainer, self.slots, cfg.micro_engram_optimizer == "lazy_adam",
+                                             on_final)
+        return self.rows_cb
+
     def post_trainer_create(self, cfg, trainer):
         # Axolotl applies unfrozen_parameters after post_model_load, and '.+micro_engram'
         # matches every engram: freeze the frozen ones again before the optimizer is built.
         _freeze_frozen(self.slots)
         if cfg.micro_engram_optimizer == "lazy_adam":
             _install_lazy_adam(trainer)
+        cb = self._row_sharding(cfg, trainer)  # normally already done in add_callbacks_post_trainer
+        if cb is not None:
+            trainer.add_callback(cb)
 
     def add_callbacks_post_trainer(self, cfg, trainer):
         _freeze_frozen(self.slots)  # in case post_trainer_create is not called by this Axolotl
         if cfg.micro_engram_optimizer == "lazy_adam":
             _install_lazy_adam(trainer)
-        # FSDP checkpoints hold the engram in their DCP folder (Accelerate's name for model 0)
+        rows_cb = self._row_sharding(cfg, trainer)
+        # FSDP checkpoints hold the engram in their DCP folder (Accelerate's name for model 0);
+        # with row sharding the complete engram is in micro_engram_rows/
         ckpt_weights = "pytorch_model_fsdp_0" if _uses_fsdp(cfg) else None
+        if self.sharding:
+            from .rows import ROWS_DIR
+
+            ckpt_weights = ROWS_DIR
         callbacks = [_WriteConfigCallback(self.base_conf, self.slots, ckpt_weights),
                      _ReportTrainableCallback(self.slots, self.dtype)]
         if cfg.micro_engram_stats_steps:
             # first in line, so the stats are in `logs` before the printer/loggers see it
             trainer.callback_handler.callbacks.insert(
-                0, _StatsCallback(self.slots, cfg.micro_engram_stats_steps))
+                0, _StatsCallback(self.slots, cfg.micro_engram_stats_steps,
+                                  rows=lambda: self.rows_cb.rows if self.rows_cb else None))
         if not _uses_fsdp(cfg):  # under FSDP the checkpoint already contains the engram
             callbacks.append(_SaveEngramCallback(self.slots, cfg.micro_engram_save_steps))
         if cfg.micro_engram_memory_snapshot:
             callbacks.append(_MemorySnapshotCallback(int(cfg.micro_engram_memory_snapshot)))
+        if rows_cb is not None:
+            callbacks.append(rows_cb)
         return callbacks
 
     def create_lr_scheduler(self, cfg, trainer, optimizer, num_training_steps):
