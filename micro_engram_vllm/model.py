@@ -76,11 +76,19 @@ def _resolve_engram(vllm_config: VllmConfig):
         with open(path) as f:
             conf = json.load(f)
         for spec in engram_specs(conf, path):
-            if not spec["weights"] or not os.path.exists(spec["weights"]):
+            if not spec["weights"]:
                 raise ValueError(
-                    f"[micro_engram] {path}: the engram at layer {spec['layer']} must say where its "
-                    f"weights are: \"weights\": \"<file or folder, relative to the config>\" "
-                    f"(found: {spec['weights']})"
+                    f"[micro_engram] {path}: the engram at layer {spec['layer']} has no \"weights\". "
+                    f"This is probably the copy training writes to output_dir at the start (before any "
+                    f"checkpoint exists): point --additional-config at checkpoint-N/{CONFIG_NAME} "
+                    f"instead, or set \"weights\": \"<file or folder; relative paths are relative to "
+                    f"this config's folder>\""
+                )
+            if not os.path.exists(spec["weights"]):
+                raise ValueError(
+                    f"[micro_engram] {path}: the weights of the engram at layer {spec['layer']} are not "
+                    f"there: {spec['weights']} (a relative \"weights\" is relative to the config's "
+                    f"folder, so a config copied elsewhere needs an absolute path)"
                 )
         return conf, path, True
 

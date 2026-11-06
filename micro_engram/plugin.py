@@ -99,8 +99,14 @@ class _WriteConfigCallback(TrainerCallback):
 
     def on_save(self, args, state, control, **kwargs):
         if state.is_world_process_zero:
+            ckpt = f"checkpoint-{state.global_step}"
             conf = build_config(self.base, self.slots, lambda s: self.checkpoint_weights)
-            write_config(conf, os.path.join(args.output_dir, f"checkpoint-{state.global_step}"))
+            write_config(conf, os.path.join(args.output_dir, ckpt))
+            if self.checkpoint_weights:
+                # the output_dir copy (written at train start with no weights yet) now points to
+                # the newest checkpoint, so it can be served directly too
+                write_config(build_config(self.base, self.slots,
+                                          lambda s: f"{ckpt}/{self.checkpoint_weights}"), args.output_dir)
 
 
 def _freeze_frozen(slots):

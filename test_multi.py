@@ -132,6 +132,11 @@ check("run A: one engram at layer 0, seed 0 (same hashing as before multi-engram
 fake_checkpoint(model_a, plug_a, run_a, 10)
 fake_checkpoint(model_a, plug_a, run_a, 20)
 os.remove(os.path.join(run_a, "checkpoint-20", "trainer_state.json"))  # still being written
+with open(os.path.join(run_a, "micro_engram_config.json")) as f:
+    top_conf = json.load(f)
+check("output_dir config points to the newest checkpoint (servable as is, weights not null)",
+      top_conf["weights"] == "checkpoint-20/pytorch_model_fsdp_0"
+      and top_conf["engrams"][0]["weights"] == "checkpoint-20/pytorch_model_fsdp_0")
 
 w, spec = resolve_engram_source(run_a, 0)
 check("init_from an output_dir picks the newest COMPLETE checkpoint",
