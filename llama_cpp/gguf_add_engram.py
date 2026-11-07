@@ -7,13 +7,16 @@ Add trained micro-engram(s) to a Gemma 4 GGUF, for llama.cpp built with the micr
 --engram: a checkpoint-N folder, an assembled model folder, or a micro_engram_config.json
 (every engram it lists is added, each from its own "weights"). The base GGUF can be
 quantized (Q4/Q8/...): its tensors are copied unchanged, the engram is added as BF16
-(--dtype f16/f32 also possible). Run from the micro_engram repo root. Needs the `gguf`
-package: `pip install gguf`, or PYTHONPATH=/path/to/llama.cpp/gguf-py.
+(--dtype f16/f32 also possible). Runs from any folder (it finds the micro_engram package
+next to it). Needs torch and the `gguf` package: `pip install gguf`, or
+PYTHONPATH=/path/to/llama.cpp/gguf-py.
 """
 import argparse
 import json
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # the repo root
 
 import numpy as np
 import torch
