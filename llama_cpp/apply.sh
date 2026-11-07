@@ -7,7 +7,7 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 dst="${1:?usage: apply.sh /path/to/llama.cpp}"
-tested=13ec8f614cfef964fe97bbf872bc436dbc484a1f
+tested=d38bea34227bbf9069d62fdc239c98ab6e05435a
 
 cd "$dst"
 if [ ! -f src/models/gemma4.cpp ]; then

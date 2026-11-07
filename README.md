@@ -342,7 +342,7 @@ vllm serve /path/to/base_model --tensor-parallel-size 4 \
 
 llama.cpp has no plugin mechanism for models, so support comes as a small patch set in `llama_cpp/`: one new file (`src/llama-micro-engram.{h,cpp}`) plus 5 small edits to existing files (`micro-engram.patch`, ~25 changed lines). The engram goes **inside the GGUF**, so `llama-server` and the other tools need no new flags.
 
-1. **Patch and build llama.cpp** (tested on llama.cpp `13ec8f6`):
+1. **Patch and build llama.cpp** (tested on llama.cpp `d38bea3`):
    ```bash
    ./llama_cpp/apply.sh /path/to/llama.cpp
    cd /path/to/llama.cpp && cmake -B build -DGGML_CUDA=ON && cmake --build build --config Release -j --target llama-server
