@@ -90,9 +90,10 @@ class MicroEngram(nn.Module):
     row_shards = None  # [Parameter [rows on this rank, dim]] per table, when row-sharded
     row_info = None    # (rank, world, first row, rows per rank)
 
-    def shard_rows(self, rank, world, device=None, dtype=None, requires_grad=True):
+    def shard_rows(self, rank, world, device=None, dtype=None, requires_grad=True, empty=False):
         """Keep only this rank's rows of every table: sliced from the tables if they exist
-        (loaded weights), else freshly initialised like nn.Embedding tables (N(0, 0.02))."""
+        (loaded weights), else freshly initialised like nn.Embedding tables (N(0, 0.02)), or
+        left uninitialised with empty=True (a server that loads the real rows next)."""
         from .rows import row_range
 
         start, count = row_range(self.table_size, rank, world)
@@ -102,10 +103,12 @@ class MicroEngram(nn.Module):
             src = [t.weight.detach()[start:start + count] for t in self.tables]
             dtype = dtype or src[0].dtype
             del self.tables
+        elif empty:
+            src = [torch.empty(count, self.engram_dim, device=device, dtype=dtype) for _ in range(n_tables)]
         else:
             g = torch.Generator().manual_seed(self.seed * 1_000_003 + rank)  # differs per rank
             src = [torch.randn(count, self.engram_dim, generator=g) * 0.02 for _ in range(n_tables)]
-        shards = [nn.Parameter(t.to(device=device, dtype=dtype).clone(), requires_grad=requires_grad)
+        shards = [nn.Parameter(t if empty else t.to(device=device, dtype=dtype).clone(), requires_grad=requires_grad)
                   for t in src]
         self.__dict__["row_shards"] = shards
         self.__dict__["row_info"] = (rank, world, start, per)
@@ -115,10 +118,14 @@ class MicroEngram(nn.Module):
         """Registered parameters plus this rank's table rows when row-sharded."""
         return list(self.parameters()) + list(self.row_shards or [])
 
+    row_lookup_fn = None  # a server's own lookup for row-sharded tables (vLLM: tensor parallel)
+
     def lookup(self, idx):
         """The table rows for the hashed ids `idx` (one tensor per table)."""
         if self.row_shards is not None:
-            from .rows import row_lookup
+            if self.row_lookup_fn is not None:
+                return self.row_lookup_fn(self, idx)
+            from .rows import row_lookup  # training: all_to_all between the data-parallel ranks
 
             return row_lookup(self, idx)
         return [tab(i) for tab, i in zip(self.tables, idx)]

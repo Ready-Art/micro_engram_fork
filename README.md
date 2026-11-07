@@ -303,6 +303,8 @@ Engram settings are resolved in this order: explicit flag (`--layer`, `--table-s
 
 `micro_engram_vllm` is a vLLM plugin (no vLLM fork). Installing this package registers it automatically; it replaces vLLM's Gemma 4 classes (text-only and multimodal) with ones that run the engram at its layer(s). Models without a `micro_engram_config.json` keep running as plain Gemma 4.
 
+With tensor parallelism the engram tables are **split by rows across the GPUs**, like vLLM's own vocabulary embedding: each GPU holds 1/TP of every table, and a lookup is a masked local read plus one all-reduce (exact: every row comes from one GPU). Two 2M-row engrams take ~1.1 GB per GPU at TP 4 instead of 4.3 GB on every GPU. The weight files are unchanged; `test_vllm_tp.py` checks it against the full tables.
+
 Install the package **in the vLLM environment** (Axolotl is not needed there):
 
 ```bash
@@ -405,6 +407,7 @@ python test_token_diff.py                     # engram_token_diff.py against a f
 python test_render_chat.py                    # render_chat.py: formats, template override, fixed sampling
 python test_resume_keys.py                    # checkpoint-wrapper key renaming on resume
 python test_vllm_ids.py                       # vLLM path: previous tokens per batch type, same output as training
+python test_vllm_tp.py                        # vLLM tables split over TP GPUs: == full tables, loading (file and checkpoint), with vLLM stand-ins
 python test_quant.py                          # 4-bit (NF4) base + placeholder QLoRA: dtype, freezing pattern, gradients (needs bitsandbytes, peft)
 python test_multi.py                          # several engrams, init_from + frozen, config, inference == training, assemble, stats (needs transformers)
 python llama_cpp/test/compare.py --llama-cpp <patched llama.cpp> --driver <engram_logits>   # llama.cpp patch vs PyTorch (needs a build; see the file)
