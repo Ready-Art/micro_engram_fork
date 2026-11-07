@@ -142,4 +142,6 @@ bad = 0
 for name, ok in results:
     print(f"[{'PASS' if ok else 'FAIL'}] {name}")
     bad += not ok
+import shutil  # noqa: E402
+shutil.rmtree(tmp, ignore_errors=True)
 sys.exit(1 if bad else 0)

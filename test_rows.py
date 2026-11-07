@@ -338,4 +338,6 @@ if __name__ == "__main__":
     for name, ok in merged.items():
         print(f"[{'PASS' if ok else 'FAIL'}] {name}")
         bad += not ok
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
     sys.exit(1 if bad or not merged else 0)
