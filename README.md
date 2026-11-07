@@ -278,6 +278,7 @@ python assemble_engram_model.py --base /path/to/base_model \
 | `infer_engram.py` | Test generation with the engram attached. See below. |
 | `engram_stats.py` | Engram weight stats from checkpoints on disk, **while training keeps running** (CPU only, reads only the engram tensors). `python engram_stats.py /path/to/output_dir` (newest checkpoint), `--all` (every checkpoint on disk), `--watch 120` (print each new checkpoint as it appears). Skips checkpoints that are still being written. |
 | `eval_logprob.py` | Measures how well a served model predicts held-out text, through vLLM's prompt log-probabilities, and compares two configs (e.g. with and without the engram): loss, perplexity, per-chunk win rate and a 95% interval. `run --url ... --data heldout/ --out a.json` once per config, then `compare a.json b.json`. |
+| `engram_token_diff.py` | Shows **where** the engram pushes within one reply: scores every token with the engram on and off (vLLM prompt log-probabilities, same tokens both times), lists the biggest pushes both ways, and writes an HTML heat map (green: the engram made the token likelier, red: less likely; hover for both probabilities). `run --url ... --messages chat.json --reply reply.txt --out on.json` once per config, then `render on.json off.json --out diff.html`. |
 
 ### Inference
 
@@ -399,6 +400,7 @@ python test_gate.py                           # all gate modes: no-op start, gra
 python test_canon.py                          # token-merge hashing and state-dict compatibility
 python test_optim.py                          # lazy_adam / rowwise_adam: vs AdamW, unused rows untouched, bf16 second-moment freeze, FSDP2 + state save/load
 python test_rows.py                           # micro_engram_sharding: rows, 3 processes: == full tables (forward, gradients, training, clipping), save/resume/reshard
+python test_token_diff.py                     # engram_token_diff.py against a fake vLLM server
 python test_resume_keys.py                    # checkpoint-wrapper key renaming on resume
 python test_vllm_ids.py                       # vLLM path: previous tokens per batch type, same output as training
 python test_quant.py                          # 4-bit (NF4) base + placeholder QLoRA: dtype, freezing pattern, gradients (needs bitsandbytes, peft)
