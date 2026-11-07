@@ -62,12 +62,17 @@ def chunk(text, max_chars):
     return [c for c in out if c.strip()]
 
 
-def load_chunks(path, max_chars, min_chars):
+def load_chunks(path, max_chars, min_chars, prefix=""):
+    """`prefix` (e.g. "<bos>" for Gemma, whose tokenizer adds no BOS) starts every piece,
+    also the ones cut from the middle of a text; a text that already starts with it keeps one."""
     chunks = []
     for source, text in read_texts(path):
-        for i, piece in enumerate(chunk(text.strip(), max_chars)):
+        text = text.strip()
+        if prefix and text.startswith(prefix):
+            text = text[len(prefix):]
+        for i, piece in enumerate(chunk(text, max_chars)):
             if len(piece) >= min_chars:
-                chunks.append({"id": f"{source}#{i}", "text": piece})
+                chunks.append({"id": f"{source}#{i}", "text": prefix + piece})
     return chunks
 
 
@@ -123,7 +128,7 @@ def score(base_url, model, piece, timeout):
 def cmd_run(args):
     base = args.url.rstrip("/")
     model = args.model or served_model(base, args.timeout)
-    chunks = load_chunks(args.data, args.max_chars, args.min_chars)
+    chunks = load_chunks(args.data, args.max_chars, args.min_chars, args.prefix)
     if not chunks:
         sys.exit(f"no text found in {args.data}")
     print(f"scoring {len(chunks)} chunks from {args.data} with '{model}' at {base} ...")
@@ -196,7 +201,11 @@ def main():
     r.add_argument("--model", default=None, help="served model name (default: ask the server)")
     r.add_argument("--data", required=True, help="folder of .txt, a .txt, or a .jsonl with 'text'")
     r.add_argument("--out", required=True, help="where to save the scores (.json)")
-    r.add_argument("--max-chars", type=int, default=6000, help="chunk size, about 1.5k tokens")
+    r.add_argument("--max-chars", type=int, default=6000, help="chunk size, about 1.5k tokens. vLLM needs "
+                   "~tokens x vocab x 4 bytes of free GPU memory per request for prompt log-probs "
+                   "(1.5k tokens x 262k vocab = 1.6 GB): keep pieces short, --parallel low")
+    r.add_argument("--prefix", default="", help='text put before every piece, e.g. "<bos>" for Gemma '
+                   "(its tokenizer adds none; without it the loss is far too high)")
     r.add_argument("--min-chars", type=int, default=200, help="skip shorter pieces")
     r.add_argument("--parallel", type=int, default=8, help="requests in flight at once")
     r.add_argument("--timeout", type=float, default=600)
