@@ -20,8 +20,10 @@ import torch
 
 try:
     import gguf
-except ImportError:
-    sys.exit("needs the gguf package: pip install gguf, or PYTHONPATH=/path/to/llama.cpp/gguf-py")
+except ImportError as e:
+    sys.exit(f"could not import the gguf package ({type(e).__name__}: {e}) with {sys.executable}. "
+             "Install it for this Python (pip install gguf) or use llama.cpp's copy: "
+             "PYTHONPATH=/path/to/llama.cpp/gguf-py")
 
 from micro_engram.module import MicroEngram, check_loaded, engram_from_spec
 from micro_engram.weights import engram_specs, load_engram_weights
