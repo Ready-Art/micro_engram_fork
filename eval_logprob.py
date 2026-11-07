@@ -25,6 +25,7 @@ import math
 import os
 import random
 import sys
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -71,15 +72,31 @@ def load_chunks(path, max_chars, min_chars):
 
 
 # ----------------------------------------------------------------------------- scoring
+AUTH = {}  # {"Authorization": "Bearer <key>"} when the server runs with --api-key
+
+
+def _open(req, timeout):
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            sys.exit("the server wants an API key: pass --api-key (or set VLLM_API_KEY)")
+        raise
+    except urllib.error.URLError as e:
+        url = req.full_url if isinstance(req, urllib.request.Request) else req
+        sys.exit(f"no server answered at {url} ({e.reason}): is vLLM up (\"Application startup complete\"), "
+                 f"on this host and port, and started with --host 0.0.0.0 if you use another machine's address?")
+
+
 def post(url, payload, timeout):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+                                 headers={"Content-Type": "application/json", **AUTH})
+    with _open(req, timeout) as r:
         return json.loads(r.read())
 
 
 def served_model(base_url, timeout):
-    with urllib.request.urlopen(f"{base_url}/v1/models", timeout=timeout) as r:
+    with _open(urllib.request.Request(f"{base_url}/v1/models", headers=AUTH), timeout) as r:
         return json.loads(r.read())["data"][0]["id"]
 
 
@@ -175,6 +192,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="score the texts with the currently served model")
     r.add_argument("--url", default="http://localhost:8000")
+    r.add_argument("--api-key", default=os.environ.get("VLLM_API_KEY"), help="if vLLM runs with --api-key")
     r.add_argument("--model", default=None, help="served model name (default: ask the server)")
     r.add_argument("--data", required=True, help="folder of .txt, a .txt, or a .jsonl with 'text'")
     r.add_argument("--out", required=True, help="where to save the scores (.json)")
@@ -186,6 +204,8 @@ def main():
     c.add_argument("a", help="first run, e.g. engram.json")
     c.add_argument("b", help="second run, e.g. base.json")
     args = ap.parse_args()
+    if getattr(args, "api_key", None):
+        AUTH["Authorization"] = f"Bearer {args.api_key}"
     cmd_run(args) if args.cmd == "run" else cmd_compare(args)
 
 
