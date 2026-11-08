@@ -164,12 +164,13 @@ class RowTables:
     """
 
     def __init__(self, entries, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, lazy=False,
-                 rowwise=False):
+                 rowwise=False, stochastic_rounding=True):
         self.entries = entries
         self.world = dist_rank_world()[1]
         train = [p for _, e in entries for p in e.row_shards if p.requires_grad]
         self.optimizer = LazyAdamW([{"params": train, "lazy": lazy, "rowwise": rowwise}], lr=lr, betas=betas,
-                                   eps=eps, weight_decay=weight_decay) if train else None
+                                   eps=eps, weight_decay=weight_decay,
+                                   stochastic_rounding=stochastic_rounding) if train else None
         self.last_grad_norm = None
         self.converted = 0  # tables whose second moment was converted on load (other optimizer)
 

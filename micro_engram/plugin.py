@@ -251,7 +251,7 @@ class _MemorySnapshotCallback(TrainerCallback):
             torch.cuda.memory._record_memory_history(enabled=None)
 
 
-def _install_lazy_adam(trainer):
+def _install_lazy_adam(trainer, stochastic_rounding=True):
     """Make the trainer build LazyAdamW when it creates its optimizer.
 
     It must stay lazy: with FSDP the Trainer creates the optimizer only after sharding,
@@ -274,7 +274,8 @@ def _install_lazy_adam(trainer):
             groups = [g for g in ({"params": lazy, "lazy": True}, {"params": dense, "lazy": False}) if g["params"]]
             a = self.args
             self.optimizer = LazyAdamW(groups, lr=a.learning_rate, betas=(a.adam_beta1, a.adam_beta2),
-                                       eps=a.adam_epsilon, weight_decay=a.weight_decay)
+                                       eps=a.adam_epsilon, weight_decay=a.weight_decay,
+                                       stochastic_rounding=stochastic_rounding)
             tables = (f"{sum(p.numel() for p in lazy) / 1e6:.1f}M table params with lazy row updates" if lazy
                       else "row-sharded tables have their own optimizer")
             LOG.warning(f"[micro_engram] optimizer: LazyAdamW ({tables}, {sum(p.numel() for p in dense) / 1e6:.1f}M "
@@ -309,7 +310,7 @@ class _RowShardCallback(TrainerCallback):
             self.on_final(args.output_dir)
 
 
-def _install_row_sharding(trainer, slots, lazy, on_final, rowwise=False):
+def _install_row_sharding(trainer, slots, lazy, on_final, rowwise=False, stochastic_rounding=True):
     """Table optimizer + checkpoint save/resume for row-sharded tables. Returns the callback.
 
     Checkpoints: Trainer._save_checkpoint calls save_model on every rank before it writes
@@ -325,7 +326,8 @@ def _install_row_sharding(trainer, slots, lazy, on_final, rowwise=False):
     a = trainer.args
     rows = RowTables([(f"{s.where}.micro_engram.", s.engram) for s in slots],
                      lr=a.learning_rate, betas=(a.adam_beta1, a.adam_beta2), eps=a.adam_epsilon,
-                     weight_decay=a.weight_decay, lazy=lazy, rowwise=rowwise)
+                     weight_decay=a.weight_decay, lazy=lazy, rowwise=rowwise,
+                     stochastic_rounding=stochastic_rounding)
     orig_save, orig_load = trainer.save_model, trainer._load_optimizer_and_scheduler
 
     def save_model(self, output_dir=None, _internal_call=False):
@@ -357,6 +359,8 @@ def _install_row_sharding(trainer, slots, lazy, on_final, rowwise=False):
     n = sum(p.numel() for p in rows.params())
     kind = "partial row-wise Adam (one fp32 second moment per row)" if rowwise else (
         "lazy AdamW" if lazy else "AdamW")
+    if stochastic_rounding and any(p.dtype == torch.bfloat16 for p in rows.params()):
+        kind += ", bf16 rows written with stochastic rounding"
     LOG.warning(f"[micro_engram] row-sharded tables: {n / 1e6:.1f}M rows' params on this GPU, own optimizer "
                 f"({kind}) and clipping (logged as engram/table_grad_norm)")
     return trainer._micro_engram_rows
@@ -825,7 +829,8 @@ class MicroEngramPlugin(BasePlugin):
 
         opt = cfg.micro_engram_optimizer
         self.rows_cb = _install_row_sharding(trainer, self.slots, opt in ("lazy_adam", "rowwise_adam"), on_final,
-                                             rowwise=opt == "rowwise_adam")
+                                             rowwise=opt == "rowwise_adam",
+                                             stochastic_rounding=cfg.micro_engram_stochastic_rounding is not False)
         return self.rows_cb
 
     def post_trainer_create(self, cfg, trainer):
@@ -833,7 +838,7 @@ class MicroEngramPlugin(BasePlugin):
         # matches every engram: freeze the frozen ones again before the optimizer is built.
         _freeze_frozen(self.slots)
         if cfg.micro_engram_optimizer == "lazy_adam":
-            _install_lazy_adam(trainer)
+            _install_lazy_adam(trainer, cfg.micro_engram_stochastic_rounding is not False)
         cb = self._row_sharding(cfg, trainer)  # normally already done in add_callbacks_post_trainer
         if cb is not None:
             trainer.add_callback(cb)
@@ -841,7 +846,7 @@ class MicroEngramPlugin(BasePlugin):
     def add_callbacks_post_trainer(self, cfg, trainer):
         _freeze_frozen(self.slots)  # in case post_trainer_create is not called by this Axolotl
         if cfg.micro_engram_optimizer == "lazy_adam":
-            _install_lazy_adam(trainer)
+            _install_lazy_adam(trainer, cfg.micro_engram_stochastic_rounding is not False)
         rows_cb = self._row_sharding(cfg, trainer)
         # FSDP checkpoints hold the engram in their DCP folder (Accelerate's name for model 0);
         # with row sharding the complete engram is in micro_engram_rows/

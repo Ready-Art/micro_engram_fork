@@ -92,18 +92,52 @@ check("rowwise: differs from AdamW for uneven gradients (it is an approximation)
 
 # the bf16 second-moment freeze: constant gradient 1, so the true bias-corrected v is exactly 1
 pb = nn.Parameter(init.clone().bfloat16())
+ps = nn.Parameter(init.clone().bfloat16())
 pr = nn.Parameter(init.clone().bfloat16())
-ob, orw = LazyAdamW([pb], lr=0.0), LazyAdamW([pr], lr=0.0, rowwise=True)
+ob = LazyAdamW([pb], lr=0.0, stochastic_rounding=False)
+osr = LazyAdamW([ps], lr=0.0)  # stochastic rounding (the default)
+orw = LazyAdamW([pr], lr=0.0, rowwise=True)
 for _ in range(1500):
-    for p_, o_ in ((pb, ob), (pr, orw)):
+    for p_, o_ in ((pb, ob), (ps, osr), (pr, orw)):
         p_.grad = torch.ones_like(p_)
         o_.step()
 bc2 = 1 - 0.999 ** 1500
 v_bf = float(ob.state[pb]["exp_avg_sq"].float().mean()) / bc2
+v_sr = float(osr.state[ps]["exp_avg_sq"].float().mean()) / bc2
 v_rw = float(orw.state[pr]["exp_avg_sq"].mean()) / bc2
-check(f"bf16 weights: a per-value bf16 second moment freezes (v_hat {v_bf:.2f} instead of 1, steps "
-      f"{v_bf ** -0.5:.1f}x too large); the fp32 row-wise one doesn't ({v_rw:.4f})",
-      v_bf < 0.5 and abs(v_rw - 1) < 1e-4)
+check(f"bf16 weights: a per-value bf16 second moment freezes with plain rounding (v_hat {v_bf:.2f} instead of 1, "
+      f"steps {v_bf ** -0.5:.1f}x too large); stochastic rounding ({v_sr:.3f}) and the fp32 row-wise one "
+      f"({v_rw:.4f}) don't",
+      v_bf < 0.5 and abs(v_sr - 1) < 0.02 and abs(v_rw - 1) < 1e-4)
+
+# stochastic rounding: small updates add up in bf16 (late epochs at a low LR)
+from micro_engram.optim import stochastic_bf16  # noqa: E402
+
+x = torch.full((100_000,), 1.00149)
+check(f"stochastic_bf16 is unbiased (mean {float(stochastic_bf16(x).float().mean()):.5f} for 1.00149; plain "
+      f"rounding gives {float(x[:1].bfloat16()):.5f}), for negative values too, inf kept",
+      abs(float(stochastic_bf16(x).float().mean()) - 1.00149) < 2e-5
+      and abs(float(stochastic_bf16(-x).float().mean()) + 1.00149) < 2e-5
+      and torch.isinf(stochastic_bf16(torch.tensor([float("inf")]))).all())
+for lr in (2.5e-5, 6.25e-5):  # bf16 spacing at 0.03 is ~1.2e-4: steps below / just above half of it
+    moved = {}
+    for name, dtype, sr in (("fp32", torch.float32, True), ("bf16 plain", torch.bfloat16, False),
+                            ("bf16 stochastic", torch.bfloat16, True)):
+        torch.manual_seed(5)
+        w = nn.Parameter(torch.full((2000, 8), 0.03, dtype=dtype))
+        opt = LazyAdamW([{"params": [w], "lazy": True, "rowwise": True}], lr=lr, stochastic_rounding=sr)
+        for _ in range(300):
+            w.grad = torch.ones_like(w)
+            opt.step()
+        moved[name] = float((0.03 - w.float()).mean())
+    off = moved["bf16 plain"] / moved["fp32"] - 1
+    check(f"bf16 at LR {lr:g}: plain rounding moves the weights {off:+.0%} vs fp32 (updates "
+          f"{'lost' if off < 0 else 'rounded up to a full step'}); stochastic rounding tracks fp32 "
+          f"({moved['bf16 stochastic']:.3e} vs {moved['fp32']:.3e})",
+          abs(off) > 0.2 and abs(moved["bf16 stochastic"] / moved["fp32"] - 1) < 0.03)
+c32, _ = run(LazyAdamW, sparse_grads, init, lazy=True, rowwise=True)
+c32n, _ = run(LazyAdamW, sparse_grads, init, lazy=True, rowwise=True, stochastic_rounding=False)
+check("fp32: stochastic rounding changes nothing (bit-identical)", torch.equal(c32, c32n))
 
 # 5. under FSDP2 (single process, gloo): sharded params, optimizer state save/load
 try:

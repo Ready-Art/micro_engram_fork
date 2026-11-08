@@ -30,10 +30,27 @@ def _local(t):
     return to_local() if to_local is not None else t
 
 
+def stochastic_bf16(x):
+    """fp32 -> bf16 with stochastic rounding: rounds up with probability equal to the part
+    that doesn't fit, so on average nothing is lost. Plain rounding drops every update
+    smaller than half a bf16 step (~0.4% of the value), which stalls training at low LR.
+    Works on the bits: add random noise below bf16's 16 kept bits, then cut them off. The
+    sign is a separate bit, so this rounds the magnitude, unbiased for both signs."""
+    x = x.float().contiguous()
+    noise = torch.randint(0, 1 << 16, x.shape, dtype=torch.int32, device=x.device)
+    bits = (x.view(torch.int32) + noise) & -65536  # 0xFFFF0000: keep sign, exponent, 7 mantissa bits
+    out = bits.view(torch.float32)
+    out = torch.where(torch.isfinite(x), out, x)  # inf/nan stay as they are
+    return out.to(torch.bfloat16)  # exact: the dropped bits are already zero
+
+
 class LazyAdamW(torch.optim.Optimizer):
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, lazy=False, rowwise=False):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, lazy=False, rowwise=False,
+                 stochastic_rounding=True):
+        """stochastic_rounding: bf16 weights and states are written back with stochastic_bf16
+        (fp32 ones are unaffected), so small updates add up instead of rounding away."""
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, lazy=lazy,
-                                      rowwise=rowwise))
+                                      rowwise=rowwise, stochastic_rounding=stochastic_rounding))
 
     @staticmethod
     def init_state(state, p, group):
@@ -87,12 +104,17 @@ class LazyAdamW(torch.optim.Optimizer):
                     denom = (v.sqrt() / bc2 ** 0.5).add_(eps)
                 p_.addcdiv_(m, denom, value=-lr / bc1)
 
+                sr = group.get("stochastic_rounding", True)
+
+                def cast(x, dtype):
+                    return stochastic_bf16(x) if sr and dtype == torch.bfloat16 else x.to(dtype)
+
                 if rows is None:
-                    P.copy_(p_)
-                    M.copy_(m)
-                    V.copy_(v)
+                    P.copy_(cast(p_, P.dtype))
+                    M.copy_(cast(m, M.dtype))
+                    V.copy_(cast(v, V.dtype))
                 else:
-                    P.index_copy_(0, rows, p_.to(P.dtype))
-                    M.index_copy_(0, rows, m.to(M.dtype))
-                    V.index_copy_(0, rows, v.to(V.dtype))
+                    P.index_copy_(0, rows, cast(p_, P.dtype))
+                    M.index_copy_(0, rows, cast(m, M.dtype))
+                    V.index_copy_(0, rows, cast(v, V.dtype))
         return loss

@@ -62,3 +62,7 @@ class MicroEngramArgs(BaseModel):
     # full-size gradients. Needs FSDP. Tables get their own optimizer (AdamW, or lazy with
     # micro_engram_optimizer: lazy_adam) and their own clipping; checkpoints add micro_engram_rows/.
     micro_engram_sharding: Optional[Literal["rows"]] = None
+    # bf16 engram weights/optimizer states (micro_engram_optimizer lazy_adam / rowwise_adam, and the
+    # row-sharded tables): written back with stochastic rounding, so updates smaller than half a
+    # bf16 step add up on average instead of rounding away. No effect in fp32.
+    micro_engram_stochastic_rounding: bool = True
