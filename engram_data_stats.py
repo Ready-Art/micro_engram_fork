@@ -120,7 +120,9 @@ def main():
         print()
 
     print("Notes: counts come from the sample, so a bigger sample means more distinct n-grams.\n"
-          "Roughly, 1 per row or less is comfortable; 5+ per row means heavy sharing.")
+          "Rule of thumb (ours, not from the Engram paper): 1 per row or less is comfortable, 5+ is heavy\n"
+          "sharing. The paper gives no load factor; in its sweep the loss kept improving log-linearly\n"
+          "with more slots (2.6e5 to 1e7), so fewer n-grams per row is better, with diminishing returns.")
 
 
 if __name__ == "__main__":
