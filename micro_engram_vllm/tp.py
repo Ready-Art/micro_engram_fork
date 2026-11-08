@@ -18,9 +18,9 @@ def tp_lookup(all_reduce):
     """A MicroEngram.row_lookup_fn: masked local lookup, then `all_reduce` (sum over TP)."""
 
     def lookup(engram, idx):
-        _rank, world, start, _per = engram.row_info
+        _rank, world, starts, _pers = engram.row_info
         parts = []
-        for shard, i in zip(engram.row_shards, idx):
+        for shard, i, start in zip(engram.row_shards, idx, starts):  # tables can differ in size
             n = shard.shape[0]
             local = i.long() - start
             if n == 0:  # more ranks than rows: this rank owns none
@@ -43,13 +43,14 @@ def load_rows(engram, sd, where, complete=True):
     the module's hook). complete=False: `sd` may be part of the engram (weights streamed
     from a checkpoint), nothing is reported missing. Returns the table indices loaded."""
     sd = dict(sd)
-    _rank, _world, start, _per = engram.row_info
+    _rank, _world, starts, _pers = engram.row_info
     loaded = set()
     for k, shard in enumerate(engram.row_shards):
         t = sd.pop(f"tables.{k}.weight", None)
         if t is None:
             continue
-        want = (engram.table_size, engram.engram_dim)
+        start = starts[k]
+        want = (engram.table_rows[k], engram.engram_dim)
         if tuple(t.shape) != want:
             raise ValueError(f"[micro_engram] {where}: tables.{k}.weight is {tuple(t.shape)}, this engram "
                              f"needs {want}")

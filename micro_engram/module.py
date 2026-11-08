@@ -5,6 +5,24 @@ import torch.nn.functional as F
 _PRIME = 2_147_483_647  # 2^31 - 1
 
 
+def resolve_order_sizes(table_size, orders=(2, 3), table_sizes=None):
+    """{order: rows per table} for the n-gram orders in use.
+
+    Every order in `orders` gets `table_size`; `table_sizes` overrides per order (keys may be
+    strings, as in JSON) and can add orders (e.g. {4: 1048576}). A size of 0 or None drops
+    that order. Sorted by order, so the table layout is the same whatever the input order.
+    """
+    sizes = {int(n): table_size for n in orders}
+    for n, v in (table_sizes or {}).items():
+        sizes[int(n)] = v
+    out = {n: int(v) for n, v in sorted(sizes.items()) if v}
+    if not out:
+        raise ValueError("micro_engram: every n-gram order has size 0/None: nothing left to hash")
+    if min(out) < 1 or min(out.values()) < 1:
+        raise ValueError(f"micro_engram: bad orders/sizes {out}")
+    return out
+
+
 class MicroEngram(nn.Module):
     """Hashed n-gram memory injected into the residual stream (Engram-style).
 
@@ -33,21 +51,25 @@ class MicroEngram(nn.Module):
 
     def __init__(self, model_dim, table_size=65_536, engram_dim=128,
                  num_heads=4, orders=(2, 3), pad_id=0, seed=0,
-                 vocab_size=262_144, canon=None, gate="scalar", build_tables=True):
+                 vocab_size=262_144, canon=None, gate="scalar", build_tables=True, table_sizes=None):
         super().__init__()
         if gate not in self.GATES:
             raise ValueError(f"gate must be one of {self.GATES}, got {gate!r}")
         self.gate = gate
-        self.orders = tuple(orders)
-        self.table_size = table_size
+        # rows per table can differ by n-gram order (micro_engram_table_sizes)
+        self.order_sizes = resolve_order_sizes(table_size, orders, table_sizes)
+        self.orders = tuple(self.order_sizes)
         self.engram_dim = engram_dim
         self.seed = seed
         self.pad_id = pad_id
         self._table_orders = [n for n in self.orders for _ in range(num_heads)]
+        self.table_rows = [self.order_sizes[n] for n in self._table_orders]  # rows of each table
+        # one size for every table (the usual case), else None: code that assumes one size fails loudly
+        self.table_size = self.table_rows[0] if len(set(self.table_rows)) == 1 else None
         n_tables = len(self._table_orders)
 
         if build_tables:  # False: row-sharded training builds only its own rows (shard_rows)
-            self.tables = nn.ModuleList(nn.Embedding(table_size, engram_dim) for _ in range(n_tables))
+            self.tables = nn.ModuleList(nn.Embedding(rows, engram_dim) for rows in self.table_rows)
             for t in self.tables:
                 nn.init.normal_(t.weight, std=0.02)
 
@@ -88,7 +110,7 @@ class MicroEngram(nn.Module):
     # The local rows live in a plain list, not as registered parameters, so FSDP, .to() and
     # state_dict() never see them (each rank holds different rows).
     row_shards = None  # [Parameter [rows on this rank, dim]] per table, when row-sharded
-    row_info = None    # (rank, world, first row, rows per rank)
+    row_info = None    # (rank, world, [first row per table], [rows per rank per table])
 
     def shard_rows(self, rank, world, device=None, dtype=None, requires_grad=True, empty=False):
         """Keep only this rank's rows of every table: sliced from the tables if they exist
@@ -96,22 +118,21 @@ class MicroEngram(nn.Module):
         left uninitialised with empty=True (a server that loads the real rows next)."""
         from .rows import row_range
 
-        start, count = row_range(self.table_size, rank, world)
-        per = -(-self.table_size // world)
-        n_tables = len(self._table_orders)
+        spans = [row_range(rows, rank, world) for rows in self.table_rows]  # (first row, count) per table
+        pers = [-(-rows // world) for rows in self.table_rows]
         if "tables" in self._modules:
-            src = [t.weight.detach()[start:start + count] for t in self.tables]
+            src = [t.weight.detach()[a:a + c] for t, (a, c) in zip(self.tables, spans)]
             dtype = dtype or src[0].dtype
             del self.tables
         elif empty:
-            src = [torch.empty(count, self.engram_dim, device=device, dtype=dtype) for _ in range(n_tables)]
+            src = [torch.empty(c, self.engram_dim, device=device, dtype=dtype) for _, c in spans]
         else:
             g = torch.Generator().manual_seed(self.seed * 1_000_003 + rank)  # differs per rank
-            src = [torch.randn(count, self.engram_dim, generator=g) * 0.02 for _ in range(n_tables)]
+            src = [torch.randn(c, self.engram_dim, generator=g) * 0.02 for _, c in spans]
         shards = [nn.Parameter(t if empty else t.to(device=device, dtype=dtype).clone(), requires_grad=requires_grad)
                   for t in src]
         self.__dict__["row_shards"] = shards
-        self.__dict__["row_info"] = (rank, world, start, per)
+        self.__dict__["row_info"] = (rank, world, [a for a, _ in spans], pers)
         return shards
 
     def all_parameters(self):
@@ -178,7 +199,7 @@ class MicroEngram(nn.Module):
             x = shifted[0] * mults[k, 0]
             for i in range(1, n):
                 x = x + shifted[i] * mults[k, i]  # < 2^51, safe in int64
-            out.append((x % _PRIME) % self.table_size)
+            out.append((x % _PRIME) % self.table_rows[k])
         return out
 
     def hash_prev(self, ids):
@@ -199,7 +220,7 @@ class MicroEngram(nn.Module):
             x = merged[:, 0] * mults[k, 0]
             for i in range(1, n):
                 x = x + merged[:, i] * mults[k, i]
-            out.append((x % _PRIME) % self.table_size)
+            out.append((x % _PRIME) % self.table_rows[k])
         return out
 
     def inject(self, hidden, idx, keep=None):
@@ -279,6 +300,7 @@ def engram_from_spec(spec, model_dim, vocab_size, pad_default=0, canon=None, bui
     return MicroEngram(
         model_dim=model_dim,
         table_size=spec["table_size"],
+        table_sizes=spec.get("table_sizes"),
         engram_dim=spec["engram_dim"],
         num_heads=spec["num_heads"],
         orders=tuple(spec.get("orders") or (2, 3)),

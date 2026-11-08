@@ -9,9 +9,9 @@ from transformers import TrainerCallback
 
 from axolotl.integrations.base import BasePlugin
 
-from .module import MicroEngram, attach_engram, check_loaded, engram_from_spec
+from .module import MicroEngram, attach_engram, check_loaded, engram_from_spec, resolve_order_sizes
 from .stats import module_stats
-from .weights import (base_fingerprint, default_seed, load_engram_weights,
+from .weights import (base_fingerprint, default_seed, load_engram_weights, norm_table_sizes,
                       resolve_engram_source)
 
 LOG = logging.getLogger(__package__)  # keeps the old "[micro_engram...]" logger name
@@ -153,9 +153,14 @@ class _ReportTrainableCallback(TrainerCallback):
         for slot in self.slots:
             info = slot.engram.row_info
             if info is not None:
+                eng, seen, parts = slot.engram, set(), []
+                for k, n in enumerate(eng._table_orders):
+                    if n not in seen:
+                        seen.add(n)
+                        a = info[2][k]
+                        parts.append(f"{n}-grams {a:,}..{a + eng.row_shards[k].shape[0] - 1:,} of {eng.table_rows[k]:,}")
                 LOG.warning(f"[micro_engram] layer {slot.layer}: tables row-sharded, this GPU holds rows "
-                            f"{info[2]:,}..{info[2] + slot.engram.row_shards[0].shape[0] - 1:,} of "
-                            f"{slot.engram.table_size:,} (counts above are this GPU's share)")
+                            f"{'; '.join(parts)} (counts above are this GPU's share)")
             t = sum(p.numel() for p in _params(slot.engram) if p.requires_grad)
             if slot.frozen and t:
                 LOG.error(f"[micro_engram] engram at layer {slot.layer} should be frozen but is training")
@@ -603,6 +608,7 @@ def _engram_requests(cfg):
     main = {
         "layer": cfg.micro_engram_layer,
         "table_size": cfg.micro_engram_table_size,
+        "table_sizes": norm_table_sizes(cfg.micro_engram_table_sizes),
         "engram_dim": cfg.micro_engram_dim,
         "num_heads": cfg.micro_engram_heads,
         "gate": cfg.micro_engram_gate,
@@ -622,6 +628,9 @@ def _engram_requests(cfg):
         spec = {
             "layer": int(e["layer"]),
             "table_size": e.get("table_size") or main["table_size"],
+            # own per-order sizes; with only its own table_size, one size for all; else the main's
+            "table_sizes": norm_table_sizes(e.get("table_sizes")) if e.get("table_sizes")
+            else (None if e.get("table_size") else main["table_sizes"]),
             "engram_dim": e.get("dim") or main["engram_dim"],
             "num_heads": e.get("heads") or main["num_heads"],
             "gate": e.get("gate") or main["gate"],
@@ -640,7 +649,7 @@ def _engram_requests(cfg):
     return reqs
 
 
-_ARCH_KEYS = ("table_size", "engram_dim", "num_heads", "orders", "gate", "seed")
+_ARCH_KEYS = ("table_size", "table_sizes", "engram_dim", "num_heads", "orders", "gate", "seed")
 
 
 class MicroEngramPlugin(BasePlugin):
@@ -670,6 +679,8 @@ class MicroEngramPlugin(BasePlugin):
             if src_spec is not None:
                 # rebuild it exactly as trained (sizes, gate, seed); the YAML can't change those
                 def norm(v):
+                    if isinstance(v, dict):
+                        return norm_table_sizes(v)
                     return tuple(v) if isinstance(v, (list, tuple)) else v
 
                 changed = {k: (spec[k], src_spec[k]) for k in _ARCH_KEYS
@@ -680,12 +691,24 @@ class MicroEngramPlugin(BasePlugin):
                                 f"settings, not the YAML's: " + ", ".join(
                                     f"{k} {a} -> {b}" for k, (a, b) in changed.items()))
                 spec.update({k: src_spec[k] for k in _ARCH_KEYS if src_spec.get(k) is not None})
+                # its own per-order sizes, also "none" (one size for every table, older runs)
+                spec["table_sizes"] = norm_table_sizes(src_spec.get("table_sizes"))
             sd = load_engram_weights(source, layer=spec["layer"])
             if not any(k.startswith("tables.") for k in sd):
                 raise ValueError(f"[micro_engram] no engram weights for layer {spec['layer']} in {source}")
             t0 = sd["tables.0.weight"]
             if src_spec is None:  # bare weights: sizes from the tensors, the rest from the YAML
                 spec["table_size"], spec["engram_dim"] = int(t0.shape[0]), int(t0.shape[1])
+                rows = [int(sd[f"tables.{k}.weight"].shape[0])
+                        for k in range(sum(1 for x in sd if x.startswith("tables.")))]
+                orders = list(resolve_order_sizes(spec["table_size"], spec.get("orders") or (2, 3),
+                                                  spec.get("table_sizes")))
+                heads = spec["num_heads"]
+                if len(rows) != heads * len(orders):
+                    raise ValueError(f"[micro_engram] {source}: {len(rows)} tables, but {heads} heads x orders "
+                                     f"{orders} need {heads * len(orders)}: set the sizes to match these weights")
+                spec["orders"] = orders
+                spec["table_sizes"] = {n: rows[i * heads] for i, n in enumerate(orders)}
                 spec["gate"] = "ple" if "up.weight" in sd else (
                     "scalar_sqrt" if "q_scale" in sd else "scalar")
 
@@ -704,6 +727,10 @@ class MicroEngramPlugin(BasePlugin):
         has_canon = not torch.equal(engram.canon, torch.arange(engram.canon.numel()))
         spec.update({
             "orders": list(engram.orders),
+            # rows per order as built; table_size is None when they differ, so a loader that only
+            # knows one size fails instead of building the wrong tables
+            "table_sizes": dict(engram.order_sizes),
+            "table_size": engram.table_size,
             "pad_id": engram.pad_id,
             "token_merge": has_canon,
             "frozen": frozen,

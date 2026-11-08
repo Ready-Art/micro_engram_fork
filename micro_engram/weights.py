@@ -156,8 +156,15 @@ def resolve_weights_path(conf, conf_path):
 # ----------------------------------------------------------------------------- engram specs
 SEED_STRIDE = 10007  # default seed = SEED_STRIDE * layer (DeepSeek's scheme); layer 0 -> 0
 
-_SPEC_KEYS = ("layer", "table_size", "engram_dim", "num_heads", "orders", "gate", "seed",
+_SPEC_KEYS = ("layer", "table_size", "table_sizes", "engram_dim", "num_heads", "orders", "gate", "seed",
               "pad_id", "token_merge", "canon_path", "frozen", "init_from")
+
+
+def norm_table_sizes(sizes):
+    """{order: rows or None} with int keys (JSON and YAML give strings or ints), or None."""
+    if not sizes:
+        return None
+    return {int(k): (int(v) if v else None) for k, v in dict(sizes).items()}
 
 
 def default_seed(layer):
@@ -181,6 +188,7 @@ def engram_specs(conf, conf_path=None):
         spec = {**top, **{k: v for k, v in e.items() if v is not None or k == "weights"}}
         spec["layer"] = int(spec.get("layer") or 0)
         spec["orders"] = tuple(spec.get("orders") or (2, 3))
+        spec["table_sizes"] = norm_table_sizes(spec.get("table_sizes"))  # per n-gram order, if they differ
         spec["gate"] = spec.get("gate") or "scalar"  # runs from before the gate option
         spec["seed"] = 0 if spec.get("seed") is None else int(spec["seed"])
         w = e.get("weights")

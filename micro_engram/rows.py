@@ -62,15 +62,25 @@ def _a2a(x, out_rows, in_rows, group):
     return out
 
 
+def _split_ids(g, offs):
+    """Global ids (offset of the table + row) -> (table, row); offs = [0, end of table 0, ...]."""
+    t = torch.searchsorted(offs, g, right=True) - 1
+    return t, g - offs[t]
+
+
 class _RowLookup(torch.autograd.Function):
-    """flat global ids (table * n_rows + row) -> their rows [M, dim], from the owners' shards."""
+    """flat global ids (offset of the table + row) -> their rows [M, dim], from the owners' shards.
+    Tables can have different sizes (per n-gram order), so each has its own offset and split."""
 
     @staticmethod
     def forward(ctx, flat, info, *shards):
-        n_rows, per, rank, world = info
+        offsets, pers, rank, world = info
         group = _group(world)
+        offs = torch.tensor(offsets, dtype=torch.long, device=flat.device)
+        per = torch.tensor(pers, dtype=torch.long, device=flat.device)
         uniq, inv = torch.unique(flat, return_inverse=True)  # each row is sent once
-        owner = (uniq % n_rows) // per
+        t_u, r_u = _split_ids(uniq, offs)
+        owner = r_u // per[t_u]
         order = torch.argsort(owner, stable=True)
         send_ids = uniq[order]
         send_counts = torch.bincount(owner, minlength=world)
@@ -81,8 +91,8 @@ class _RowLookup(torch.autograd.Function):
             recv_counts = send_counts
         sc, rc = send_counts.tolist(), recv_counts.tolist()
         req = _a2a(send_ids, rc, sc, group)  # rows the others want from me
-        table = req // n_rows
-        local = req % n_rows - rank * per
+        table, row = _split_ids(req, offs)
+        local = row - rank * per[table]
         rows = shards[0].new_empty(req.numel(), shards[0].shape[1])
         for k, shard in enumerate(shards):
             sel = (table == k).nonzero().squeeze(1)
@@ -120,10 +130,13 @@ class _RowLookup(torch.autograd.Function):
 def row_lookup(engram, idx):
     """Per-table rows [*idx shape, dim] for the hashed ids `idx` (list, one per table)."""
     shards = engram.row_shards
-    n_rows, (rank, world, _start, per) = engram.table_size, engram.row_info
+    rank, world, _starts, pers = engram.row_info
+    offsets = [0]
+    for rows in engram.table_rows:
+        offsets.append(offsets[-1] + rows)
     dev = shards[0].device
-    flat = torch.cat([i.reshape(-1).to(dev) + k * n_rows for k, i in enumerate(idx)])
-    out = _RowLookup.apply(flat, (n_rows, per, rank, world), *shards)
+    flat = torch.cat([i.reshape(-1).to(dev) + offsets[k] for k, i in enumerate(idx)])
+    out = _RowLookup.apply(flat, (offsets, pers, rank, world), *shards)
     m = idx[0].numel()
     return [out[k * m:(k + 1) * m].reshape(*idx[0].shape, -1) for k in range(len(shards))]
 
@@ -198,7 +211,7 @@ class RowTables:
             if not frozen_too and not any(p.requires_grad for p in e.row_shards):
                 continue
             for k, p in enumerate(e.row_shards):
-                yield f"{prefix}tables.{k}.weight", e, p
+                yield f"{prefix}tables.{k}.weight", e.table_rows[k], p
 
     def save(self, folder, optim_folder=None):
         """The complete engram (tables + key/value/scales/buffers, the usual names) to `folder`;
@@ -211,17 +224,17 @@ class RowTables:
             if not any(p.requires_grad for p in e.row_shards):
                 continue
             sd.update({prefix + k: v for k, v in e.state_dict().items()})
-        for key, e, p in self._table_items():
-            sd[key] = _dtensor(p.detach(), e.table_size, self.world)
+        for key, rows, p in self._table_items():
+            sd[key] = _dtensor(p.detach(), rows, self.world)
         if sd:
             dcp.save(sd, checkpoint_id=folder)
         if optim_folder and self.optimizer is not None:
             osd = {}
-            for key, e, p in self._table_items():
+            for key, rows, p in self._table_items():
                 st = self.optimizer.state.get(p)
                 if st:
-                    osd[f"{key}.exp_avg"] = _dtensor(st["exp_avg"], e.table_size, self.world)
-                    osd[f"{key}.exp_avg_sq"] = _dtensor(st["exp_avg_sq"], e.table_size, self.world)
+                    osd[f"{key}.exp_avg"] = _dtensor(st["exp_avg"], rows, self.world)
+                    osd[f"{key}.exp_avg_sq"] = _dtensor(st["exp_avg_sq"], rows, self.world)
                     osd[f"{key}.step"] = st["step"].detach().clone().reshape(())
             if osd:
                 dcp.save(osd, checkpoint_id=optim_folder)
@@ -244,28 +257,33 @@ class RowTables:
                 found = by_name.get((layer, f"tables.{k}.weight")) or by_name.get((None, f"tables.{k}.weight"))
                 if found is None:
                     raise ValueError(f"[micro_engram] {folder} has no tables.{k}.weight for {prefix.rstrip('.')}")
-                want[found] = (e, p)
-        templ = {k: _dtensor(p.data, e.table_size, self.world) for k, (e, p) in want.items()}
+                saved_rows = meta[found].size[0]
+                if saved_rows != e.table_rows[k]:
+                    raise ValueError(f"[micro_engram] {folder}: tables.{k}.weight has {saved_rows:,} rows, this "
+                                     f"engram's table {k} (order {e._table_orders[k]}) has {e.table_rows[k]:,}: "
+                                     f"different table sizes can't resume (start a new run, or keep the sizes)")
+                want[found] = (e.table_rows[k], p)
+        templ = {k: _dtensor(p.data, rows, self.world) for k, (rows, p) in want.items()}
         dcp.load(templ, checkpoint_id=folder)
         optim_loaded = False
         if optim_folder and self.optimizer is not None and os.path.isdir(optim_folder):
             ometa = dcp.FileSystemReader(optim_folder).read_metadata().state_dict_metadata
             otempl, steps, convert = {}, {}, {}
             group = self.optimizer.param_groups[0]
-            for key, e, p in self._table_items():
+            for key, rows, p in self._table_items():
                 if f"{key}.exp_avg" not in ometa:
                     continue
                 st = self.optimizer.state[p]
                 if not st:
                     LazyAdamW.init_state(st, p, group)
-                otempl[f"{key}.exp_avg"] = _dtensor(st["exp_avg"], e.table_size, self.world)
+                otempl[f"{key}.exp_avg"] = _dtensor(st["exp_avg"], rows, self.world)
                 saved = len(ometa[f"{key}.exp_avg_sq"].size)
                 sq = st["exp_avg_sq"]
                 if saved != sq.dim():  # saved by the other optimizer (lazy_adam <-> rowwise_adam)
                     sq = torch.zeros(p.shape if saved == p.dim() else p.shape[:1], dtype=torch.float32,
                                      device=p.device)
                     convert[p] = sq
-                otempl[f"{key}.exp_avg_sq"] = _dtensor(sq, e.table_size, self.world)
+                otempl[f"{key}.exp_avg_sq"] = _dtensor(sq, rows, self.world)
                 otempl[f"{key}.step"] = steps[p] = torch.zeros((), dtype=torch.float32)
             if otempl:
                 dcp.load(otempl, checkpoint_id=optim_folder)

@@ -32,10 +32,13 @@ struct llama_micro_engram {
         gate_type gate       = GATE_SCALAR;
         int64_t   pad_id     = 0;
 
-        std::vector<uint32_t> orders; // [n_tables] n-gram order of each table
-        std::vector<uint64_t> mults;  // [n_tables*max_order]
+        std::vector<uint32_t> orders;     // [n_tables] n-gram order of each table
+        std::vector<uint64_t> mults;      // [n_tables*max_order]
+        std::vector<uint32_t> table_rows; // [n_tables] rows of each table (can differ by order)
+        std::vector<uint64_t> table_offs; // [n_tables] first row of each table in `tables`
+        uint64_t              total_rows = 0;
 
-        ggml_tensor * tables  = nullptr; // [dim, n_tables*table_size]
+        ggml_tensor * tables  = nullptr; // [dim, total_rows], the tables one after another
         ggml_tensor * key     = nullptr; // [n_tables*dim, n_embd]
         ggml_tensor * value   = nullptr; // [n_tables*dim, n_embd]
         ggml_tensor * q_scale = nullptr; // [n_embd]
@@ -61,7 +64,7 @@ struct llama_micro_engram {
     using create_fn = std::function<ggml_tensor * (bool is_vec, const char * suffix, int il, std::initializer_list<int64_t> ne)>;
     void create_tensors(const create_fn & create, int64_t n_embd);
 
-    // rows to gather for every token: out[i*n_tables + t] = t*table_size + row
+    // rows to gather for every token: out[i*n_tables + t] = table_offs[t] + row
     void hash(const engram & e, const llama_ubatch & ubatch, const std::vector<llama_token> & prev, std::vector<int32_t> & out) const;
 };
 

@@ -66,8 +66,8 @@ def load_engrams(conf_path, n_embd):
             canon = torch.load(spec["canon_path"], map_location="cpu")
         eng = engram_from_spec(spec, n_embd, vocab, conf.get("pad_id") or 0, canon)
         check_loaded(eng, sd, src)
-        print(f"layer {spec['layer']}: {spec['gate']} gate, {len(eng.tables)} tables x {eng.table_size} rows x "
-              f"{eng.tables[0].embedding_dim}, seed {spec['seed']}, from {src}")
+        print(f"layer {spec['layer']}: {spec['gate']} gate, {len(eng.tables)} tables, rows per order "
+              f"{eng.order_sizes} x {eng.tables[0].embedding_dim}, seed {spec['seed']}, from {src}")
         out.append((spec, eng))
     return out
 
@@ -86,7 +86,7 @@ def engram_tensors(layer, eng: MicroEngram, dtype):
     """{gguf name: (array, raw dtype)}. Names match the patch: blk.N.engram_kv.mengram_* (matrices)
     and blk.N.engram_gate.mengram_* (norm scales, always F32)."""
     kv, vec = f"blk.{layer}.engram_kv.", f"blk.{layer}.engram_gate."
-    tables = torch.cat([t.weight for t in eng.tables], dim=0)  # [n_tables*table_size, dim]
+    tables = torch.cat([t.weight for t in eng.tables], dim=0)  # [all tables' rows, dim], one after another
     out = {kv + "mengram_tables": as_dtype(tables, dtype)}
     if eng.gate == "ple":
         out[kv + "mengram_down"] = as_dtype(eng.down.weight, dtype)
@@ -140,18 +140,21 @@ def main():
             sys.exit(f"engram layer {spec['layer']} but the model has {n_layer} layers")
 
     max_order = max(max(eng.orders) for _, eng in engrams)
-    orders, mults = [], []
+    orders, mults, rows = [], [], []
     for _, eng in engrams:
         m = eng.mults.long()
         for k, n in enumerate(eng._table_orders):
             orders.append(int(n))
+            rows.append(int(eng.table_rows[k]))
             row = [int(v) for v in m[k, :n]] + [0] * (max_order - n)
             mults.extend(row)
 
     T = gguf.GGUFValueType
     meta = {
         "layers": ([s["layer"] for s, _ in engrams], T.UINT32),
-        "table_size": ([e.table_size for _, e in engrams], T.UINT32),
+        # one size per engram for older patched builds; 0 when the sizes differ, which they refuse
+        "table_size": ([e.table_size or 0 for _, e in engrams], T.UINT32),
+        "table_rows": (rows, T.UINT32),  # rows of every table, in table order
         "dim": ([e.tables[0].embedding_dim for _, e in engrams], T.UINT32),
         "n_tables": ([len(e.tables) for _, e in engrams], T.UINT32),
         "gate": ([GATES[e.gate] for _, e in engrams], T.UINT32),

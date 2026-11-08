@@ -484,7 +484,7 @@ _ReportTrainableCallback(p_rows.slots).on_train_begin(None, types.SimpleNamespac
 rep_r = " | ".join(grab.msgs)
 n_rows_params = sum(p.numel() for s_ in p_rows.slots for p in s_.engram.row_shards)
 check("rows: train-start report counts the rows, says which rows this GPU holds, no errors",
-      "holds rows 0..256 of 257" in rep_r and "FROZEN" not in rep_r
+      "holds rows 2-grams 0..256 of 257; 3-grams 0..256 of 257" in rep_r and "FROZEN" not in rep_r
       and f"{(sum(p.numel() for p in rowm.parameters() if p.requires_grad) + n_rows_params) / 1e6:.1f}M trainable" in rep_r)
 mixed = MicroEngram(model_dim=D, table_size=257, engram_dim=8, num_heads=2, vocab_size=V, gate="scalar_sqrt",
                     build_tables=False)
@@ -512,6 +512,75 @@ try:
 except ValueError:
     rw_alone = True
 check("rowwise_adam is refused without micro_engram_sharding: rows", rw_alone)
+
+# per-order table sizes (micro_engram_table_sizes): 4-grams, dropping an order, inheritance
+from micro_engram.module import engram_from_spec  # noqa: E402
+from micro_engram.weights import engram_specs as _specs  # noqa: E402
+
+p_sz = MicroEngramPlugin()
+p_sz.post_model_load(cfg(micro_engram_table_sizes={2: 101, 3: 307, 4: 53},
+                         micro_engram_extra=[{"layer": 2}, {"layer": 3, "table_size": 61}]), Toy())
+e_main, e_inh, e_own = (s_.engram for s_ in p_sz.slots)
+check("table_sizes: orders 2/3/4 with their own rows (4-grams added), table_size None when mixed",
+      e_main.orders == (2, 3, 4) and e_main.table_rows == [101, 101, 307, 307, 53, 53] and e_main.table_size is None
+      and [t.weight.shape[0] for t in e_main.tables] == e_main.table_rows and tuple(e_main.mults.shape) == (6, 4))
+idx_sz = e_main.hash_ids(torch.randint(0, V, (2, 40)))
+check("table_sizes: every table's hashed rows stay inside that table",
+      all(int(i.max()) < r and int(i.min()) >= 0 for i, r in zip(idx_sz, e_main.table_rows)))
+check("extra engram without sizes inherits the main's per-order sizes; with its own table_size, one size",
+      e_inh.table_rows == e_main.table_rows and e_own.orders == (2, 3) and e_own.table_rows == [61] * 4)
+p_drop = MicroEngramPlugin()
+p_drop.post_model_load(cfg(micro_engram_table_sizes={2: 0, 3: 307}), Toy())
+p_null = MicroEngramPlugin()
+p_null.post_model_load(cfg(micro_engram_table_sizes={"2": None, "4": None}), Toy())
+check("an order set to 0 or null is not used (keys may be strings, as from JSON)",
+      p_drop.slots[0].engram.orders == (3,) and p_null.slots[0].engram.orders == (3,)
+      and p_null.slots[0].engram.table_rows == [257, 257])
+conf_sz = build_config(p_sz.base_conf, p_sz.slots, lambda s_: None)
+conf_sz = json.loads(json.dumps(conf_sz))  # through JSON: order keys become strings
+specs_sz = _specs(conf_sz)
+rebuilt = engram_from_spec(specs_sz[0], D, V, 0)
+check("config round trip (JSON): the loaders rebuild the same tables and hashing",
+      rebuilt.table_rows == e_main.table_rows and torch.equal(rebuilt.mults, e_main.mults)
+      and conf_sz["engrams"][0]["table_size"] is None and specs_sz[2]["table_sizes"] == {2: 61, 3: 61})
+grab.msgs.clear()
+p_keep = MicroEngramPlugin()
+p_keep.post_model_load(cfg(micro_engram_init_from=run_a, micro_engram_table_sizes={2: 50, 3: 900}), Toy())
+check("init_from a uniform run keeps the trained sizes over the YAML's table_sizes (and says so)",
+      p_keep.slots[0].engram.table_rows == [257] * 4 and any("table_sizes" in m for m in grab.msgs))
+p_rs = MicroEngramPlugin()
+toy_rs = Toy()
+p_rs.post_model_load(cfg(micro_engram_table_sizes={2: 101, 3: 307, 4: 53}, micro_engram_sharding="rows"), toy_rs)
+e_rs = p_rs.slots[0].engram
+check("row sharding with mixed sizes: one shard per table, each its own size",
+      [p_.shape[0] for p_ in e_rs.row_shards] == [101, 101, 307, 307, 53, 53] and e_rs.row_info[2] == [0] * 6)
+toy_rs(input_ids=torch.randint(5, V, (2, 12))).pow(2).sum().backward()
+check("row sharding with mixed sizes: forward and backward run, every table gets gradients",
+      all(p_.grad is not None for p_ in e_rs.row_shards))
+
+toy_sz = Toy()
+p_sz2 = MicroEngramPlugin()
+p_sz2.post_model_load(cfg(micro_engram_table_sizes={2: 101, 3: 307, 4: 53}, unfrozen_parameters=[".+micro_engram"]),
+                      toy_sz)
+axolotl_unfreeze(toy_sz, ".+micro_engram")
+with torch.no_grad():
+    p_sz2.slots[0].engram.value.weight.normal_(std=0.05)
+ck_sz = fake_checkpoint(toy_sz, p_sz2, os.path.join(TMP, "runSZ"), 4)
+ids4 = torch.randint(5, V, (1, 14))
+toy_sz.eval()
+with torch.no_grad():
+    ref_sz = toy_sz(input_ids=ids4)
+args_sz = types.SimpleNamespace(model=TMP, engram_pt=None, engram_config=os.path.join(ck_sz, "micro_engram_config.json"),
+                                layer=None, table_size=None, dim=None, heads=None, gate=None)
+fresh_sz = Toy().eval()
+runner_sz = attach_planned(plan_engrams(args_sz), fresh_sz)
+with torch.no_grad():
+    runner_sz.reset()
+    full_sz = fresh_sz(input_ids=ids4)
+    runner_sz.reset()
+    parts_sz = [fresh_sz(input_ids=ids4[:, :9])] + [fresh_sz(input_ids=ids4[:, t:t + 1]) for t in range(9, 14)]
+check("4-grams + sizes 101/307/53 saved, reloaded by infer_engram == training forward (full and prefill + decode)",
+      torch.allclose(full_sz, ref_sz, atol=1e-6) and torch.allclose(torch.cat(parts_sz, dim=1), ref_sz, atol=1e-6))
 
 shutil.rmtree(TMP, ignore_errors=True)
 bad = 0

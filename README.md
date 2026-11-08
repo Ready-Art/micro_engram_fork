@@ -49,6 +49,7 @@ plugins:
 |---|---|---|
 | `micro_engram_layer` | `0` | Inject the memory into the output of this decoder layer (0-indexed: `0` = after the first block, the Engram paper's best single placement) |
 | `micro_engram_table_size` | `65536` | Rows per hash table |
+| `micro_engram_table_sizes` | unset | Rows per table **for each n-gram order**, overriding `micro_engram_table_size`, e.g. `{2: 1048576, 3: 3145728}`. An order set to `0` or `null` is not used; an order not listed keeps `micro_engram_table_size` (orders 2 and 3), so `{4: 1048576}` **adds 4-grams**. See [Table sizes per n-gram order](#table-sizes-per-n-gram-order) |
 | `micro_engram_dim` | `128` | Width of each table row |
 | `micro_engram_heads` | `4` | Hash tables per n-gram order (orders 2 and 3 give `2 × heads` tables in total) |
 | `micro_engram_save_steps` | `250` | Non-FSDP only: also save `micro_engram-step{N}.pt` every N steps (`0` = save only at the end) |
@@ -61,7 +62,24 @@ plugins:
 | `micro_engram_lr_epoch_decay` | `null` | LR schedule: linear warmup (`warmup_ratio`/`warmup_steps` as usual), then the LR is multiplied by this factor at the start of every epoch (`0.5` = halve each epoch). Replaces `lr_scheduler` / `lr_scheduler_kwargs`. Epoch boundaries come from the step count, and resume continues the curve |
 | `micro_engram_stats_steps` | `10` | Every N steps, add engram stats to the training log line (output-weight size, table RMS and share of rows trained per n-gram order, gate mean and saturation). `0` = off. See *Watching training* |
 
-The engram has `2 × heads × table_size × dim` table parameters plus two `(2·heads·dim) × hidden_size` projections. With the settings below on Gemma 4 31B, that is about 268M table parameters and 11M projection parameters.
+The engram has `orders × heads × table_size × dim` table parameters (2 orders by default; with `micro_engram_table_sizes`, `heads × dim ×` the sum of the sizes) plus two `(orders·heads·dim) × hidden_size` projections. With the settings below on Gemma 4 31B, that is about 268M table parameters and 11M projection parameters.
+
+#### Table sizes per n-gram order
+
+There are many more distinct 3-grams than 2-grams in most data, so one size for every table leaves the 2-gram tables roomy and the 3-gram ones crowded. `engram_data_stats.py` measures it on your prepared dataset (`--orders 2,3,4 --canon <canon file> --sizes ...` prints how many n-grams worth memorizing share each row). Then size each order:
+
+```yaml
+micro_engram_table_size: 2097152   # default for the orders not listed
+micro_engram_table_sizes:
+  2: 1048576    # 2-grams: half the rows
+  3: 3145728    # 3-grams: 1.5x the rows (same memory as 2M + 2M)
+  4: 0          # 0, null or not listed: no 4-grams
+```
+
+- Every order keeps `micro_engram_heads` tables, each of its own size. 4-grams look up the 3 tokens before each position: training, vLLM and the llama.cpp patch all handle it.
+- Extra engrams take `table_sizes` too; without it they copy the main engram's per-order sizes, and with only their own `table_size` they use one size for all.
+- The config records the sizes per order, and every loader rebuilds the same tables. An engram trained with one size per order still loads as before. `init_from` always uses the trained engram's sizes (the YAML can't change them), and resuming a run with different sizes is refused.
+- Memory grows with the total rows: with row sharding in fp32 + `rowwise_adam`, every 64-wide row costs ~768 bytes in training (weights, gradients, momentum), split over the GPUs.
 
 #### Gate modes
 
@@ -107,7 +125,7 @@ Each engram sits in its own decoder layer. The settings above describe the main 
 | `micro_engram_init_from` / `init_from` | Start from a trained engram: an output folder (its newest complete checkpoint is used), a `checkpoint-N` folder, a `micro_engram_config.json`, or the weights themselves (DCP folder, `.pt`, `.safetensors`). With a config, the engram is rebuilt exactly as trained (sizes, gate, **seed**); the YAML can't change those |
 | `micro_engram_frozen` / `frozen` | Load it but don't train it (needs `init_from`). A frozen engram costs only its weights, not gradients or optimizer state |
 | `micro_engram_seed` / `seed` | Hash seed. Default `10007 × layer` (DeepSeek's scheme), so each layer hashes n-grams to different rows; layer 0 keeps seed 0, as before |
-| `layer`, `table_size`, `dim`, `heads`, `gate` (extra only) | `layer` is required (one engram per layer); the others default to the main engram's |
+| `layer`, `table_size`, `table_sizes`, `dim`, `heads`, `gate` (extra only) | `layer` is required (one engram per layer); the others default to the main engram's |
 
 Second engram at mid depth, after the layer-0 one has finished training:
 
@@ -272,7 +290,7 @@ python assemble_engram_model.py --base /path/to/base_model \
 | Script | What it does |
 |---|---|
 | `build_canon.py` | Builds the token-merge map. `python build_canon.py --tokenizer /path/to/model --out canon.pt --paper`. By default it merges only case/NFKC variants (`▁The` = `▁the`). Each option merges more: `--merge-space` (`▁the` = `the`), `--strip-accents` (`é` = `e`, Latin/Greek/Cyrillic diacritics only) and `--merge-whitespace` (all whitespace-only pieces share one id). `--paper` turns on all three, like the paper's tokenizer compression. `--protect names.txt` (one name per line, `#` comments, repeatable) keeps names that are also ordinary words apart from the word, e.g. `Peril` the dragon vs `peril`: a single-token name keeps its own id while the word forms still merge with each other. Names split into several tokens are listed and left alone. Special, added and byte tokens are never merged. It prints the class count for each step so you can compare. |
-| `engram_data_stats.py` | Estimates how many n-grams your data trains and how crowded each table size would be. `python engram_data_stats.py /path/to/last_run_prepared/<hash> [--max-tokens N]`. Use it to pick `micro_engram_table_size`. |
+| `engram_data_stats.py` | Estimates how many n-grams your data trains and how crowded each table size would be. `python engram_data_stats.py /path/to/last_run_prepared/<hash> [--max-tokens N] [--orders 2,3,4] [--canon canon.pt] [--sizes 1048576,2097152,...]`. `--canon` counts the n-grams the engram really sees (after token merging); 4-grams are counted through a 64-bit hash. Use it to pick `micro_engram_table_size` / `micro_engram_table_sizes`. |
 | `assemble_engram_model.py` | Builds a servable model folder from the base weights (symlinked, not copied) plus an engram from a DCP checkpoint, a safetensors folder or a `.pt`. See *Outputs*. |
 | `extract_engram.py` | Pulls the engram tensors out of merged safetensors into a standalone `.pt` file. |
 | `infer_engram.py` | Test generation with the engram attached. See below. |

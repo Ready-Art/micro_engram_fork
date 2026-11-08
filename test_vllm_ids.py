@@ -30,7 +30,7 @@ def make(gate="scalar"):
     return eng
 
 
-def run_step(chunks, histories, slots):
+def run_step(chunks, histories, slots, width=3):
     """chunks: list of (request, first position, count). Returns the filled buffer rows."""
     input_ids, positions, qsl = [], [], [0]
     for r, start, n in chunks:
@@ -44,7 +44,7 @@ def run_step(chunks, histories, slots):
     table = torch.full((MAX_REQS, MAX_LEN), 999, dtype=torch.int32)
     for r, start, _ in chunks:
         table[slots[r], :start] = torch.tensor(histories[r][:start], dtype=torch.int32)
-    out = torch.full((num_tokens + 10, 3), 777, dtype=torch.int32)
+    out = torch.full((num_tokens + 10, width), 777, dtype=torch.int32)
     fill_engram_ids(
         out,
         torch.tensor(input_ids + [5] * 3, dtype=torch.int32),
@@ -114,6 +114,22 @@ for gate in MicroEngram.GATES:
         served.append(eng.inject(hidden[start:start + cnt], eng.hash_prev(out[:n])))
     results.append((f"{gate}: chunked prefill + decode == training forward",
                     torch.allclose(torch.cat(served), train, atol=1e-5)))
+
+# 3b. 4-grams and different table sizes per order: 3 earlier tokens per position
+eng4 = MicroEngram(model_dim=D, table_size=257, engram_dim=4, num_heads=2, vocab_size=V, pad_id=0,
+                   gate="scalar_sqrt", table_sizes={2: 257, 3: 401, 4: 97})
+with torch.no_grad():
+    eng4.value.weight.normal_()
+seq = torch.tensor(hist[1][:30])
+hidden = torch.randn(30, D) * 30
+train = eng4(hidden.unsqueeze(0), seq.unsqueeze(0))[0]
+served = []
+for chunk in [(0, 0, 11), (0, 11, 9)] + [(0, p, 1) for p in range(20, 30)]:
+    out, n, _ = run_step([chunk], {0: seq.tolist()}, {0: 1}, width=4)
+    _, start, cnt = chunk
+    served.append(eng4.inject(hidden[start:start + cnt], eng4.hash_prev(out[:n])))
+results.append(("4-grams + sizes 257/401/97: chunked prefill + decode == training forward",
+                torch.allclose(torch.cat(served), train, atol=1e-5)))
 
 # 4. multimodal: media placeholder tokens get no engram, and count as missing history
 from micro_engram_vllm.ids import mask_media  # noqa: E402

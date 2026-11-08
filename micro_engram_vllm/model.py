@@ -157,10 +157,10 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
             layer.__class__ = EngramGemma4DecoderLayer
             self.micro_engram_slots.append((spec, layer))
             logger.info(
-                "[micro_engram] attached at layer %d: %s gate, %d tables x %d rows x %d dims (this GPU: %d "
-                "rows each, TP %d), seed %d%s, from %s",
-                spec["layer"], engram.gate, len(engram.row_shards), engram.table_size, engram.engram_dim,
-                engram.row_shards[0].shape[0], tp_size, spec["seed"],
+                "[micro_engram] attached at layer %d: %s gate, %d tables of %d dims, rows per order %s "
+                "(this GPU holds 1/%d of each), seed %d%s, from %s",
+                spec["layer"], engram.gate, len(engram.row_shards), engram.engram_dim, engram.order_sizes,
+                tp_size, spec["seed"],
                 "" if on else " (OFF: MICRO_ENGRAM_OFF=1)",
                 spec["weights"] if separate else "the model checkpoint",
             )

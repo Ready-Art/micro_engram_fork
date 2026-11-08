@@ -129,6 +129,26 @@ def worker(rank, world, port, tmp):
         check(f"{str(dtype)[6:]}: same output as the full tables (exact), this rank holds {count} of {N} rows",
               same and sh.row_shards[0].shape[0] == count)
 
+    # 1b. mixed table sizes per n-gram order (with 4-grams): each table its own split
+    torch.manual_seed(4)
+    fm = MicroEngram(model_dim=D, table_size=N, engram_dim=E, num_heads=2, vocab_size=V, gate="scalar_sqrt",
+                     table_sizes={2: 31, 3: 47, 4: 13})
+    with torch.no_grad():
+        fm.value.weight.normal_(std=0.3)
+    sm = MicroEngram(model_dim=D, table_size=N, engram_dim=E, num_heads=2, vocab_size=V, gate="scalar_sqrt",
+                     table_sizes={2: 31, 3: 47, 4: 13}, build_tables=False)
+    sm.shard_rows(rank, world, requires_grad=False, empty=True)
+    sm.row_lookup_fn = tp_lookup(all_reduce)
+    load_rows(sm, fm.state_dict(), "mixed")
+    hm = torch.randn(24, D) * 5
+    g = torch.Generator().manual_seed(9)
+    hist4 = torch.randint(5, V, (24, 4), generator=g)
+    hist4[:2, 1:] = -1
+    im = fm.hash_prev(hist4)
+    check("mixed sizes (31/47/13, 2-4-grams): same output as the full tables, each table split on its own",
+          torch.equal(sm.inject(hm, im), fm.inject(hm, im))
+          and [p.shape[0] for p in sm.row_shards] == [row_range(r, rank, world)[1] for r in fm.table_rows])
+
     # 2. loading: slices, partial pieces, errors
     full = make_full()
     sd = full.state_dict()

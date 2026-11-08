@@ -102,8 +102,13 @@ def resolve_settings(args, sd, layer_from_key):
     # what the saved tensors say
     n_tables = sum(1 for k in sd if k.startswith("tables.") and k.endswith(".weight"))
     t0 = sd.get("tables.0.weight")
+    rows = [int(sd[f"tables.{k}.weight"].shape[0]) for k in range(n_tables) if f"tables.{k}.weight" in sd]
+    heads_from_shapes = (n_tables // len(orders)) if n_tables else None
     from_shapes = {
         "table_size": int(t0.shape[0]) if t0 is not None else None,
+        # per-order sizes when the tables differ (orders as listed, heads tables each)
+        "table_sizes": ({n: rows[i * heads_from_shapes] for i, n in enumerate(orders)}
+                        if rows and len(set(rows)) > 1 and heads_from_shapes else None),
         "engram_dim": int(t0.shape[1]) if t0 is not None else None,
         "num_heads": (n_tables // len(orders)) if n_tables else None,
         "gate": "ple" if "up.weight" in sd else ("scalar_sqrt" if "q_scale" in sd
@@ -113,6 +118,7 @@ def resolve_settings(args, sd, layer_from_key):
     settings = {
         "layer": pick(args.layer, conf.get("layer"), layer_from_key, 0),
         "table_size": pick(args.table_size, conf.get("table_size"), from_shapes["table_size"], 65_536),
+        "table_sizes": None if args.table_size else pick(conf.get("table_sizes"), from_shapes["table_sizes"]),
         "engram_dim": pick(args.dim, conf.get("engram_dim"), from_shapes["engram_dim"], 128),
         "num_heads": pick(args.heads, conf.get("num_heads"), from_shapes["num_heads"], 4),
         "orders": orders,
@@ -223,8 +229,9 @@ def plan_engrams(args):
             if not any(k.startswith("tables.") for k in sd):
                 raise SystemExit(f"No engram weights for layer {spec['layer']} in {src}.")
             spec["model_dim"] = conf.get("model_dim")
-            print(f"[engram] layer {spec['layer']}: {spec['gate']} gate, {spec['num_heads']} heads x "
-                  f"{spec['table_size']} rows x {spec['engram_dim']}, seed {spec['seed']}, from {src}")
+            sizes = spec.get("table_sizes") or {n: spec["table_size"] for n in spec["orders"]}
+            print(f"[engram] layer {spec['layer']}: {spec['gate']} gate, {spec['num_heads']} heads, rows per "
+                  f"order {sizes} x {spec['engram_dim']}, seed {spec['seed']}, from {src}")
             plans.append((spec, sd))
         return plans
     sd, layer_from_key = load_engram_weights(args.model, args.engram_pt)

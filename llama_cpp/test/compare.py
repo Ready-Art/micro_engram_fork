@@ -57,10 +57,10 @@ def make_model(out_dir):
     return model
 
 
-def make_engram(layer, gate, seed_shift=0):
+def make_engram(layer, gate, seed_shift=0, table_sizes=None):
     canon = torch.arange(V) & ~1  # merge every odd id into the even one below (idempotent)
     eng = MicroEngram(model_dim=D, table_size=97, engram_dim=8, num_heads=2, pad_id=0, seed=default_seed(layer),
-                      vocab_size=V, canon=canon, gate=gate)
+                      vocab_size=V, canon=canon, gate=gate, table_sizes=table_sizes)
     g = torch.Generator().manual_seed(100 + layer + seed_shift)
     with torch.no_grad():
         for n, p in eng.named_parameters():
@@ -78,7 +78,8 @@ def save_engrams(engrams, out_dir):
     for layer, eng in engrams:
         name = f"engram_L{layer}.pt"
         torch.save(eng.state_dict(), os.path.join(out_dir, name))
-        entries.append({"layer": layer, "table_size": eng.table_size, "engram_dim": eng.tables[0].embedding_dim,
+        entries.append({"layer": layer, "table_size": eng.table_size, "table_sizes": dict(eng.order_sizes),
+                        "engram_dim": eng.tables[0].embedding_dim,
                         "num_heads": len(eng.tables) // len(eng.orders), "orders": list(eng.orders),
                         "gate": eng.gate, "seed": default_seed(layer), "pad_id": 0, "token_merge": True,
                         "weights": name})
@@ -178,11 +179,14 @@ def main():
         ("scalar@0 + scalar_sqrt@3", [(0, "scalar"), (3, "scalar_sqrt")], "f32"),
         ("ple@0 + scalar_sqrt@5", [(0, "ple"), (5, "scalar_sqrt")], "f32"),
         ("scalar_sqrt@0 + ple@3, bf16 storage", [(0, "scalar_sqrt"), (3, "ple")], "bf16"),
+        # rows per order differ (and 4-grams: 3 earlier tokens from the KV history)
+        ("4-grams + sizes 97-131-61 @0 + scalar@3", [(0, "scalar_sqrt", {2: 97, 3: 131, 4: 61}), (3, "scalar")], "f32"),
     ]
     for label, layout, dtype in variants:
         edir = os.path.join(args.work, "engram_" + label.split(",")[0].replace(" ", "").replace("+", "_").replace("@", ""))
         os.makedirs(edir, exist_ok=True)
-        engrams = [(layer, make_engram(layer, gate)) for layer, gate in layout]
+        engrams = [(entry[0], make_engram(entry[0], entry[1], table_sizes=entry[2] if len(entry) > 2 else None))
+                   for entry in layout]
         save_engrams(engrams, edir)
         gguf_path = os.path.join(args.work, "tiny_engram.gguf")
         run([sys.executable, os.path.join("llama_cpp", "gguf_add_engram.py"), "--gguf", base_gguf, "--engram", edir,

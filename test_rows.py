@@ -89,6 +89,44 @@ def worker(rank, world, port, tmp):
           and torch.allclose(full.q_scale.grad, sh.q_scale.grad, atol=1e-6))
     ref_grads = [p.grad.clone() for p in sh.row_shards]
 
+    # 2b. mixed table sizes per n-gram order, with 4-grams: offsets and splits per table
+    torch.manual_seed(3)
+    fm = MicroEngram(model_dim=D, table_size=N, engram_dim=E, num_heads=2, vocab_size=50, gate="scalar_sqrt",
+                     table_sizes={2: 31, 3: 47, 4: 13})
+    with torch.no_grad():
+        fm.value.weight.normal_(std=0.3)
+    sm = sharded_copy(fm, rank, world)
+    hm, im = batch(rank)
+    om_f, om_s = fm(hm, im), sm(hm, im)
+    check("mixed sizes (31/47/13, 2-4-grams): same output as the full tables", torch.equal(om_f, om_s))
+    om_f.pow(2).sum().backward()
+    om_s.pow(2).sum().backward()
+    want_m = avg_table_grads(fm, world)
+    starts_m = sm.row_info[2]
+    check("mixed sizes: every table's gradient == averaged full gradient, sliced per table",
+          all(torch.allclose(p.grad, w[a:a + p.shape[0]], atol=1e-6) for p, w, a in zip(sm.row_shards, want_m, starts_m))
+          and [p.shape[0] for p in sm.row_shards] == [row_range(r, rank, world)[1] for r in fm.table_rows])
+    mdir = os.path.join(tmp, "mixed", ROWS_DIR)
+    RowTables([(PREFIX, sm)]).save(mdir)
+    dist.barrier()
+    sdm = load_engram_weights(mdir, layer=3)
+    fresh_m = MicroEngram(model_dim=D, table_size=N, engram_dim=E, num_heads=2, vocab_size=50, gate="scalar_sqrt",
+                          table_sizes={2: 31, 3: 47, 4: 13}, build_tables=False)
+    fresh_m.shard_rows(rank, world)
+    RowTables([(PREFIX, fresh_m)]).load(mdir)
+    check("mixed sizes: saved as full tables of their own sizes, loaded back into each rank's rows",
+          [sdm[f"tables.{k}.weight"].shape[0] for k in range(6)] == fm.table_rows
+          and all(torch.equal(a, b) for a, b in zip(fresh_m.row_shards, sm.row_shards)))
+    wrong = MicroEngram(model_dim=D, table_size=N, engram_dim=E, num_heads=2, vocab_size=50, gate="scalar_sqrt",
+                        table_sizes={2: 31, 3: 31, 4: 13}, build_tables=False)
+    wrong.shard_rows(rank, world)
+    try:
+        RowTables([(PREFIX, wrong)]).load(mdir)
+        refused = False
+    except ValueError as e:
+        refused = "can't resume" in str(e)
+    check("resuming into different table sizes is refused with a clear message", refused)
+
     # 3. activation checkpointing (the forward runs again inside the backward, with its exchange)
     from torch.utils.checkpoint import checkpoint
 

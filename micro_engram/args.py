@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel
 
@@ -9,6 +9,7 @@ class MicroEngramExtraArgs(BaseModel):
     """One additional engram (micro_engram_extra). Unset sizes/gate copy the main engram's."""
     layer: int                       # decoder layer (0-indexed); one engram per layer
     table_size: Optional[int] = None
+    table_sizes: Optional[Dict[int, Optional[int]]] = None  # per n-gram order, like micro_engram_table_sizes
     dim: Optional[int] = None
     heads: Optional[int] = None
     gate: Optional[Gate] = None
@@ -20,6 +21,10 @@ class MicroEngramExtraArgs(BaseModel):
 class MicroEngramArgs(BaseModel):
     micro_engram_layer: int = 0            # inject after this decoder layer (0-indexed)
     micro_engram_table_size: int = 65_536  # rows per hash table
+    # Rows per table for each n-gram order, overriding micro_engram_table_size, e.g.
+    # {2: 1048576, 3: 3145728, 4: 1048576}. An order set to 0 or null is not used; an order
+    # not listed keeps micro_engram_table_size (orders 2 and 3), so {4: N} adds 4-grams.
+    micro_engram_table_sizes: Optional[Dict[int, Optional[int]]] = None
     micro_engram_dim: int = 128            # width of each table row
     micro_engram_heads: int = 4            # hash tables per n-gram order
     micro_engram_save_steps: int = 250     # 0 = only save at the end

@@ -56,7 +56,7 @@ void llama_micro_engram::load_hparams(llama_model_loader & ml, uint32_t n_layer)
         return;
     }
 
-    std::vector<uint32_t> table_size, dim, n_tables, gate, orders;
+    std::vector<uint32_t> table_size, dim, n_tables, gate, orders, table_rows;
     std::vector<int32_t>  pad_id;
     std::vector<uint64_t> mults;
     mengram_arr(meta, "micro_engram.table_size",   GGUF_TYPE_UINT32, table_size);
@@ -67,6 +67,8 @@ void llama_micro_engram::load_hparams(llama_model_loader & ml, uint32_t n_layer)
     mengram_arr(meta, "micro_engram.table_orders", GGUF_TYPE_UINT32, orders);
     mengram_arr(meta, "micro_engram.mults",        GGUF_TYPE_UINT64, mults);
     mengram_arr(meta, "micro_engram.canon",        GGUF_TYPE_INT32,  canon);
+    // rows per table; optional (older files: table_size rows for every table)
+    const bool has_rows = mengram_arr(meta, "micro_engram.table_rows", GGUF_TYPE_UINT32, table_rows, false);
 
     const int64_t id_order = gguf_find_key(meta, "micro_engram.max_order");
     if (id_order < 0 || gguf_get_kv_type(meta, id_order) != GGUF_TYPE_UINT32) {
@@ -93,12 +95,24 @@ void llama_micro_engram::load_hparams(llama_model_loader & ml, uint32_t n_layer)
         if (layers[i] >= n_layer || (i > 0 && layers[i] <= layers[i - 1])) {
             throw std::runtime_error(format("micro_engram layer %u is out of range or out of order", layers[i]));
         }
-        if (e.table_size == 0 || e.dim == 0 || e.n_tables == 0 || gate[i] > GATE_PLE ||
-                (uint64_t) e.table_size*e.n_tables > (uint64_t) INT32_MAX) {
+        if ((!has_rows && e.table_size == 0) || e.dim == 0 || e.n_tables == 0 || gate[i] > GATE_PLE) {
             throw std::runtime_error(format("micro_engram layer %u: bad table settings", layers[i]));
         }
-        if (orders.size() < t_off + e.n_tables || mults.size() < (t_off + e.n_tables)*max_order) {
+        if (orders.size() < t_off + e.n_tables || mults.size() < (t_off + e.n_tables)*max_order ||
+                (has_rows && table_rows.size() < t_off + e.n_tables)) {
             throw std::runtime_error("micro_engram metadata is inconsistent");
+        }
+        for (uint32_t k = 0; k < e.n_tables; ++k) {
+            const uint32_t rows = has_rows ? table_rows[t_off + k] : e.table_size;
+            if (rows == 0) {
+                throw std::runtime_error(format("micro_engram layer %u: table %u has no rows", layers[i], k));
+            }
+            e.table_rows.push_back(rows);
+            e.table_offs.push_back(e.total_rows);
+            e.total_rows += rows;
+        }
+        if (e.total_rows > (uint64_t) INT32_MAX) {
+            throw std::runtime_error(format("micro_engram layer %u: too many table rows", layers[i]));
         }
         e.orders.assign(orders.begin() + t_off, orders.begin() + t_off + e.n_tables);
         e.mults.assign(mults.begin() + t_off*max_order, mults.begin() + (t_off + e.n_tables)*max_order);
@@ -117,7 +131,7 @@ void llama_micro_engram::load_hparams(llama_model_loader & ml, uint32_t n_layer)
 void llama_micro_engram::create_tensors(const create_fn & create, int64_t n_embd) {
     for (auto & e : engrams) {
         const int il = e.layer;
-        e.tables = create(false, "mengram_tables", il, {(int64_t) e.dim, (int64_t) e.n_tables*e.table_size});
+        e.tables = create(false, "mengram_tables", il, {(int64_t) e.dim, (int64_t) e.total_rows});
         if (e.gate == GATE_PLE) {
             e.down = create(false, "mengram_down", il, {n_embd, e.mem_dim()});
             e.up   = create(false, "mengram_up",   il, {e.mem_dim(), n_embd});
@@ -156,7 +170,7 @@ void llama_micro_engram::hash(const engram & e, const llama_ubatch & ubatch, con
             for (uint32_t s = 0; s < e.orders[k]; ++s) {
                 x += toks[s]*e.mults[(size_t) k*max_order + s];
             }
-            out[(size_t) i*e.n_tables + k] = (int32_t) ((uint64_t) k*e.table_size + (x % MENGRAM_PRIME) % e.table_size);
+            out[(size_t) i*e.n_tables + k] = (int32_t) (e.table_offs[k] + (x % MENGRAM_PRIME) % e.table_rows[k]);
         }
     }
 }
