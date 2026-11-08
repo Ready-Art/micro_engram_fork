@@ -19,8 +19,10 @@ def tp_lookup(all_reduce):
 
     def lookup(engram, idx):
         _rank, world, starts, _pers = engram.row_info
+        # host offload: the rows live in pinned CPU memory, read through their GPU (UVA) views
+        tables = engram.__dict__.get("row_views") or engram.row_shards
         parts = []
-        for shard, i, start in zip(engram.row_shards, idx, starts):  # tables can differ in size
+        for shard, i, start in zip(tables, idx, starts):  # tables can differ in size
             n = shard.shape[0]
             local = i.long() - start
             if n == 0:  # more ranks than rows: this rank owns none

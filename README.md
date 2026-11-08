@@ -322,6 +322,8 @@ Engram settings are resolved in this order: explicit flag (`--layer`, `--table-s
 
 `micro_engram_vllm` is a vLLM plugin (no vLLM fork). Installing this package registers it automatically; it replaces vLLM's Gemma 4 classes (text-only and multimodal) with ones that run the engram at its layer(s). Models without a `micro_engram_config.json` keep running as plain Gemma 4.
 
+**Tables in host memory** (`--additional-config '{"micro_engram": "...", "micro_engram_offload": true}'`, or `MICRO_ENGRAM_OFFLOAD=1`): each rank keeps its share of the tables in pinned CPU RAM, and the GPU reads only the rows a step looks up, over PCIe, through a UVA view. That's the same mechanism vLLM uses for its own Engram/n-gram tables. The tables then take no GPU memory (all of it goes to the KV cache), at the cost of pinned host RAM (the whole engram once, split over the ranks) and a little latency per step (an 8k-token prefill reads a few tens of MB). CUDA graphs keep working. It needs a platform with UVA (NVIDIA).
+
 With tensor parallelism the engram tables are **split by rows across the GPUs**, like vLLM's own vocabulary embedding: each GPU holds 1/TP of every table, and a lookup is a masked local read plus one all-reduce (exact: every row comes from one GPU). Two 2M-row engrams take ~1.1 GB per GPU at TP 4 instead of 4.3 GB on every GPU. The weight files are unchanged; `test_vllm_tp.py` checks it against the full tables.
 
 Install the package **in the vLLM environment** (Axolotl is not needed there):

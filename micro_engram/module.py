@@ -112,7 +112,7 @@ class MicroEngram(nn.Module):
     row_shards = None  # [Parameter [rows on this rank, dim]] per table, when row-sharded
     row_info = None    # (rank, world, [first row per table], [rows per rank per table])
 
-    def shard_rows(self, rank, world, device=None, dtype=None, requires_grad=True, empty=False):
+    def shard_rows(self, rank, world, device=None, dtype=None, requires_grad=True, empty=False, pin_memory=False):
         """Keep only this rank's rows of every table: sliced from the tables if they exist
         (loaded weights), else freshly initialised like nn.Embedding tables (N(0, 0.02)), or
         left uninitialised with empty=True (a server that loads the real rows next)."""
@@ -124,8 +124,10 @@ class MicroEngram(nn.Module):
             src = [t.weight.detach()[a:a + c] for t, (a, c) in zip(self.tables, spans)]
             dtype = dtype or src[0].dtype
             del self.tables
-        elif empty:
-            src = [torch.empty(c, self.engram_dim, device=device, dtype=dtype) for _, c in spans]
+        elif empty:  # pin_memory: CPU rows a GPU reads in place (vLLM host offload, UVA)
+            pin = pin_memory and torch.cuda.is_available()  # pinning needs CUDA (always there in vLLM)
+            src = [torch.empty(c, self.engram_dim, device=device, dtype=dtype, pin_memory=pin)
+                   for _, c in spans]
         else:
             g = torch.Generator().manual_seed(self.seed * 1_000_003 + rank)  # differs per rank
             src = [torch.randn(c, self.engram_dim, generator=g) * 0.02 for _, c in spans]

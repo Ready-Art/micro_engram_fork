@@ -47,6 +47,9 @@ def all_reduce(t):
     return t
 
 
+VIEWS, UVA = [], [True]
+
+
 def install_vllm_stubs():
     """Just enough of vLLM for model.py: module paths, base classes, TP helpers."""
     def mod(name, **attrs):
@@ -93,6 +96,11 @@ def install_vllm_stubs():
     mod("vllm.model_executor.models.gemma4", Gemma4DecoderLayer=Gemma4DecoderLayer, Gemma4ForCausalLM=Gemma4ForCausalLM)
     mod("vllm.model_executor.models.gemma4_mm", Gemma4ForConditionalGeneration=nn.Module)
     mod("vllm.model_executor.models.utils", PPMissingLayer=type("PPMissingLayer", (nn.Module,), {}))
+    # host offload: UVA views stand-in (CPU here; on GPUs a CUDA view of the same pinned memory)
+    VIEWS.clear()
+    mod("vllm.utils")
+    mod("vllm.utils.platform_utils", is_uva_available=lambda: UVA[0])
+    mod("vllm.utils.torch_utils", get_accelerator_view_from_cpu_tensor=lambda t: VIEWS.append(t) or t)
 
 
 def vllm_config(conf=None, model_dir="/nonexistent"):
@@ -217,6 +225,34 @@ def worker(rank, world, port, tmp):
         out, _ = layer(None, h, None)
         ref = full.inject(torch.tanh(layer.lin(h)), full.hash_prev(ids))
         check(f"{mode}: decoder layer output == base layer + the full-table engram", torch.allclose(out, ref, atol=1e-6))
+
+    # 4. host offload (micro_engram_offload): rows in (pinned) CPU memory, read through UVA views
+    folder = os.path.join(tmp, "file")
+    cfg_off = vllm_config(os.path.join(folder, "micro_engram_config.json"))
+    cfg_off.additional_config["micro_engram_offload"] = True
+    model = EngramGemma4ForCausalLM(vllm_config=cfg_off)
+    model.load_weights(iter({k: v + 1 for k, v in model.state_dict().items() if ".micro_engram." not in k}.items()))
+    layer = model.model.layers[LAYER]
+    eng = layer.micro_engram
+    check("offload: the rows live in CPU memory, the lookup reads them through one view per table",
+          all(p.device.type == "cpu" for p in eng.row_shards) and len(VIEWS) == len(eng.row_shards)
+          and all(v.data_ptr() == p.data_ptr() for v, p in zip(eng.row_views, eng.row_shards)))
+    layer.micro_engram_ids.copy_(torch.cat([ids, torch.full((64 - 24, 3), -1)])[:64].to(torch.int32))
+    out, _ = layer(None, h, None)
+    ref = full.inject(torch.tanh(layer.lin(h)), full.hash_prev(ids))
+    check("offload: decoder layer output == the full-table engram", torch.allclose(out, ref, atol=1e-6))
+    UVA[0] = False
+    try:
+        EngramGemma4ForCausalLM(vllm_config=cfg_off)
+        no_uva = False
+    except RuntimeError as e:
+        no_uva = "UVA" in str(e)
+    UVA[0] = True
+    os.environ["MICRO_ENGRAM_OFFLOAD"] = "1"
+    m_env = EngramGemma4ForCausalLM(vllm_config=vllm_config(os.path.join(folder, "micro_engram_config.json")))
+    del os.environ["MICRO_ENGRAM_OFFLOAD"]
+    check("offload: refused without UVA; MICRO_ENGRAM_OFFLOAD=1 turns it on too",
+          no_uva and m_env.model.layers[LAYER].micro_engram.row_views is not None)
 
     with open(os.path.join(tmp, f"res{world}_{rank}.json"), "w") as f:
         json.dump(res, f)

@@ -50,6 +50,27 @@ class EngramGemma4DecoderLayer(Gemma4DecoderLayer):
         return self.micro_engram.inject(hidden_states, idx, keep), residual
 
 
+def _offload_wanted(vllm_config: VllmConfig) -> bool:
+    """Engram tables in pinned host memory: --additional-config '{"micro_engram_offload": true}'
+    or MICRO_ENGRAM_OFFLOAD=1."""
+    extra = vllm_config.additional_config
+    if isinstance(extra, dict) and "micro_engram_offload" in extra:
+        return bool(extra["micro_engram_offload"])
+    return os.environ.get("MICRO_ENGRAM_OFFLOAD", "0") == "1"
+
+
+def _host_views(shards):
+    """GPU views (UVA) of pinned CPU rows: kernels read only the rows they index, over PCIe,
+    at fixed addresses (CUDA graphs keep working). Same mechanism as vLLM's own Engram offload."""
+    from vllm.utils.platform_utils import is_uva_available
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    if not is_uva_available():
+        raise RuntimeError("[micro_engram] micro_engram_offload needs UVA (pinned host memory readable "
+                           "by the GPU); this platform has none: serve without offload")
+    return [get_accelerator_view_from_cpu_tensor(p.data) for p in shards]
+
+
 def _resolve_engram(vllm_config: VllmConfig):
     """Which engram(s) to load: (config, config path, separate weights?) or (None, None, False).
 
@@ -131,6 +152,7 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
         # embedding): each holds 1/TP of them, a lookup is masked + one all-reduce (tp.py).
         tp_rank, tp_size = get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
         lookup = tp_lookup(tensor_model_parallel_all_reduce)
+        offload = _offload_wanted(vllm_config)
         on = os.environ.get("MICRO_ENGRAM_OFF", "0") != "1"  # =1: load but skip, for A/B tests
         for spec in specs:
             layer = self.model.layers[spec["layer"]]
@@ -140,9 +162,15 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
                                       self.config.pad_token_id or 0, build_tables=False)
             ref = next(layer.parameters())
             engram.to(device=ref.device, dtype=ref.dtype)  # ints (canon, mults) keep their dtype
-            # this GPU's rows, filled by load_weights (not registered: vLLM's loader never sees them)
-            engram.shard_rows(tp_rank, tp_size, device=ref.device, dtype=ref.dtype, requires_grad=False,
-                              empty=True)
+            # this GPU's rows, filled by load_weights (not registered: vLLM's loader never sees them);
+            # with offload they stay in pinned host memory and the GPU reads them through UVA views
+            if offload:
+                engram.shard_rows(tp_rank, tp_size, device="cpu", dtype=ref.dtype, requires_grad=False,
+                                  empty=True, pin_memory=True)
+                engram.__dict__["row_views"] = _host_views(engram.row_shards)
+            else:
+                engram.shard_rows(tp_rank, tp_size, device=ref.device, dtype=ref.dtype, requires_grad=False,
+                                  empty=True)
             engram.row_lookup_fn = lookup
             layer.add_module("micro_engram", engram)
             if self._micro_engram_ids is None:
@@ -158,9 +186,10 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
             self.micro_engram_slots.append((spec, layer))
             logger.info(
                 "[micro_engram] attached at layer %d: %s gate, %d tables of %d dims, rows per order %s "
-                "(this GPU holds 1/%d of each), seed %d%s, from %s",
+                "(this rank holds 1/%d of each: %.2f GiB %s), seed %d%s, from %s",
                 spec["layer"], engram.gate, len(engram.row_shards), engram.engram_dim, engram.order_sizes,
-                tp_size, spec["seed"],
+                tp_size, sum(p.numel() * p.element_size() for p in engram.row_shards) / 2**30,
+                "in pinned host memory" if offload else "on the GPU", spec["seed"],
                 "" if on else " (OFF: MICRO_ENGRAM_OFF=1)",
                 spec["weights"] if separate else "the model checkpoint",
             )
