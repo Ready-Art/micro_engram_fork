@@ -303,7 +303,7 @@ def worker_full(rank, world, port, root, model_dir, data):
     """A whole run through Trainer.train(): checkpoints, rotation, final output."""
     _init(rank, world, port)
     cfg = base_cfg(root, model_dir, data, os.path.join(root, "run_full"), save_steps=2, save_total_limit=2,
-                   num_epochs=2, lr_scheduler="cosine", warmup_ratio=0.2)
+                   num_epochs=2, lr_scheduler="cosine", warmup_ratio=0.2, profile_step=2)
     t = _trainer(cfg)
     t.train()
     dist.destroy_process_group()
@@ -345,6 +345,8 @@ def main():
             and all(sd["tables.0.weight"].shape[0] == 97 for sd in sds) and all("value.weight" in sd for sd in sds)
         check("final output loads through engram_specs / load_engram_weights (both engrams, full tables)", ok,
               [s["weights"] for s in specs])
+        check("profile_step writes a kernel table and a timeline",
+              all(os.path.isfile(os.path.join(out, "profile", f"rank0_step2.{x}")) for x in ("txt", "json")))
         with open(os.path.join(out, "train_log.jsonl")) as f:
             lines = [json.loads(x) for x in f]
         check("training log has loss, grad norms and engram stats",

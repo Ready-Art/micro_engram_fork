@@ -128,6 +128,7 @@ class TrainConfig(MicroEngramArgs):
     auto_resume_from_checkpoints: bool = True
     resume_from_checkpoint: Optional[str] = None
     logging_steps: int = 1
+    profile_step: Optional[int] = None               # profile this step (torch.profiler) -> output_dir/profile/
     wandb_project: Optional[str] = None
     wandb_name: Optional[str] = None
     wandb_entity: Optional[str] = None

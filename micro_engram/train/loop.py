@@ -322,7 +322,10 @@ class Trainer:
             if self.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(self.device)
             micro = self.plan.micro_batches(self.epoch, self.step_in_epoch, self.rank)
-            logs = self.train_step(micro)
+            if cfg.profile_step and self.global_step + 1 == cfg.profile_step:
+                logs = self._profiled_step(micro)
+            else:
+                logs = self.train_step(micro)
             self.global_step += 1
             self.step_in_epoch += 1
             toks += logs.pop("tokens")
@@ -353,6 +356,31 @@ class Trainer:
                   f"--additional-config '{{\"micro_engram\": \"{cfg.output_dir}/{CONFIG_NAME}\"}}'")
             if self.wandb:
                 self.wandb.finish()
+
+    def _profiled_step(self, micro):
+        """One step under torch.profiler (every rank records; rank 0 writes the files):
+        output_dir/profile/rank0_step<N>.json (chrome://tracing or https://ui.perfetto.dev) and a
+        table of the top CUDA kernels in profile/rank0_step<N>.txt."""
+        from torch.profiler import ProfilerActivity, profile
+
+        acts = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if self.device.type == "cuda" else [])
+        with profile(activities=acts, record_shapes=False) as prof:
+            logs = self.train_step(micro)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+        if self.rank == 0:
+            folder = os.path.join(self.cfg.output_dir, "profile")
+            os.makedirs(folder, exist_ok=True)
+            base = os.path.join(folder, f"rank0_step{self.global_step + 1}")
+            try:
+                prof.export_chrome_trace(base + ".json")
+                key = "cuda_time_total" if self.device.type == "cuda" else "cpu_time_total"
+                with open(base + ".txt", "w") as f:
+                    f.write(prof.key_averages().table(sort_by=key, row_limit=40))
+                LOG.warning(f"[micro_engram] profile written: {base}.txt (top kernels), {base}.json (timeline)")
+            except Exception as e:  # noqa: BLE001
+                LOG.warning(f"[micro_engram] writing the profile failed (training continues): {e}")
+        return logs
 
     def _memory(self):
         if self.device.type != "cuda":
