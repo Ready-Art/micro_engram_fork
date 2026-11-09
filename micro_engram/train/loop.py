@@ -508,6 +508,21 @@ def main(argv=None):
     try:
         t.build()
         t.train()
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
+    except BaseException:
+        # Print the error NOW and exit hard: destroy_process_group() would wait for the other
+        # GPUs, which are stuck in a collective this rank never reaches, so the error would never
+        # show and the run would hang. Exiting lets torchrun stop the others.
+        import sys
+        import traceback
+
+        rank = os.environ.get("RANK", "?")
+        print(f"\n[micro_engram] rank {rank} FAILED:", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        sys.stderr.flush()
+        if torch.cuda.is_available():
+            dev = torch.cuda.current_device()
+            print(f"[micro_engram] rank {rank}: {torch.cuda.memory_allocated(dev) / 2**30:.2f} GiB allocated, "
+                  f"{torch.cuda.memory_reserved(dev) / 2**30:.2f} GiB reserved", file=sys.stderr, flush=True)
+        os._exit(1)
+    if dist.is_initialized():
+        dist.destroy_process_group()
