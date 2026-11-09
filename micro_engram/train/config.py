@@ -26,6 +26,10 @@ IGNORED_FSDP_KEYS = {
     "sync_module_states", "auto_wrap_policy", "transformer_layer_cls_to_wrap", "state_dict_type",
     "fsdp_version", "use_orig_params", "limit_all_gathers",
 }
+# Fused-loss switches: micro_engram.train always uses its own chunked vocab-parallel loss
+# (full logits never exist), so these are accepted and have nothing to switch
+LOSS_KEYS = {"cut_cross_entropy", "liger_cross_entropy", "liger_fused_linear_cross_entropy",
+             "chunked_cross_entropy", "chunked_cross_entropy_num_chunks"}
 # The placeholder QLoRA a 4-bit base needed under Axolotl: gone, and must not come back
 LORA_KEYS = {"adapter", "unfrozen_parameters"}
 LORA_PREFIX = ("lora_", "peft_")
@@ -167,10 +171,17 @@ def load_config(path_or_dict):
             "with no placeholder LoRA, and trains only the engram (no unfrozen_parameters needed)")
     if raw.get("fsdp_version") not in (None, 2, "2"):
         raise ValueError("only FSDP2 is supported (fsdp_version: 2, or leave it out)")
+    import os
+
+    first = os.environ.get("RANK", "0") == "0"  # one warning, not one per GPU
     ignored = sorted(k for k in raw if k in IGNORED_KEYS)
-    if ignored:
+    if ignored and first:
         LOG.warning(f"[micro_engram] ignoring Axolotl-only keys: {', '.join(ignored)}")
-    for k in ignored:
+    loss = sorted(k for k in raw if k in LOSS_KEYS)
+    if loss and first:
+        LOG.warning(f"[micro_engram] {', '.join(loss)}: not needed, the loss is always fused "
+                    f"(chunked, vocab-parallel; no full logits)")
+    for k in ignored + loss:
         raw.pop(k)
     if "load_in_8bit" in raw:
         if raw.pop("load_in_8bit"):
