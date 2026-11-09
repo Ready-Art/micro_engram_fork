@@ -12,6 +12,67 @@ At each position `t`, the module looks up the 2-grams and 3-grams that **end** a
 
 ---
 
+## Training without Axolotl: `micro_engram.train` (new)
+
+The repo has its own trainer: plain PyTorch + FSDP2, with no HF Trainer, Accelerate or PEFT. It reads the same YAML keys, so an existing Axolotl config works after you **delete** these lines:
+- `adapter`, `lora_*`, `unfrozen_parameters`: a 4-bit base loads directly, with no placeholder LoRA, and only the engram is trainable. These keys are now an error.
+- `plugins`
+
+```bash
+torchrun --nproc_per_node 5 -m micro_engram.train stage1.yaml
+```
+
+How it differs from the Axolotl plugin:
+
+| | Axolotl plugin | `micro_engram.train` |
+|---|---|---|
+| 4-bit base | rank-1 placeholder QLoRA + `unfrozen_parameters` | `load_in_4bit: true`, nothing else |
+| embedding / lm_head (tied, ~2.7 GiB) | whole on every GPU (FSDP root) | rows split over the GPUs; the loss is vocab-parallel and chunked, so full logits never exist (`sharded_vocab`, `loss_chunk_tokens`) |
+| layers before the first *trained* engram | forward + backward | forward only, no autograd (`no_grad_prefix: true`). With a frozen layer-0 engram and a layer-29 one in training, about half of the backward is skipped |
+| engram tables | `micro_engram_sharding: rows` | always row-sharded |
+| engram key/value/scales | inside FSDP | replicated, gradients all-reduced (they are small) |
+| loss over gradient accumulation | Axolotl turns token weighting off for Gemma 4 (a mean of micro-batch means) | per-token mean over the whole step (all micro-batches, all GPUs) |
+| the token after a packed document's last token | trained as a target | not a target (it belongs to the next document) |
+| activation offloading | TRL hooks | layer inputs of checkpointed layers go to a reused pinned-memory pool |
+
+The loss is not bit-identical to Axolotl's, because of the last two rows. Expect it to be very close at step 1.
+
+Kept from Axolotl (copied in `micro_engram/train/vendor/`, Apache-2.0):
+- Gemma 4 fused q/k/v-norm + RoPE kernel (`fused_attn_kernel`, on by default as in Axolotl)
+- `gemma4_hybrid_attn_impl` (FA2 sliding layers + packing-aware SDPA on the 512-dim global layers)
+- the head_dim-512 Triton flash kernel (`large_head_attention: auto|triton_flash`)
+- the FSDP2 + bitsandbytes 4-bit parameter patch
+
+The Liger RMSNorm/GEGLU kernels are applied when `liger_rms_norm` / `liger_glu_activation` is set.
+
+Data:
+- `type: completion` follows Axolotl's rules (chunks of `sequence_len`, EOS appended when the text is shorter than `sequence_len*64`).
+- `type: chat_template` renders with `chat_template_jinja` + `chat_template_kwargs` and trains each assistant turn's content plus its `eot_tokens`. The role header and anything after the end-of-turn token are not trained.
+- Tokenized data is cached in `dataset_prepared_path/micro_engram-<hash>/`.
+- `axolotl_prepared_dataset: <folder>` reads an existing Axolotl prepared dataset as-is, for an exact data match.
+- Every epoch the samples are reshuffled and repacked (seed + epoch).
+
+Checkpoints use the same layout as before, so vLLM, llama.cpp, `assemble_engram_model.py`, `engram_stats.py` and `init_from` read them unchanged:
+- `checkpoint-N/micro_engram_rows/` holds the complete engram, `micro_engram_rows_optim/` the tables' Adam state, and `micro_engram_config.json` the settings.
+- Each checkpoint also gets the dense optimizer + scheduler state and `trainer_state.json`, which is written last.
+- `auto_resume_from_checkpoints` picks up the newest complete checkpoint, and the data order continues exactly where it stopped.
+- To continue from an *Axolotl* checkpoint, use `micro_engram_init_from`.
+
+Logs go to stdout, `output_dir/train_log.jsonl` and wandb. Each line has loss, `grad_norm` (dense), `table_grad_norm`, lr, s/step, trained tokens/s, the peak VRAM per GPU, and the engram stats.
+
+Not supported: LoRA/adapters, eval split, `fsdp_config.activation_checkpointing` (use `gradient_checkpointing`), non-Gemma-style tied heads.
+
+Tested on CPU only (`test_train.py`: 2 processes on a tiny Gemma 4). It checks:
+- the first-step loss against a plain HF forward
+- that the no-grad prefix gives the same gradients
+- that save → resume gives the same next step
+- cpu_ram_efficient_loading
+- that checkpoints load through the usual loaders
+
+**Not yet run on GPUs.**
+
+---
+
 ## Installation
 
 Install into the **same Python environment as Axolotl**:
@@ -420,6 +481,7 @@ For a run that started without this option (or to look at past checkpoints), `en
 Run them from the repo root:
 
 ```bash
+python test_train.py                          # micro_engram.train: data, config, loss vs HF, no-grad prefix, resume, meta loading (2 procs)
 python test_gate.py                           # all gate modes: no-op start, gradients, bf16, checkpoint names; weight stats
 python test_canon.py                          # token-merge hashing and state-dict compatibility
 python test_optim.py                          # lazy_adam / rowwise_adam: vs AdamW, unused rows untouched, bf16 second-moment freeze, FSDP2 + state save/load
