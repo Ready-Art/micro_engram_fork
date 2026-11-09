@@ -478,6 +478,8 @@ def main(argv=None):
     ap.add_argument("config")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(message)s")
+    if os.environ.get("RANK", "0") != "0":  # one copy of the setup log, from rank 0; errors from all
+        logging.getLogger("micro_engram").setLevel(logging.ERROR)
     cfg = load_config(args.config)
     t = Trainer(cfg)
     try:

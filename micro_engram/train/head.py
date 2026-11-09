@@ -66,7 +66,8 @@ def _gather(x, group, world):
     if world == 1:
         return x
     out = x.new_empty((world * x.shape[0],) + tuple(x.shape[1:]))
-    dist.all_gather_into_tensor(out, x.contiguous(), group=group)
+    gather = getattr(dist, "all_gather_single", None) or dist.all_gather_into_tensor  # newer torch renamed it
+    gather(out, x.contiguous(), group=group)
     return out
 
 
