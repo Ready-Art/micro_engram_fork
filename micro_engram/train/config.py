@@ -118,6 +118,7 @@ class TrainConfig(MicroEngramArgs):
     activation_offloading: bool = False
     no_grad_prefix: bool = True                       # layers before the first trained engram run without autograd
     sharded_vocab: bool = True                        # embedding/lm_head rows split across GPUs (vocab-parallel loss)
+    sparse_row_grads: bool = True                     # lazy_adam/rowwise_adam: keep only touched rows' gradients
     loss_chunk_tokens: int = 2048                     # tokens per chunk of the fused loss
     fsdp_config: FsdpConfig = FsdpConfig()
 

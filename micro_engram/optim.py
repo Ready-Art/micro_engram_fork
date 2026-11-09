@@ -72,7 +72,8 @@ class LazyAdamW(torch.optim.Optimizer):
             beta1, beta2 = group["betas"]
             lr, eps, wd = group["lr"], group["eps"], group["weight_decay"]
             for p in group["params"]:
-                if p.grad is None:
+                sparse = getattr(p, "sparse_grad", None)  # (rows, fp32 grads) from rows.add_sparse_grad
+                if p.grad is None and sparse is None:
                     continue
                 state = self.state[p]
                 if not state:
@@ -81,16 +82,28 @@ class LazyAdamW(torch.optim.Optimizer):
                 step = float(state["step"])
                 bc1, bc2 = 1 - beta1 ** step, 1 - beta2 ** step
 
-                P, G = _local(p), _local(p.grad)
+                P = _local(p)
                 M, V = _local(state["exp_avg"]), _local(state["exp_avg_sq"])
                 rows = None
-                if group["lazy"] and P.dim() >= 2:
+                if sparse is not None:
+                    if not group["lazy"]:
+                        raise ValueError("sparse row gradients need lazy=True")
+                    rows, g = sparse
+                    keep = (g != 0).flatten(1).any(dim=1)  # like the dense path: all-zero rows are skipped
+                    rows, g = rows[keep], g[keep]
+                    if rows.numel() == 0:
+                        continue
+                    p_ = P.index_select(0, rows).float()
+                    m, v = M.index_select(0, rows).float(), V.index_select(0, rows).float()
+                elif group["lazy"] and P.dim() >= 2:
+                    G = _local(p.grad)
                     rows = (G != 0).flatten(1).any(dim=1).nonzero().squeeze(1)
                     if rows.numel() == 0:
                         continue
                     p_, g = P.index_select(0, rows).float(), G.index_select(0, rows).float()
                     m, v = M.index_select(0, rows).float(), V.index_select(0, rows).float()
                 else:
+                    G = _local(p.grad)
                     p_, g, m, v = P.float(), G.float(), M.float(), V.float()
 
                 if wd:

@@ -141,7 +141,8 @@ class Trainer:
                               lr=a.learning_rate, betas=(a.adam_beta1, a.adam_beta2), eps=a.adam_epsilon,
                               weight_decay=a.weight_decay, lazy=opt in ("lazy_adam", "rowwise_adam"),
                               rowwise=opt == "rowwise_adam",
-                              stochastic_rounding=a.micro_engram_stochastic_rounding is not False)
+                              stochastic_rounding=a.micro_engram_stochastic_rounding is not False,
+                              sparse_grads=bool(cfg.sparse_row_grads and opt in ("lazy_adam", "rowwise_adam")))
         if cfg.optimizer and not str(cfg.optimizer).startswith("adamw"):
             _log0(f"[micro_engram] optimizer: {cfg.optimizer} is not used; key/value/scales use AdamW")
 
@@ -226,7 +227,8 @@ class Trainer:
         _log0(f"[micro_engram] {len(self.samples):,} samples, {len(self.plan.bins(0)):,} bins of "
               f"{self.cfg.sequence_len} tokens, {self.plan.per_step} bins per step, {self.total_steps} steps; "
               f"no-grad prefix through layer {self.first_trained if self.cfg.no_grad_prefix else '-'}; "
-              f"vocab rows {self.vocab.rows:,} of {self.vocab.V:,} on this GPU (loss chunk {self.vocab.chunk} tokens)")
+              f"vocab rows {self.vocab.rows:,} of {self.vocab.V:,} on this GPU (loss chunk {self.vocab.chunk} tokens); "
+              f"table gradients: {'sparse (touched rows only)' if self.rows.sparse else 'dense'}")
         if self.device.type == "cuda":
             _log0(f"[micro_engram] after setup: {torch.cuda.memory_allocated(self.device) / 2**30:.2f} GiB allocated "
                   f"on GPU {self.local}")

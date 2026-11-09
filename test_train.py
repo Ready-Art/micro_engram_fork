@@ -203,6 +203,16 @@ def _engram_state(t):
     return out
 
 
+def _dense_grad(p):
+    """A table shard's gradient as a dense tensor, whether it is stored sparse or dense."""
+    sg = getattr(p, "sparse_grad", None)
+    if sg is not None:
+        g = torch.zeros(p.shape, dtype=torch.float32)
+        g.index_add_(0, sg[0], sg[1])
+        return g
+    return None if p.grad is None else p.grad.float().clone()
+
+
 def worker(rank, world, port, root, model_dir, data, q):
     _init(rank, world, port)
     from transformers import Gemma4ForCausalLM
@@ -236,18 +246,20 @@ def worker(rank, world, port, root, model_dir, data, q):
 
     def grads(prefix):
         t.cfg.no_grad_prefix = prefix
-        for p in t.dense + t.rows.params():
+        for p in t.dense:
             p.grad = None
+        t.rows.zero_grad()
         t.forward_loss(b, 1.0)
-        return [None if p.grad is None else p.grad.clone() for p in t.dense + t.rows.params()]
+        return [None if p.grad is None else p.grad.clone() for p in t.dense] + [_dense_grad(p) for p in t.rows.params()]
 
     g1, g0 = grads(True), grads(False)
     res["prefix_same"] = all((a is None and c is None) or (a is not None and c is not None and torch.allclose(a, c, atol=1e-6))
                              for a, c in zip(g1, g0))
     res["prefix_nonzero"] = any(a is not None and a.abs().sum() > 0 for a in g1)
     t.cfg.no_grad_prefix = True
-    for p in t.dense + t.rows.params():
+    for p in t.dense:
         p.grad = None
+    t.rows.zero_grad()
 
     # 5. save -> resume == uninterrupted
     t.global_step, t.step_in_epoch = 1, 1
@@ -268,6 +280,21 @@ def worker(rank, world, port, root, model_dir, data, q):
                    "fsdp_config": {"cpu_ram_efficient_loading": True}})
     res["meta_loss"] = t3.train_step(t3.plan.micro_batches(0, 0, rank))["loss"]
     del t3
+
+    # 8. sparse row gradients == dense ones: same tables after a few steps (clipping included)
+    states = []
+    for sparse in (True, False):
+        tt = _trainer({**cfg, "output_dir": os.path.join(root, f"run_sp{int(sparse)}"), "sparse_row_grads": sparse,
+                       "max_grad_norm": 0.05})
+        _randomize_dense(tt)
+        res[f"sparse_flag{int(sparse)}"] = tt.rows.sparse
+        norms = [tt.train_step(tt.plan.micro_batches(0, k, rank))["table_grad_norm"] for k in range(3)]
+        states.append((_engram_state(tt), norms))
+        del tt
+    (a, na), (b, nb) = states
+    res["sparse_same"] = all(torch.allclose(a[k], b[k], atol=1e-6) for k in a) and \
+        all(abs(x - y) < 1e-5 * max(1, abs(y)) for x, y in zip(na, nb))
+    res["sparse_norms"] = na
     q.put((rank, res))
     dist.destroy_process_group()
 
@@ -298,6 +325,9 @@ def main():
               all(res[r]["prefix_same"] for r in res) and r0["prefix_nonzero"])
         check("save -> resume -> next step identical to the uninterrupted run",
               all(res[r]["resume_same"] for r in res) and r0["resume_step"] == 1)
+        check("sparse row gradients: same tables and table grad norms as dense ones (3 steps, clipped)",
+              all(res[r]["sparse_same"] for r in res) and r0["sparse_flag1"] and not r0["sparse_flag0"]
+              and all(n and n > 0 for n in r0["sparse_norms"]), r0["sparse_norms"])
         check("cpu_ram_efficient_loading (meta on rank 1) trains like a normal load",
               abs(r0["meta_loss"] - r0["loss"]) < 1e-4, f"{r0['meta_loss']} vs {r0['loss']}")
 

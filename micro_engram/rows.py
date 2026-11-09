@@ -104,6 +104,8 @@ class _RowLookup(torch.autograd.Function):
         ctx.save_for_backward(inv, order, table, local)
         ctx.sc, ctx.rc, ctx.info, ctx.n_uniq = sc, rc, info, uniq.numel()
         ctx.shapes = [(s.shape, s.dtype) for s in shards]
+        # sparse row gradients (RowTables(sparse_grads=True)): the shards themselves, to add to
+        ctx.shards = shards if any(getattr(s, "_sparse_rows", False) for s in shards) else None
         return emb[inv]
 
     @staticmethod
@@ -121,10 +123,28 @@ class _RowLookup(torch.autograd.Function):
                 grads.append(None)
                 continue
             sel = (table == k).nonzero().squeeze(1)
+            if ctx.shards is not None and getattr(ctx.shards[k], "_sparse_rows", False):
+                # only the touched rows (fp32), kept on the shard; no full-size gradient
+                add_sparse_grad(ctx.shards[k], local[sel], g_req[sel].div_(world))
+                grads.append(None)
+                continue
             g = torch.zeros(shape, dtype=torch.float32, device=grad.device)
             g.index_add_(0, local[sel], g_req[sel])
             grads.append(g.div_(world).to(dtype))  # FSDP averages gradients across ranks
         return (None, None, *grads)
+
+
+def add_sparse_grad(p, rows, g):
+    """Add gradient rows `g` [n, dim] (fp32) for local rows `rows` to p.sparse_grad, kept
+    coalesced: (unique rows, their summed gradients). Repeated n-grams merge, so the size is
+    bounded by the rows the step touched."""
+    cur = getattr(p, "sparse_grad", None)
+    if cur is not None:
+        rows, g = torch.cat([cur[0], rows]), torch.cat([cur[1], g])
+    u, inv = torch.unique(rows, return_inverse=True)
+    acc = torch.zeros(u.numel(), g.shape[1], dtype=torch.float32, device=g.device)
+    acc.index_add_(0, inv, g.float())
+    p.sparse_grad = (u, acc)
 
 
 def row_lookup(engram, idx):
@@ -164,10 +184,18 @@ class RowTables:
     """
 
     def __init__(self, entries, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, lazy=False,
-                 rowwise=False, stochastic_rounding=True):
+                 rowwise=False, stochastic_rounding=True, sparse_grads=False):
+        """sparse_grads (lazy optimizers only): the backward keeps only the touched rows' gradients
+        (p.sparse_grad) instead of a full-size gradient per table shard."""
         self.entries = entries
         self.world = dist_rank_world()[1]
         train = [p for _, e in entries for p in e.row_shards if p.requires_grad]
+        if sparse_grads and not lazy:
+            raise ValueError("sparse row gradients need a lazy optimizer (lazy_adam / rowwise_adam): "
+                             "plain AdamW updates every row every step")
+        self.sparse = bool(sparse_grads)
+        for p in train:
+            p._sparse_rows = self.sparse
         self.optimizer = LazyAdamW([{"params": train, "lazy": lazy, "rowwise": rowwise}], lr=lr, betas=betas,
                                    eps=eps, weight_decay=weight_decay,
                                    stochastic_rounding=stochastic_rounding) if train else None
@@ -187,6 +215,9 @@ class RowTables:
         for p in ps:
             if p.grad is not None:
                 sq += p.grad.float().pow(2).sum()
+            sg = getattr(p, "sparse_grad", None)
+            if sg is not None:
+                sq += sg[1].pow(2).sum()  # rows are unique: exact
         if self.world > 1:
             dist.all_reduce(sq, group=_group(self.world))
         norm = sq.sqrt()
@@ -195,6 +226,9 @@ class RowTables:
             for p in ps:
                 if p.grad is not None:
                     p.grad.mul_(coef.to(p.grad.dtype))
+                sg = getattr(p, "sparse_grad", None)
+                if sg is not None:
+                    sg[1].mul_(coef)
         self.last_grad_norm = float(norm)
         return self.last_grad_norm
 
@@ -204,7 +238,13 @@ class RowTables:
         for g in self.optimizer.param_groups:
             g["lr"] = lr
         self.optimizer.step()
-        self.optimizer.zero_grad(set_to_none=True)
+        self.zero_grad()
+
+    def zero_grad(self):
+        if self.optimizer is not None:
+            self.optimizer.zero_grad(set_to_none=True)
+        for p in self.params():
+            p.sparse_grad = None
 
     # --- checkpoints (collective: every rank calls these) ---
     def _table_items(self, frozen_too=False):

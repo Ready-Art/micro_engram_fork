@@ -34,6 +34,7 @@ How it differs from the Axolotl plugin:
 | loss over gradient accumulation | Axolotl turns token weighting off for Gemma 4 (a mean of micro-batch means) | per-token mean over the whole step (all micro-batches, all GPUs) |
 | the token after a packed document's last token | trained as a target | not a target (it belongs to the next document) |
 | activation offloading | TRL hooks | layer inputs of checkpointed layers go to a reused pinned-memory pool |
+| table gradients | a full-size gradient per table shard (~4 GB per GPU for 2 big bf16 engrams) | with `lazy_adam` / `rowwise_adam`: only the touched rows, coalesced, in fp32 (`sparse_row_grads: true`, the default). Same results as dense (`test_train.py`) |
 
 The loss is not bit-identical to Axolotl's, because of the last two rows. Expect it to be very close at step 1.
 
