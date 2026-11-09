@@ -35,8 +35,10 @@ class VocabShard:
             device=device, dtype=dtype or weight.dtype).clone()
         self.embed_scale = embed_scale
         self.softcap = softcap
-        # tokens per chunk: world * chunk logits [world*c, rows] in fp32 stay under chunk_bytes
-        fit = max(64, chunk_bytes // max(1, world * max(self.rows, 1) * 4))
+        # tokens per chunk: world * chunk logits [world*c, rows] in fp32 stay under chunk_bytes.
+        # From `per` (rows rounded up), NOT this rank's rows: the last rank can hold fewer rows,
+        # and every rank must run the same chunks or the collectives deadlock
+        fit = max(64, chunk_bytes // max(1, world * self.per * 4))
         self.chunk = max(1, min(chunk_tokens, fit))
 
     @property

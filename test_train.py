@@ -152,6 +152,12 @@ def test_data(root, model_dir, data):
     flat = [tuple(x) for r in mb for m in r for x in m]
     check("ranks and micro-batches get distinct bins", len(flat) == len(set(flat)) == 4)
 
+    from micro_engram.train.head import VocabShard
+
+    W = torch.zeros(262_144, 8)
+    chunks = {VocabShard(W, r, 5).chunk for r in range(5)}  # 52,429 rows on ranks 0-3, 52,428 on rank 4
+    check("vocab shards: same loss chunk on every rank, also with an uneven split", len(chunks) == 1, chunks)
+
     for bad, why in (({"adapter": "qlora"}, "adapter"), ({"lora_r": 1}, "lora_r"),
                      ({"unfrozen_parameters": [".+x"]}, "unfrozen"), ({"no_such_key": 1}, "unknown")):
         try:
