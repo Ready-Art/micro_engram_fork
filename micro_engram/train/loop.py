@@ -313,7 +313,7 @@ class Trainer:
             from tqdm import tqdm
 
             self.pbar = tqdm(total=self.total_steps, initial=self.global_step, dynamic_ncols=True, unit="step",
-                             bar_format="{percentage:3.0f}% {n}/{total} [{elapsed}<{remaining}, {rate_inv_fmt}]")
+                             bar_format="{percentage:3.0f}%|{bar}| {n}/{total} [{elapsed}<{remaining}, {rate_inv_fmt}]")
         while self.global_step < self.total_steps:
             n_ep = self.plan.steps_per_epoch(self.epoch)
             if self.step_in_epoch >= n_ep:
@@ -333,11 +333,10 @@ class Trainer:
                 self.pbar.update(1)
                 ppl = logs["ppl"]
                 stats = (f"loss {logs['loss']:.4f}  ppl {ppl:.0f}" if ppl >= 100 else
-                         f"loss {logs['loss']:.4f}  ppl {ppl:.2f}") + \
-                    f"  lr {logs['learning_rate']:.1e}  ep {self.epoch}"
-                # stats first: a narrow terminal cuts the bar at the end, not the numbers
-                self.pbar.bar_format = ("{percentage:3.0f}% {n}/{total} [{elapsed}<{remaining}, {rate_inv_fmt}]  "
-                                        + stats.replace("{", "{{").replace("}", "}}"))
+                         f"loss {logs['loss']:.4f}  ppl {ppl:.2f}")
+                # lr / epoch are in the JSON line above; the bar shrinks to fit, the numbers stay
+                self.pbar.bar_format = ("{percentage:3.0f}%|{bar}| {n}/{total} [{elapsed}<{remaining}, "
+                                        "{rate_inv_fmt}]  " + stats)
                 self.pbar.refresh()
             if self.global_step % cfg.logging_steps == 0 or self.global_step == self.total_steps:
                 dt = time.time() - t_last
