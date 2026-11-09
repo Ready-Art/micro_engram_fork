@@ -25,6 +25,7 @@ _LARGE_HEAD_MIN_DIM = 256
 _POLICY = "sdpa"
 _PACKED: bool | None = None
 _SDPA_ORIG_ATTR = "_axolotl_large_head_sdpa_original"
+_WARNED = False
 
 
 def set_large_head_policy(policy: str | None) -> None:
@@ -90,7 +91,12 @@ def flash_d512_route(module, query, key, value, scaling, position_ids, policy=No
         v = value.repeat_interleave(ng, dim=1) if ng > 1 else value
         out = flash_d512(query, k, v, True, position_ids=pid, scale=scaling)
         return out.transpose(1, 2).contiguous(), None
-    except Exception:  # pragma: no cover - any kernel issue falls back to SDPA
+    except Exception as e:  # pragma: no cover - any kernel issue falls back to SDPA
+        global _WARNED
+        if not _WARNED:  # micro_engram: say so once instead of silently running the slow path
+            _WARNED = True
+            LOG.warning("[micro_engram] Triton head_dim>256 flash kernel failed, packed rows fall back to "
+                        "masked SDPA: %s: %s", type(e).__name__, e)
         return None
 
 

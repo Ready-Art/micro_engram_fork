@@ -295,6 +295,13 @@ def worker(rank, world, port, root, model_dir, data, q):
     res["sparse_same"] = all(torch.allclose(a[k], b[k], atol=1e-6) for k in a) and \
         all(abs(x - y) < 1e-5 * max(1, abs(y)) for x, y in zip(na, nb))
     res["sparse_norms"] = na
+    # 9. (last: patches transformers for this process) hybrid attention, packed rows: the global
+    # layers get no model mask and build the block mask themselves; loss == the plain reference
+    th = _trainer({**cfg, "output_dir": os.path.join(root, "run_h"), "gemma4_hybrid_attn_impl": True})
+    hb = [th._micro_batch(b) for b in th.plan.micro_batches(0, 0, rank)]
+    res["multi_doc"] = any(int((b["position_ids"] == 0).sum()) > b["position_ids"].shape[0] for b in hb)
+    res["hybrid_loss"] = th.train_step(th.plan.micro_batches(0, 0, rank))["loss"]
+    del th
     q.put((rank, res))
     dist.destroy_process_group()
 
@@ -325,6 +332,11 @@ def main():
               all(res[r]["prefix_same"] for r in res) and r0["prefix_nonzero"])
         check("save -> resume -> next step identical to the uninterrupted run",
               all(res[r]["resume_same"] for r in res) and r0["resume_step"] == 1)
+        check("hybrid attention: global layers isolate packed documents themselves (loss == reference)",
+              r0["multi_doc"] and abs(r0["hybrid_loss"] - r0["ref_loss"]) < 2e-2 * r0["ref_loss"],
+              f"{r0['hybrid_loss']} vs {r0['ref_loss']}, multi-doc {r0['multi_doc']}")
+        check("hybrid attention gives the same loss as plain SDPA", abs(r0["hybrid_loss"] - r0["loss"]) < 1e-4,
+              f"{r0['hybrid_loss']} vs {r0['loss']}")
         check("sparse row gradients: same tables and table grad norms as dense ones (3 steps, clipped)",
               all(res[r]["sparse_same"] for r in res) and r0["sparse_flag1"] and not r0["sparse_flag0"]
               and all(n and n > 0 for n in r0["sparse_norms"]), r0["sparse_norms"])

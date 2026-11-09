@@ -41,7 +41,7 @@ The loss is not bit-identical to Axolotl's, because of the last two rows. Expect
 Kept from Axolotl (copied in `micro_engram/train/vendor/`, Apache-2.0):
 - Gemma 4 fused q/k/v-norm + RoPE kernel (`fused_attn_kernel`, on by default as in Axolotl)
 - `gemma4_hybrid_attn_impl` (FA2 sliding layers + packing-aware SDPA on the 512-dim global layers)
-- the head_dim-512 Triton flash kernel (`large_head_attention: auto|triton_flash`)
+- the head_dim-512 Triton flash kernel (`large_head_attention: auto`). The global layers get no mask from the model and decide per call: one-document rows use SDPA's plain causal path, and rows with several packed documents use the Triton kernel (varlen, built from position_ids). Without the kernel (`large_head_attention` unset), they build the block-diagonal mask themselves. Turn the kernel on for chat SFT (stage 2), where nearly every row holds several conversations
 - the FSDP2 + bitsandbytes 4-bit parameter patch
 
 The Liger RMSNorm/GEGLU kernels are applied when `liger_rms_norm` / `liger_glu_activation` is set.

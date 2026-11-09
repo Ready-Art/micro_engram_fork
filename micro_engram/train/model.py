@@ -37,11 +37,35 @@ def apply_kernel_patches(cfg, on_cuda):
         # S x S block mask on single-document rows too: SDPA then can't skip the causal triangle,
         # ~2x the work on the 512-dim global layers (34% of the step in the stage-1 profile).
         set_large_head_packed(None)
-        done.append(f"hybrid attention (large-head policy {cfg.large_head_policy})")
+        _global_layers_unmasked()
+        done.append(f"hybrid attention (global layers: {'Triton flash for packed rows' if cfg.large_head_policy != 'sdpa' else 'block mask for packed rows'}, causal SDPA otherwise)")
     if (cfg.liger_rms_norm or cfg.liger_glu_activation) and on_cuda:
         done += _apply_liger(cfg)
     if done:
         LOG.warning(f"[micro_engram] kernels: {', '.join(done)}")
+
+
+def _global_layers_unmasked():
+    """The global (full-attention) layers get no mask from the model: their attention function
+    (vendor.gemma4_hybrid_mask's sdpa_global_packed) checks each call whether the rows hold
+    several documents and then uses the Triton head_dim-512 flash kernel (varlen, from
+    position_ids; large_head_attention: auto), or else builds the block-diagonal mask itself;
+    one-document rows take SDPA's plain causal path. The sliding-window mask is untouched."""
+    from transformers.models.gemma4 import modeling_gemma4 as mg
+
+    cur = mg.create_causal_mask
+    if getattr(cur, "_me_unmasked", False):
+        return
+
+    def create_causal_mask(config, *args, **kwargs):
+        if kwargs.get("and_mask_function") is not None:  # a sliding-window mask built through this
+            return cur(config, *args, **kwargs)
+        if kwargs.get("past_key_values") is not None:  # generation (not training): keep the real mask
+            return cur(config, *args, **kwargs)
+        return None
+
+    create_causal_mask._me_unmasked = True
+    mg.create_causal_mask = create_causal_mask
 
 
 def _apply_liger(cfg):
