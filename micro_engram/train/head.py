@@ -156,7 +156,8 @@ class _VocabParallelCE(torch.autograd.Function):
             dH = (p.to(w.dtype) @ w).float()                       # [world*n, d], this GPU's vocab part
             if world > 1:
                 out = torch.empty(n, shard.d, dtype=torch.float32, device=dH.device)
-                dist.reduce_scatter_tensor(out, dH, group=group)
+                scatter = getattr(dist, "reduce_scatter_single", None) or dist.reduce_scatter_tensor  # renamed
+                scatter(out, dH, group=group)
             else:
                 out = dH
             grad[a:b] = out.to(grad.dtype)
