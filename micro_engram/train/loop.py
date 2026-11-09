@@ -312,8 +312,8 @@ class Trainer:
         if self.rank == 0:
             from tqdm import tqdm
 
-            self.pbar = tqdm(total=self.total_steps, initial=self.global_step, desc="train", dynamic_ncols=True,
-                             unit="step")
+            self.pbar = tqdm(total=self.total_steps, initial=self.global_step, dynamic_ncols=True, unit="step",
+                             bar_format="{percentage:3.0f}% {n}/{total} [{elapsed}<{remaining}, {rate_inv_fmt}]")
         while self.global_step < self.total_steps:
             n_ep = self.plan.steps_per_epoch(self.epoch)
             if self.step_in_epoch >= n_ep:
@@ -331,8 +331,14 @@ class Trainer:
             toks += logs.pop("tokens")
             if self.pbar is not None:
                 self.pbar.update(1)
-                self.pbar.set_postfix(loss=f"{logs['loss']:.4f}", ppl=f"{logs['ppl']:.1f}",
-                                      lr=f"{logs['learning_rate']:.2e}", epoch=self.epoch, refresh=True)
+                ppl = logs["ppl"]
+                stats = (f"loss {logs['loss']:.4f}  ppl {ppl:.0f}" if ppl >= 100 else
+                         f"loss {logs['loss']:.4f}  ppl {ppl:.2f}") + \
+                    f"  lr {logs['learning_rate']:.1e}  ep {self.epoch}"
+                # stats first: a narrow terminal cuts the bar at the end, not the numbers
+                self.pbar.bar_format = ("{percentage:3.0f}% {n}/{total} [{elapsed}<{remaining}, {rate_inv_fmt}]  "
+                                        + stats.replace("{", "{{").replace("}", "}}"))
+                self.pbar.refresh()
             if self.global_step % cfg.logging_steps == 0 or self.global_step == self.total_steps:
                 dt = time.time() - t_last
                 logs.update(self._memory())
