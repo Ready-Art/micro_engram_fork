@@ -1,0 +1,19 @@
+# micro_engram.train (training). An existing Axolotl venv already has all of this.
+# Install torch first, built for your CUDA (https://pytorch.org), then:  pip install -r requirements.txt
+torch>=2.10            # FSDP2 fully_shard with ignored_params; tested on 2.13 (server) and 2.15 (CPU tests)
+transformers>=5.5      # Gemma 4 (Gemma4TextModel, gemma4 masks); tested on 5.22
+bitsandbytes>=0.45     # load_in_4bit (NF4 base)
+pydantic>=2
+pyyaml
+numpy
+safetensors
+tqdm
+datasets               # axolotl_prepared_dataset, engram_data_stats.py
+wandb                  # wandb_project (optional: leave wandb_project unset to skip it)
+
+# Optional, compiled / GPU-only: install the way your setup needs
+# flash-attn           # attn_implementation: flash_attention_2 (Gemma 4 sliding layers)
+# liger-kernel         # liger_rms_norm / liger_glu_activation
+# triton               # comes with torch on Linux; used by the Gemma 4 kernels in micro_engram/train/vendor
+
+# Serving with vLLM needs vLLM at the pinned commit instead (see README, "Serving with vLLM").

@@ -10,7 +10,6 @@ import os
 import socket
 import sys
 import tempfile
-import types
 
 import torch
 import torch.distributed as dist
@@ -280,60 +279,6 @@ def worker(rank, world, port, tmp):
         sd = load_engram_weights(ffolder, layer=3)
         check("FSDP2 + rows: saved key.weight is the full matrix, q_scale the scale",
               torch.equal(sd["key.weight"], full.key.weight) and torch.allclose(sd["q_scale"], torch.full((D,), 1.25)))
-
-    # 9. plugin glue: optimizer step through the Trainer's callbacks, checkpoint save + resume
-    for name in ("axolotl", "axolotl.integrations", "axolotl.integrations.base"):
-        sys.modules.setdefault(name, types.ModuleType(name))
-    sys.modules["axolotl.integrations.base"].BasePlugin = type("BasePlugin", (), {"__init__": lambda self: None})
-    from micro_engram.plugin import _install_row_sharding, _Slot
-
-    eg = sharded_copy(full, rank, world)
-    main_opt = torch.optim.SGD([eg.key.weight], lr=0.02)
-    main_opt.param_groups[0]["initial_lr"] = 0.04  # the scheduler is at half the base LR
-    calls = []
-
-    class FakeTrainer:
-        def __init__(self):
-            self.args = types.SimpleNamespace(learning_rate=1e-2, adam_beta1=0.9, adam_beta2=0.999, adam_epsilon=1e-8,
-                                              weight_decay=0.0, max_grad_norm=1.0, output_dir=tmp)
-            self.optimizer = main_opt
-
-        def save_model(self, output_dir=None, _internal_call=False):
-            calls.append(("save", output_dir))
-
-        def _load_optimizer_and_scheduler(self, checkpoint):
-            calls.append(("load", checkpoint))
-
-    tr = FakeTrainer()
-    finals = []
-    cb = _install_row_sharding(tr, [_Slot(spec={"layer": 3}, engram=eg, where="model.layers.3")], True, finals.append)
-    check("plugin: installing twice returns the same callback",
-          _install_row_sharding(tr, [], True, finals.append) is cb)
-    before = [p.detach().clone() for p in eg.row_shards]
-    eg(h, ids).pow(2).sum().backward()
-    st = types.SimpleNamespace(is_world_process_zero=rank == 0, global_step=1)
-    cb.on_pre_optimizer_step(tr.args, st, None)
-    cb.on_optimizer_step(tr.args, st, None)
-    lr_used = cb.rows.optimizer.param_groups[0]["lr"]
-    check(f"plugin: table LR follows the schedule (base 1e-2 x 0.02/0.04 = {lr_used:g})", abs(lr_used - 5e-3) < 1e-12)
-    check("plugin: tables stepped, gradients cleared, grad norm recorded",
-          any(not torch.equal(a, b) for a, b in zip(before, eg.row_shards))
-          and all(p.grad is None for p in eg.row_shards) and cb.rows.last_grad_norm > 0)
-    ck = os.path.join(tmp, "run", "checkpoint-5")
-    tr.save_model(ck, _internal_call=True)
-    dist.barrier()
-    check("plugin: a checkpoint save writes micro_engram_rows/ and its optimizer state (after the model)",
-          calls[0] == ("save", ck) and os.path.isfile(os.path.join(ck, ROWS_DIR, ".metadata"))
-          and os.path.isfile(os.path.join(ck, ROWS_OPTIM_DIR, ".metadata")))
-    trained = [p.detach().clone() for p in eg.row_shards]
-    with torch.no_grad():
-        for p in eg.row_shards:
-            p.zero_()
-    tr._load_optimizer_and_scheduler(ck)
-    check("plugin: resume reads the rows back", all(torch.equal(a, b) for a, b in zip(trained, eg.row_shards)))
-    cb.on_train_end(tr.args, st, None)
-    check("plugin: train end saves the final engram and writes the config (rank 0)",
-          os.path.isfile(os.path.join(tmp, ROWS_DIR, ".metadata")) and finals == ([tmp] if rank == 0 else []))
 
     with open(os.path.join(tmp, f"rank{rank}.json"), "w") as f:
         json.dump(res, f)

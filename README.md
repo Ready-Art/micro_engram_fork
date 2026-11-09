@@ -1,131 +1,163 @@
 # micro-engram
 
-An [Axolotl](https://github.com/axolotl-ai-cloud/axolotl) plugin that adds a small **hashed n-gram memory** (Engram-style) to the residual stream of a decoder model. It was built for and tested on Gemma 4 (31B).
+A small **hashed n-gram memory** (Engram-style) added to the residual stream of a frozen decoder model, with its own trainer. Built for and tested on Gemma 4 (31B).
 
-At each position `t`, the module looks up the 2-grams and 3-grams that **end** at `t` (so it stays causal) in a set of hashed embedding tables. A learned gate decides how much of that memory goes into the hidden state after one decoder layer. Some details:
+At each position `t`, the module looks up the 2-, 3- (and optionally 4-) grams that **end** at `t` (so it stays causal) in hashed embedding tables. A learned gate decides how much of that memory goes into the hidden state after one decoder layer.
 
-- **No data pipeline changes.** Hashes are computed directly from `input_ids`.
+- **No data pipeline changes.** Hashes are computed directly from the token ids.
 - **Sample packing works.** `position_ids` stop n-grams from crossing document boundaries.
 - **It starts as an exact no-op.** The output projection is zero-initialised, so step 0 behaves exactly like the base model.
-- **It works with FSDP2.** The engram lives inside one decoder layer, so it is sharded, offloaded, checkpointed and auto-resumed together with that layer.
 - **Token merging is optional.** A "canon" map can merge token variants (e.g. `▁The` / `▁the`) so they share table rows.
-
----
-
-## Training without Axolotl: `micro_engram.train` (new)
-
-The repo has its own trainer: plain PyTorch + FSDP2, with no HF Trainer, Accelerate or PEFT. It reads the same YAML keys, so an existing Axolotl config works after you **delete** these lines:
-- `adapter`, `lora_*`, `unfrozen_parameters`: a 4-bit base loads directly, with no placeholder LoRA, and only the engram is trainable. These keys are now an error.
-- `plugins`
-
-```bash
-torchrun --nproc_per_node 5 -m micro_engram.train stage1.yaml
-```
-
-How it differs from the Axolotl plugin:
-
-| | Axolotl plugin | `micro_engram.train` |
-|---|---|---|
-| 4-bit base | rank-1 placeholder QLoRA + `unfrozen_parameters` | `load_in_4bit: true`, nothing else |
-| embedding / lm_head (tied, ~2.7 GiB) | whole on every GPU (FSDP root) | rows split over the GPUs; the loss is vocab-parallel and chunked, so full logits never exist (`sharded_vocab`, `loss_chunk_tokens`) |
-| layers before the first *trained* engram | forward + backward | forward only, no autograd (`no_grad_prefix: true`). With a frozen layer-0 engram and a layer-29 one in training, about half of the backward is skipped |
-| engram tables | `micro_engram_sharding: rows` | always row-sharded |
-| engram key/value/scales | inside FSDP | replicated, gradients all-reduced (they are small) |
-| loss over gradient accumulation | Axolotl turns token weighting off for Gemma 4 (a mean of micro-batch means) | per-token mean over the whole step (all micro-batches, all GPUs) |
-| the token after a packed document's last token | trained as a target | not a target (it belongs to the next document) |
-| activation offloading | TRL hooks | layer inputs of checkpointed layers go to a reused pinned-memory pool |
-| table gradients | a full-size gradient per table shard (~4 GB per GPU for 2 big bf16 engrams) | with `lazy_adam` / `rowwise_adam`: only the touched rows, coalesced, in fp32 (`sparse_row_grads: true`, the default). Same results as dense (`test_train.py`) |
-
-The loss is not bit-identical to Axolotl's, because of the last two rows. Expect it to be very close at step 1.
-
-Kept from Axolotl (copied in `micro_engram/train/vendor/`, Apache-2.0):
-- Gemma 4 fused q/k/v-norm + RoPE kernel (`fused_attn_kernel`, on by default as in Axolotl)
-- `gemma4_hybrid_attn_impl` (FA2 sliding layers + packing-aware SDPA on the 512-dim global layers)
-- the head_dim-512 Triton flash kernel (`large_head_attention: auto`). The global layers get no mask from the model and decide per call: one-document rows use SDPA's plain causal path, and rows with several packed documents use the Triton kernel (varlen, built from position_ids). Without the kernel (`large_head_attention` unset), they build the block-diagonal mask themselves. Turn the kernel on for chat SFT (stage 2), where nearly every row holds several conversations
-- the FSDP2 + bitsandbytes 4-bit parameter patch
-
-The Liger RMSNorm/GEGLU kernels are applied when `liger_rms_norm` / `liger_glu_activation` is set.
-
-Data:
-- `type: completion` follows Axolotl's rules (chunks of `sequence_len`, EOS appended when the text is shorter than `sequence_len*64`).
-- `type: chat_template` renders with `chat_template_jinja` + `chat_template_kwargs` and trains each assistant turn's content plus its `eot_tokens`. The role header and anything after the end-of-turn token are not trained.
-- Tokenized data is cached in `dataset_prepared_path/micro_engram-<hash>/`.
-- `axolotl_prepared_dataset: <folder>` reads an existing Axolotl prepared dataset as-is, for an exact data match.
-- Every epoch the samples are reshuffled and repacked (seed + epoch).
-
-Checkpoints use the same layout as before, so vLLM, llama.cpp, `assemble_engram_model.py`, `engram_stats.py` and `init_from` read them unchanged:
-- `checkpoint-N/micro_engram_rows/` holds the complete engram, `micro_engram_rows_optim/` the tables' Adam state, and `micro_engram_config.json` the settings.
-- Each checkpoint also gets the dense optimizer + scheduler state and `trainer_state.json`, which is written last.
-- `auto_resume_from_checkpoints` picks up the newest complete checkpoint, and the data order continues exactly where it stopped.
-- To continue from an *Axolotl* checkpoint, use `micro_engram_init_from`.
-
-Logs go to stdout, `output_dir/train_log.jsonl` and wandb. Each line has loss, `grad_norm` (dense), `table_grad_norm`, lr, s/step, trained tokens/s, the peak VRAM per GPU, and the engram stats.
-
-Not supported: LoRA/adapters, eval split, `fsdp_config.activation_checkpointing` (use `gradient_checkpointing`), non-Gemma-style tied heads.
-
-Tested on CPU only (`test_train.py`: 2 processes on a tiny Gemma 4). It checks:
-- the first-step loss against a plain HF forward
-- that the no-grad prefix gives the same gradients
-- that save → resume gives the same next step
-- cpu_ram_efficient_loading
-- that checkpoints load through the usual loaders
-
-**Not yet run on GPUs.**
+- **Serving:** vLLM plugin, an HF server, and a llama.cpp patch (see below).
 
 ---
 
 ## Installation
 
-Install into the **same Python environment as Axolotl**:
-
 ```bash
 git clone https://github.com/som1tokmynam/micro_engram.git
 cd micro_engram
-pip install -e .
+pip install -r requirements.txt     # training; skip what your environment already has
+pip install -e . --no-deps          # registers micro_engram (+ the vLLM plugin entry point)
+python -c "import micro_engram.train.loop; print('ok')"
 ```
 
-To check that it worked:
-
-```bash
-python -c "from micro_engram import MicroEngramPlugin; print('ok')"
-```
-
-Requirements: `torch`, `transformers`, `axolotl` and `accelerate`, all of which an Axolotl install already provides. `safetensors` and `datasets` are only used by the helper scripts.
+`requirements.txt` lists what training needs: torch, transformers with Gemma 4, bitsandbytes (4-bit base), flash-attn (FA2 sliding layers), liger-kernel (optional kernels), datasets (`axolotl_prepared_dataset`), wandb, pydantic, pyyaml, tqdm, safetensors. An existing Axolotl venv already has all of it. Serving with vLLM needs vLLM (pinned commit, see *Serving with vLLM*), not these.
 
 ---
 
-## Usage
+## Training: `micro_engram.train`
 
-### 1. Register the plugin
+Plain PyTorch + FSDP2 (no HF Trainer, Accelerate or PEFT). One YAML, launched with torchrun:
 
-```yaml
-plugins:
-  - micro_engram.MicroEngramPlugin
+```bash
+torchrun --nproc_per_node 5 -m micro_engram.train stage1.yaml
 ```
 
-> Without `pip install`: if you clone the repo into the folder you launch Axolotl from, use `micro_engram.micro_engram.MicroEngramPlugin` instead (repo folder → package folder). Don't mix the two: once the package is pip-installed, only `micro_engram.MicroEngramPlugin` works.
+The key names follow the Axolotl configs this project used before, so an old config works after deleting `adapter`, `lora_*`, `unfrozen_parameters` (now errors: a 4-bit base loads directly and only the engram trains) and `plugins`. Axolotl-only keys (`strict`, `bf16`, `save_safetensors`, ...) are listed in one warning and ignored; any other unknown key is an error.
 
-### 2. Configure the engram
+### Example (Gemma 4 31B, 5x RTX 3090)
+
+```yaml
+base_model: /path/to/G4-31B
+load_in_4bit: true                       # NF4 base, no adapter
+sequence_len: 8192
+
+datasets:
+  - path: /path/to/pretraining.jsonl
+    type: completion                     # or chat_template (see Data)
+dataset_prepared_path: /path/to/prepared
+# axolotl_prepared_dataset: /path/to/axolotl/prepared/<hash>   # reuse Axolotl's tokenized data as-is
+
+output_dir: /path/to/output
+auto_resume_from_checkpoints: true
+save_steps: 36
+save_total_limit: 20
+
+# --- engram ---
+micro_engram_layer: 0
+micro_engram_extra:
+  - layer: 29
+micro_engram_table_size: 2097152
+micro_engram_table_sizes: {2: 1572864, 3: 4194304, 4: 4194304}
+micro_engram_dim: 64
+micro_engram_heads: 8
+micro_engram_gate: scalar_sqrt
+micro_engram_dtype: bf16                 # + stochastic rounding (default on)
+micro_engram_optimizer: rowwise_adam
+micro_engram_canon_path: /path/to/canon_paper.pt
+micro_engram_stats_steps: 20
+
+# --- schedule ---
+micro_batch_size: 1
+gradient_accumulation_steps: 3
+num_epochs: 5
+learning_rate: 5e-3                      # the tables
+micro_engram_dense_lr: 1e-3              # key/value, gates, norm scales (default: learning_rate)
+micro_engram_lr_epoch_decay: 0.5         # warmup, then x0.5 every epoch (or lr_scheduler: ...)
+warmup_ratio: 0.05
+max_grad_norm: 2.0
+weight_decay: 0.0
+
+# --- speed / memory ---
+gradient_checkpointing: true
+gradient_checkpointing_kwargs: {use_reentrant: false}
+activation_offloading: true
+gemma4_hybrid_attn_impl: true            # FA2 on the sliding layers, see Attention
+attn_implementation: flash_attention_2
+large_head_attention: auto               # Triton flash for packed rows on the 512-dim global layers
+liger_rms_norm: true
+liger_glu_activation: true
+tf32: true
+fsdp_config:
+  offload_params: false
+  reshard_after_forward: true
+
+wandb_project: my-project
+logging_steps: 1
+seed: 42
+```
+
+Measured on 5x RTX 3090 with the layout above (stage 1, both engrams training): ~70 s/step and 16.9 GiB peak, against ~110 s/step and ~20.7 GiB with the old Axolotl plugin.
+
+### What runs where (per GPU)
+
+| Part | How |
+|---|---|
+| base model | frozen; FSDP2 per decoder layer, bf16 or bitsandbytes NF4 (`load_in_4bit`); `fsdp_config.offload_params` moves it to CPU; `cpu_ram_efficient_loading` loads it on rank 0 only (bf16) |
+| embedding / output head (tied, ~2.7 GiB) | rows split over the GPUs, outside FSDP. The loss is vocab-parallel and chunked (Gemma's final softcap included): full logits never exist. `loss_chunk_tokens` caps the chunk |
+| engram tables | row-sharded: each GPU keeps its share of the rows and fetches the rows a batch uses from their owners (all_to_all). Own optimizer and clipping |
+| table gradients | with `lazy_adam` / `rowwise_adam`, only the touched rows (fp32, coalesced) instead of a full-size gradient per table (`sparse_row_grads: true`, the default) |
+| engram key/value/gates/scales | replicated on every GPU, outside FSDP, gradients all-reduced (they are small) |
+| layers before the first trained engram | forward only, no autograd (`no_grad_prefix: true`) |
+| loss over gradient accumulation | per-token mean over the whole step: all micro-batches, all GPUs |
+| activation checkpointing | per-layer non-reentrant, as HF's `gradient_checkpointing` (FSDP's own `activation_checkpointing` is refused) |
+| activation offloading | the checkpointed layers' inputs go to a reused pinned-memory pool, copied on a side stream |
+
+### Attention (Gemma 4)
+
+Gemma 4 has 512-dim "global" layers that FA2 can't run, and SDPA has no packing support (it needs an S×S block mask, and then computes the whole square). With `gemma4_hybrid_attn_impl`, the sliding layers run FA2 (varlen, from `position_ids`), and the global layers decide per call:
+
+| row | global layers |
+|---|---|
+| one document (padding continues its positions) | SDPA causal, no mask |
+| several packed documents | `large_head_attention: auto`: the Triton head_dim-512 flash kernel (varlen); unset: the block-diagonal mask |
+
+Use `auto` for chat SFT, where nearly every row holds several conversations. If the Triton kernel fails, one warning is logged and those rows use the mask. The kernels are vendored from Axolotl 0.19.0 (Apache-2.0) in `micro_engram/train/vendor/`: fused q/k/v-norm + RoPE (`fused_attn_kernel`, on by default), the hybrid mask, the head_dim-512 flash kernel, and the FSDP2 patch for bitsandbytes 4-bit parameters.
+
+### Data
+
+- `type: completion`: Axolotl's rules: the text is cut at `sequence_len*64` tokens, EOS appended when shorter, split into `sequence_len` chunks; every token is trained. Gemma 4's tokenizer adds no `<bos>`, so put a literal `<bos>` at the start of each line.
+- `type: chat_template`: rendered with `chat_template_jinja` + `chat_template_kwargs`; trains each assistant turn's content plus its `eot_tokens`, not the role header nor what follows the end-of-turn token. `field_messages`, `message_property_mappings` and `roles` work as in Axolotl. Conversations longer than `sequence_len` are dropped.
+- Tokenized data is cached in `dataset_prepared_path/micro_engram-<hash>/` (rank 0 tokenizes, `dataset_num_proc` processes).
+- `axolotl_prepared_dataset: <folder>` reads an Axolotl prepared dataset instead. `compare_axolotl_data.py cfg.yaml <folder>` compares our tokens and masks with it.
+- Packing: every epoch the samples are reshuffled (seed + epoch) and packed into `sequence_len` bins; `position_ids` restart per document.
+
+### Settings
 
 | Key | Default | Meaning |
 |---|---|---|
 | `micro_engram_layer` | `0` | Inject the memory into the output of this decoder layer (0-indexed: `0` = after the first block, the Engram paper's best single placement) |
 | `micro_engram_table_size` | `65536` | Rows per hash table |
-| `micro_engram_table_sizes` | unset | Rows per table **for each n-gram order**, overriding `micro_engram_table_size`, e.g. `{2: 1048576, 3: 3145728}`. An order set to `0` or `null` is not used; an order not listed keeps `micro_engram_table_size` (orders 2 and 3), so `{4: 1048576}` **adds 4-grams**. See [Table sizes per n-gram order](#table-sizes-per-n-gram-order) |
+| `micro_engram_table_sizes` | unset | Rows per table **for each n-gram order**, overriding `micro_engram_table_size`, e.g. `{2: 1048576, 3: 3145728}`. `0`/`null` drops an order; an order not listed keeps `micro_engram_table_size` (orders 2 and 3), so `{4: N}` **adds 4-grams** |
 | `micro_engram_dim` | `128` | Width of each table row |
-| `micro_engram_heads` | `4` | Hash tables per n-gram order (orders 2 and 3 give `2 × heads` tables in total) |
-| `micro_engram_save_steps` | `250` | Non-FSDP only: also save `micro_engram-step{N}.pt` every N steps (`0` = save only at the end) |
+| `micro_engram_heads` | `4` | Hash tables per n-gram order |
 | `micro_engram_canon_path` | `null` | Token-merge map from `build_canon.py`. `null` turns merging off |
-| `micro_engram_save_trainable_only` | `false` | FSDP2 only: checkpoints hold only the trainable weights (the engram, ~0.5–3 GB) instead of the whole model. Resuming reads them back and takes the frozen weights from `base_model`. See *Outputs* |
-| `micro_engram_gate` | `scalar` | How the memory is mixed in: `scalar` (the paper's sigmoid gate), `scalar_sqrt` (DeepSeek's released code: signed-sqrt gate with learnable norm scales, recommended for new runs) or `ple` (a Gemma 3n PLE-style per-dimension gate). See below |
-| `micro_engram_dtype` | unset | Engram weight dtype. Unset: same as its layer (bf16). `fp32`: fp32 master weights, so Adam's small steps don't round away in bf16 (matters most late in training, at low LR); costs ~2x the engram's share of memory (weights, gradients, Adam state). Under FSDP2 the compute stays bf16. FSDP2 only needs one dtype among the *trainable* params of a unit, so this works inside a frozen bf16 or 4-bit layer (checked on PyTorch 2.15; older versions may differ, the train-start log states the dtype). Without a 4-bit base, recent Accelerate versions may already upcast trainable params to fp32 on their own |
-| `micro_engram_optimizer` | unset | Unset: Axolotl's `optimizer`. `lazy_adam`: AdamW, except that a table row whose gradient is zero this step is left exactly as it is (no drift from leftover momentum), like `SparseAdam` but on ordinary gradients, so it works with FSDP2 (rows are sharded, each GPU decides for its own rows). Other trainable params (key/value/scales) use plain AdamW. Uses `learning_rate`, `adam_beta1/2`, `adam_epsilon`, `weight_decay`; the YAML `optimizer` is ignored. Same memory and speed as AdamW: it changes how rarely-seen rows learn, not the cost. State names match AdamW, so you can switch on resume. `rowwise_adam` (needs `micro_engram_sharding: rows`): see [Row-wise Adam](#row-wise-adam-rowwise_adam) |
-| `micro_engram_stochastic_rounding` | `true` | With bf16 engram weights: the optimizer (`lazy_adam`, `rowwise_adam`, row-sharded tables) writes bf16 weights and states back with stochastic rounding, so updates smaller than half a bf16 step add up on average. Plain rounding loses them at a low LR, or rounds them up to a full step (`test_optim.py`: -100% and +36% vs fp32 at LR 2.5e-5 and 6.25e-5; stochastic rounding within 1%). No effect in fp32 |
-| `micro_engram_sharding` | unset | `rows`: the tables are split by rows across the GPUs, outside FSDP, and a batch fetches only the rows it uses. See [Row-sharded tables](#row-sharded-tables). Needs FSDP |
-| `micro_engram_lr_epoch_decay` | `null` | LR schedule: linear warmup (`warmup_ratio`/`warmup_steps` as usual), then the LR is multiplied by this factor at the start of every epoch (`0.5` = halve each epoch). Replaces `lr_scheduler` / `lr_scheduler_kwargs`. Epoch boundaries come from the step count, and resume continues the curve |
-| `micro_engram_stats_steps` | `10` | Every N steps, add engram stats to the training log line (output-weight size, table RMS and share of rows trained per n-gram order, gate mean and saturation). `0` = off. See *Watching training* |
+| `micro_engram_gate` | `scalar` | `scalar` (the paper), `scalar_sqrt` (DeepSeek's code, recommended) or `ple` (Gemma 3n style). See *Gate modes* |
+| `micro_engram_dtype` | unset | Engram weights: unset = its layer's dtype (bf16); `fp32` doubles the engram's memory (weights, gradients, momentum) |
+| `micro_engram_stochastic_rounding` | `true` | bf16 weights and optimizer states written back with stochastic rounding, so updates smaller than half a bf16 step add up on average (`test_optim.py`) |
+| `micro_engram_optimizer` | unset | Tables: unset = AdamW (every row every step, dense gradients); `lazy_adam` = a row moves only when its n-gram appears (like SparseAdam); `rowwise_adam` = lazy + one fp32 second moment per row (half the optimizer state; FBGEMM/TorchRec style). See *Row-wise Adam* |
+| `learning_rate` | `1e-3` | The tables' LR (and everything's, without `micro_engram_dense_lr`). Hashed rows only learn when their n-gram shows up, so they want a high LR |
+| `micro_engram_dense_lr` | `learning_rate` | LR of key/value, gates and norm scales, which learn on every token. Same schedule as the tables. Logged as `dense_lr` |
+| `micro_engram_lr_epoch_decay` | `null` | Warmup, then LR x this factor at every epoch start (replaces `lr_scheduler`). Otherwise `lr_scheduler`: `constant`, `constant_with_warmup`, `cosine` (+`cosine_min_lr_ratio`), `linear`, `warmup_stable_decay` (+`lr_scheduler_kwargs`) |
+| `micro_engram_stats_steps` | `10` | Every N steps, engram stats in the log line (see *Watching training*) |
+| `micro_engram_init_from` / `micro_engram_frozen` / `micro_engram_seed` / `micro_engram_extra` | | Several engrams, starting from trained ones (see below) |
+| `no_grad_prefix` | `true` | Layers before the first trained engram run without autograd |
+| `sparse_row_grads` | `true` | Sparse table gradients with lazy optimizers |
+| `loss_chunk_tokens` | `2048` | Cap on tokens per loss chunk (auto-shrunk to ~256 MB of logits) |
+| `profile_step` | unset | Profile that step: `output_dir/profile/rank0_step<N>.txt` (top kernels) and `.json` (timeline for https://ui.perfetto.dev) |
 
-The engram has `orders × heads × table_size × dim` table parameters (2 orders by default; with `micro_engram_table_sizes`, `heads × dim ×` the sum of the sizes) plus two `(orders·heads·dim) × hidden_size` projections. With the settings below on Gemma 4 31B, that is about 268M table parameters and 11M projection parameters.
+The engram has `heads × dim ×` (sum of the per-order rows) table parameters plus two `(orders·heads·dim) × hidden_size` projections.
 
 #### Table sizes per n-gram order
 
@@ -154,197 +186,51 @@ All modes use the same tables and start as an exact no-op. `scalar` and `ple` ha
 
 The gate mode is saved in `micro_engram_config.json`, and `infer_engram.py` picks it up automatically. Checkpoints from before this option are `scalar`.
 
-### 3. Make it trainable
-
-**Full-model freeze (recommended).** List the engram in `unfrozen_parameters`. The optional wrapper part of the regex is needed because gradient checkpointing renames the layer:
-
-```yaml
-unfrozen_parameters:
-  - 'model.language_model.layers.0.(_checkpoint_wrapped_module.)?micro_engram..*'
-```
-
-Change the `0` if you change `micro_engram_layer`. You can add other patterns too, for example selected embedding rows.
-
-If you set **neither** `unfrozen_parameters` **nor** `adapter`, the plugin freezes the whole model and trains only the engram on its own.
-
-### 4. Settings it needs
-
-```yaml
-gradient_checkpointing: true
-gradient_checkpointing_kwargs:
-  use_reentrant: false   # required: with reentrant checkpointing and frozen inputs the engram gets no gradients
-
-sample_packing: true     # supported, as long as position_ids restart at 0 per document (Axolotl's default)
-```
-
-Hashed tables usually want a **higher learning rate** than normal fine-tuning (we use `1e-3`) and `weight_decay: 0.0`.
-
 ### Several engrams, and starting from a trained one
 
-Each engram sits in its own decoder layer. The settings above describe the main engram; `micro_engram_extra` adds more. Any engram can start from trained weights (`init_from`) and can be kept frozen (`frozen`):
+Each engram sits in its own decoder layer. `micro_engram_extra` adds more. Any engram can start from trained weights (`init_from`) and can be kept frozen (`frozen`):
 
 | Setting (main engram / in `micro_engram_extra`) | Meaning |
 |---|---|
-| `micro_engram_init_from` / `init_from` | Start from a trained engram: an output folder (its newest complete checkpoint is used), a `checkpoint-N` folder, a `micro_engram_config.json`, or the weights themselves (DCP folder, `.pt`, `.safetensors`). With a config, the engram is rebuilt exactly as trained (sizes, gate, **seed**); the YAML can't change those |
-| `micro_engram_frozen` / `frozen` | Load it but don't train it (needs `init_from`). A frozen engram costs only its weights, not gradients or optimizer state |
-| `micro_engram_seed` / `seed` | Hash seed. Default `10007 × layer` (DeepSeek's scheme), so each layer hashes n-grams to different rows; layer 0 keeps seed 0, as before |
+| `micro_engram_init_from` / `init_from` | Start from a trained engram: an output folder (its newest complete checkpoint), a `checkpoint-N` folder, a `micro_engram_config.json`, or the weights themselves (DCP folder, `.pt`, `.safetensors`). Old Axolotl checkpoints (`pytorch_model_fsdp_0`) work too. With a config, the engram is rebuilt exactly as trained (sizes, gate, **seed**); the YAML can't change those |
+| `micro_engram_frozen` / `frozen` | Load it but don't train it (needs `init_from`). A frozen engram costs only its weights |
+| `micro_engram_seed` / `seed` | Hash seed. Default `10007 × layer` (DeepSeek's scheme); layer 0 keeps seed 0 |
 | `layer`, `table_size`, `table_sizes`, `dim`, `heads`, `gate` (extra only) | `layer` is required (one engram per layer); the others default to the main engram's |
 
-Second engram at mid depth, after the layer-0 one has finished training:
+Stage 2 (SFT) from stage 1, both engrams training: `micro_engram_init_from: /path/to/stage1_output` with the same `micro_engram_extra`, and `init_from` on the extra too. A frozen layer-0 engram with only a deeper one training also makes the no-grad prefix skip everything up to that layer.
 
-```yaml
-micro_engram_layer: 0
-micro_engram_init_from: /path/to/first_run_output   # its newest checkpoint
-micro_engram_frozen: true
-micro_engram_extra:
-  - layer: 29          # pick one right after a global-attention layer (see layer_types in config.json)
-    gate: scalar_sqrt
-unfrozen_parameters:
-  - '.+micro_engram'   # matches both; the plugin re-freezes the frozen one before training
-```
-
-Both at once: leave out `init_from`/`frozen`. Fine-tuning a 4-bit-trained engram on the bf16 base for a short final stretch: `micro_engram_init_from` without `frozen`.
-
-Every checkpoint's `micro_engram_config.json` lists all engrams under `"engrams"`, each with its own `weights`: a trained one points to that checkpoint, a frozen one to the files it was loaded from (it is not in trainable-only checkpoints). The first engram is also written at the top level, so older loaders still see it. `infer_engram.py`, `serve_engram.py`, the vLLM plugin, `assemble_engram_model.py` and `engram_stats.py` load all of them. The training log uses `engram_L<layer>/...` keys when there is more than one.
-
-### Row-sharded tables
-
-```yaml
-micro_engram_sharding: rows
-```
-
-Without it, FSDP2 also splits each table across the GPUs, but before every use it gathers the **whole** table onto every GPU (in the forward, and again in the backward with activation checkpointing). It also builds a full-size gradient and reduce-scatters it, even though a batch only uses a few thousand rows. For a 2×1M-row engram that is ~1 GiB per gather, and the gradient buffer stays in VRAM until the next layer's reduce-scatter.
-
-With `rows`, each GPU keeps only its own share of the rows (1/number of GPUs), on the GPU, outside FSDP:
-
-- **Forward:** each GPU sends the row numbers its batch needs to the GPUs that own them, and gets just those rows back (`all_to_all`, a few MB per micro-batch). Rows used several times are sent once.
-- **Backward:** the gradients of those rows go back to their owners, which add up every GPU's share and divide by the number of GPUs, exactly as FSDP averages gradients.
-- **Memory:** the table costs 1/GPUs of its size plus its Adam state (also 1/GPUs), with no full-table gather or gradient buffer. So a bigger table is cheap.
-- **Optimizer:** the tables get their own AdamW (lazy AdamW with `micro_engram_optimizer: lazy_adam`, partial row-wise Adam with `rowwise_adam`), stepped right after the Trainer's. It uses `learning_rate`, `adam_beta1/2`, `adam_epsilon` and `weight_decay`, and follows the Trainer's LR schedule (warmup, decay, `micro_engram_lr_epoch_decay`). Key/value/scales stay in FSDP with Axolotl's `optimizer`.
-- **Gradient clipping:** the tables are clipped on their own to `max_grad_norm`. The Trainer's `grad_norm` no longer includes them, so their norm is logged as `engram/table_grad_norm`.
-- **Checkpoints:** each checkpoint gets `micro_engram_rows/` (the **complete** engram: tables, key/value, scales, buffers, under the usual names) and `micro_engram_rows_optim/` (the tables' Adam state). Both are written before `trainer_state.json`, so a checkpoint that counts as complete has them. The checkpoint's `micro_engram_config.json` points to `micro_engram_rows`, so vLLM, llama.cpp, `assemble_engram_model.py`, `engram_stats.py` and `init_from` read it like any checkpoint. At the end of training it is also written to `output_dir/micro_engram_rows`.
-- **Resume:** the rows come back from `micro_engram_rows/`, re-split if the number of GPUs changed. A checkpoint from a run *without* row sharding also works: the tables are read from `pytorch_model_fsdp_0`, but the tables' Adam state starts over (logged).
-- **Frozen engrams** are row-sharded too (no full-table gathers at all), and aren't saved (their config points to their source, as before).
-
-The results are the same as without sharding. `test_rows.py` checks this with 3 processes: same output, same gradients (also with activation checkpointing and FSDP2), same tables after training steps, the same clipping norm, and save/load/resume including a different GPU count.
-
-Notes:
-- `offload_params` doesn't move the tables to the CPU (they aren't FSDP's), so they stay on the GPU.
-- Stats (`rows_learned`, ...) come from rank 0's rows, as before with FSDP shards.
+Every checkpoint's `micro_engram_config.json` lists all engrams under `"engrams"`, each with its own `weights` (a frozen one points to the files it was loaded from). The first engram is also written at the top level for older loaders.
 
 #### Row-wise Adam (`rowwise_adam`)
 
-```yaml
-micro_engram_sharding: rows
-micro_engram_optimizer: rowwise_adam
-```
+For the tables only: lazy row updates, and **one second moment per row** instead of one per value: the running mean of the row's g². This is "partial row-wise Adam" as FBGEMM/TorchRec use for big embedding tables. The momentum stays per value. The tables' optimizer state drops from 2× to ~1× their size.
 
-For the tables only: lazy row updates (as `lazy_adam`), and **one second moment per row** instead of one per value: the running mean of the row's g². This is "partial row-wise Adam" as FBGEMM/TorchRec use for big embedding tables. The momentum stays per value. The tables' optimizer state drops from 2× to ~1× their size. For example, a 2M-row fp32 engram pair on 5 GPUs goes from ~6.9 GB to ~5.2 GB per GPU (weights + gradients + state).
-
-- The second moment is always fp32, also with bf16 weights. In bf16, `v = 0.999·v + 0.001·g²` changes by less than bf16's precision, so `v` can never decay and only moves up on big gradient spikes. With a constant gradient it gets stuck low (steps ~1.8× too large, shown in `test_optim.py`). With noisy, shrinking or sparse gradients, which is what engram rows get, it gets stuck high: steps come out ~0.6–0.9× of the correct size, like a lower learning rate. Plain AdamW on bf16 weights keeps its state in bf16 too, so this applies to bf16 engram runs with any per-value Adam.
+- The second moment is always fp32, also with bf16 weights. In bf16, `v = 0.999·v + 0.001·g²` changes by less than bf16's precision, so `v` can never decay (shown in `test_optim.py`); with the noisy, sparse gradients engram rows get, steps come out ~0.6–0.9× of the correct size.
 - It equals AdamW whenever a row's gradient values have the same size, and approximates it otherwise.
-- Key/value/scales keep the YAML `optimizer`.
-- Resume works across `lazy_adam` ↔ `rowwise_adam`: per value → per row is exact (the row mean), per row → per value copies the row's value.
+- Resume works across `lazy_adam` ↔ `rowwise_adam`.
 
-### Training on a 4-bit base (NF4, experimental)
+### Checkpoints, resume, output
 
-The frozen base can be loaded in 4-bit (bitsandbytes NF4, as in QLoRA) while the engram trains in bf16. Gemma 4 31B drops from ~62 GB to ~17 GB, so FSDP no longer needs `offload_params` and training gets much faster, with room for bigger tables. The engram is still served on the normal bf16 base.
-
-Axolotl only loads a 4-bit base for `adapter: qlora`, so the config uses a **placeholder LoRA**: rank 1 on one module. LoRA starts as an exact no-op (its B matrix is zero), and `unfrozen_parameters` keeps it frozen, so it stays a no-op and only the engram trains:
-
-```yaml
-base_model: /path/to/bf16/model        # quantized on the fly; serve the engram on this same folder
-load_in_4bit: true
-adapter: qlora
-lora_r: 1
-lora_alpha: 1
-lora_dropout: 0.0
-lora_target_modules:
-  - model.language_model.layers.59.self_attn.o_proj   # any single module; it stays frozen at zero
-
-unfrozen_parameters:
-  - '.+micro_engram'     # PEFT renames everything to base_model.model...; '.+' is a wildcard here
-
-fsdp_config:
-  offload_params: false              # the point of 4-bit
-  cpu_ram_efficient_loading: false   # Axolotl rejects true with FSDP2 + 4-bit
-micro_engram_save_trainable_only: true
-```
-
-Notes:
-- **Change the `unfrozen_parameters` pattern.** The old `model.language_model.layers.0...` pattern matches nothing under PEFT (Axolotl matches from the start of the name), so the engram would stay frozen. The plugin logs an error at train start if that happens, and a warning if anything besides the engram is training (e.g. the LoRA).
-- Don't set a PEFT init option (`peft_init_lora_weights` / PiSSA / OLoRA etc.): only the default init starts the LoRA at exactly zero.
-- Checkpoints: with an adapter, the Trainer saves FSDP checkpoints "adapter only", which in Accelerate means only the LoRA, so the engram would be missing (a ~100 KB `pytorch_model_fsdp_0`). The plugin patches this: checkpoints hold every trainable weight (the engram), and resume reads it back. Check the size of the first checkpoint: about 0.5 GB per 274M-parameter engram in bf16.
-- Don't merge the LoRA; it is zero. The engram is in the checkpoint as usual (`assemble_engram_model.py`, vLLM `--additional-config`).
-- The engram learns against the 4-bit model's hidden states and is served on bf16 ones. Like QLoRA adapters this is usually fine, but measure it: `eval_logprob.py` on the bf16 base, engram on vs off.
-- Tested on CPU only (`test_quant.py`: real bitsandbytes NF4 layers plus a PEFT LoRA). Not yet run on GPUs with FSDP2.
-
-### Full example (Gemma 4 31B, FSDP2)
-
-```yaml
-base_model: /path/to/gemma-4-31B
-sequence_len: 8192
-sample_packing: true
-pad_to_sequence_len: true
-
-# --- micro-engram ---
-micro_engram_layer: 0
-micro_engram_table_size: 262144
-micro_engram_dim: 128
-micro_engram_heads: 4
-micro_engram_canon_path: /path/to/canon.pt   # optional, from build_canon.py --paper
-
-unfrozen_parameters:
-  - 'model.language_model.layers.0.(_checkpoint_wrapped_module.)?micro_engram..*'
-
-learning_rate: 1e-3
-lr_scheduler: constant_with_warmup
-warmup_ratio: 0.05
-weight_decay: 0.0
-optimizer: adamw_torch_fused
-max_grad_norm: 2.0
-
-gradient_checkpointing: true
-gradient_checkpointing_kwargs:
-  use_reentrant: false
-
-plugins:
-  - axolotl.integrations.cut_cross_entropy.CutCrossEntropyPlugin
-  - micro_engram.MicroEngramPlugin
-
-fsdp_version: 2
-fsdp_config:
-  offload_params: true
-  auto_wrap_policy: TRANSFORMER_BASED_WRAP
-  transformer_layer_cls_to_wrap: Gemma4TextDecoderLayer
-  state_dict_type: SHARDED_STATE_DICT
-  reshard_after_forward: true
-```
-
----
-
-## Outputs
-
-During training, the plugin writes `micro_engram_config.json` (layer, table size, dim, heads, vocab and canon info) to `output_dir` and to every `checkpoint-N/` folder. **Keep this file with the weights**, because inference reads it.
-
-**Without FSDP**, the engram is saved separately as `output_dir/micro_engram.pt`, plus `micro_engram-step{N}.pt` every `micro_engram_save_steps` steps.
-
-**With FSDP**, the engram is part of the normal checkpoint. Merge the sharded checkpoint as usual (e.g. `axolotl merge-sharded-fsdp-weights`). You can then either use the merged model directly, or pull out only the engram:
-
-```bash
-python extract_engram.py /path/to/merged_model micro_engram.pt
-```
-
-**Smaller checkpoints:** with `micro_engram_save_trainable_only: true` (FSDP2), each checkpoint holds only the trainable weights instead of the whole model, e.g. ~0.5 GB of engram instead of ~62 GB for Gemma 4 31B. Resuming works the same way, and older full checkpoints still resume. The checkpoint is then **not a servable model**: build one with `assemble_engram_model.py`, which links the base weights and adds the engram (no merge step, no copy of the base):
+- `checkpoint-N/micro_engram_rows/`: the complete engram (tables, key/value, scales, buffers) as a DCP folder; `micro_engram_rows_optim/`: the tables' Adam state; `micro_engram_dense_optim.pt`: the dense optimizer + scheduler; `micro_engram_config.json`; `trainer_state.json`, written last (it marks the checkpoint complete).
+- `output_dir/micro_engram_config.json` always points to the newest checkpoint, so `output_dir` can be served directly. At the end, the engram is also written to `output_dir/micro_engram_rows/`.
+- `auto_resume_from_checkpoints` continues from the newest complete checkpoint: same data order, optimizer state and LR schedule. The YAML's LRs win over the checkpoint's, so they can be changed when resuming. The GPU count may change (rows are resharded).
+- vLLM (`--additional-config`), llama.cpp (`gguf_add_engram.py`), `assemble_engram_model.py`, `engram_stats.py` and `init_from` all read these checkpoints.
+- If a GPU fails, it prints its traceback and VRAM and exits; torchrun stops the others (no silent hang).
 
 ```bash
 python assemble_engram_model.py --base /path/to/base_model \
-    --engram /path/to/output/checkpoint-400/pytorch_model_fsdp_0 --out /path/to/base_model-engram
+    --engram /path/to/output/checkpoint-400/micro_engram_rows --out /path/to/base_model-engram
 ```
 
-`--engram` also takes a merged safetensors folder or a `.pt` file. The output folder works with vLLM (plugin) and with `serve_engram.py` / `infer_engram.py`.
+### Logs
 
-**Resuming** (`auto_resume_from_checkpoints: true`) is handled. The plugin patches Accelerate's FSDP state-dict loading so the engram weights are restored even with the checkpoint wrapper. If the canon file in your YAML differs from the one the checkpoint was trained with, resume **fails on purpose**, because otherwise the run would silently train on different hashes.
+stdout and `output_dir/train_log.jsonl` (and wandb with `wandb_project`), one JSON line per logged step: `loss`, `ppl`, `grad_norm` (dense part), `table_grad_norm`, `learning_rate` (tables), `dense_lr`, peak VRAM per GPU, `s_per_step`, trained tokens/s, and every `micro_engram_stats_steps` the engram stats. A progress bar on rank 0 shows loss and ppl.
+
+### Not supported
+
+LoRA/adapters (the base is frozen), an eval split, `fsdp_config.activation_checkpointing`, models whose output head is not tied to the embedding.
+
+The Axolotl plugin this project started as was removed after the new trainer matched it on GPUs; `git checkout axolotl-plugin-final` has its last version.
 
 ---
 
@@ -460,7 +346,7 @@ Not yet tested on a GPU or with the real 31B model.
 
 ## Watching training
 
-With `micro_engram_stats_steps` (default every 10 steps) the training log line gets `engram/...` entries, which also reach wandb/tensorboard:
+With `micro_engram_stats_steps` (default every 10 steps) the training log line gets `engram/...` entries (`engram_L<layer>/...` with several engrams), which also reach wandb:
 
 | Entry | Meaning | What to look for |
 |---|---|---|
@@ -471,7 +357,7 @@ With `micro_engram_stats_steps` (default every 10 steps) the training log line g
 | `engram/gate_saturated` | share of tokens with gate > 0.99 | high values mean an on/off gate that learns slowly |
 | `engram/q_scale_mean`, `k_scale_mean` | learnable norm scales (`scalar_sqrt`) | start at 1; drifting shows the gate tuning its sharpness |
 
-Under FSDP the numbers come from rank 0's shard of each weight, a random sample of rows, so no extra communication is needed.
+The table numbers come from rank 0's share of the rows, a random sample, so no extra communication is needed. `rows_learned` uses a rule-of-thumb threshold (1.5x the starting RMS), so it stays near 0 early in training even while rows are moving.
 
 For a run that started without this option (or to look at past checkpoints), `engram_stats.py` reads the same weight stats from the checkpoints on disk without stopping training.
 
@@ -482,17 +368,15 @@ For a run that started without this option (or to look at past checkpoints), `en
 Run them from the repo root:
 
 ```bash
-python test_train.py                          # micro_engram.train: data, config, loss vs HF, no-grad prefix, resume, meta loading (2 procs)
+python test_train.py                          # micro_engram.train (2 procs): data, config, loss vs HF, no-grad prefix, resume, sparse grads, dense LR, hybrid attention, meta loading
 python test_gate.py                           # all gate modes: no-op start, gradients, bf16, checkpoint names; weight stats
 python test_canon.py                          # token-merge hashing and state-dict compatibility
 python test_optim.py                          # lazy_adam / rowwise_adam: vs AdamW, unused rows untouched, bf16 second-moment freeze, FSDP2 + state save/load
 python test_rows.py                           # micro_engram_sharding: rows, 3 processes: == full tables (forward, gradients, training, clipping), save/resume/reshard
 python test_token_diff.py                     # engram_token_diff.py against a fake vLLM server
 python test_render_chat.py                    # render_chat.py: formats, template override, fixed sampling
-python test_resume_keys.py                    # checkpoint-wrapper key renaming on resume
 python test_vllm_ids.py                       # vLLM path: previous tokens per batch type, same output as training
 python test_vllm_tp.py                        # vLLM tables split over TP GPUs: == full tables, loading (file and checkpoint), with vLLM stand-ins
-python test_quant.py                          # 4-bit (NF4) base + placeholder QLoRA: dtype, freezing pattern, gradients (needs bitsandbytes, peft)
 python test_multi.py                          # several engrams, init_from + frozen, config, inference == training, assemble, stats (needs transformers)
 python llama_cpp/test/compare.py --llama-cpp <patched llama.cpp> --driver <engram_logits>   # llama.cpp patch vs PyTorch (needs a build; see the file)
 ```
@@ -502,5 +386,5 @@ python llama_cpp/test/compare.py --llama-cpp <patched llama.cpp> --driver <engra
 ## Notes / limitations
 
 - It is tested on Gemma 4 only. Other decoders should work as long as `find_text_layers` finds the text decoder `ModuleList` (it prefers a `*.language_model.*layers` path and skips vision/audio towers).
-- The n-gram orders are fixed at (2, 3).
+- N-gram orders: 2 and 3 by default; 4-grams via `micro_engram_table_sizes`.
 - Hash multipliers are rebuilt from a fixed seed, so they are identical in every run and are not loaded from checkpoints.

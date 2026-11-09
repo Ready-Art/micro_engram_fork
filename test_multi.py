@@ -1,12 +1,12 @@
 """
 Several engrams, init_from and frozen, on CPU:  python test_multi.py
-(needs transformers; Axolotl is stubbed, so this runs outside the training venv too)
 
-Run A trains one engram at layer 0 and saves a checkpoint like FSDP does (DCP folder +
-micro_engram_config.json). Run B loads it FROZEN and adds a new engram at layer 2.
-Then: the config lists both, inference with both matches training, the frozen one
-stays frozen even when unfrozen_parameters matches it, assemble_engram_model.py writes
-both, and engram_stats.py reports the trained one.
+Engrams are set up the way micro_engram.train does it (runconfig.engram_requests +
+build_slot). Run A trains one engram at layer 0 and saves a checkpoint like the old
+Axolotl/FSDP runs did (DCP folder + micro_engram_config.json), which init_from must keep
+reading. Run B loads it FROZEN and adds a new engram at layer 2. Then: the config lists
+both, inference with both matches training, the frozen one stays frozen,
+assemble_engram_model.py writes both, and engram_stats.py reports the trained one.
 """
 import json
 import os
@@ -19,21 +19,13 @@ import types
 import torch
 import torch.nn as nn
 
-# --- stub Axolotl (only BasePlugin is imported) -----------------------------------------
-_ax = types.ModuleType("axolotl")
-_integ = types.ModuleType("axolotl.integrations")
-_base = types.ModuleType("axolotl.integrations.base")
-_base.BasePlugin = type("BasePlugin", (), {"__init__": lambda self: None})
-sys.modules.setdefault("axolotl", _ax)
-sys.modules.setdefault("axolotl.integrations", _integ)
-sys.modules.setdefault("axolotl.integrations.base", _base)
+import logging  # noqa: E402
 
 import torch.distributed.checkpoint as dcp  # noqa: E402
 
-from infer_engram import EngramRunner  # noqa: E402
 from micro_engram.module import MicroEngram  # noqa: E402
-from micro_engram.plugin import (MicroEngramPlugin, _WriteConfigCallback,  # noqa: E402
-                                 build_config)
+from micro_engram.runconfig import (_params, build_config, build_slot, engram_requests,  # noqa: E402
+                                    write_config)
 from micro_engram.weights import (engram_layers_in, engram_specs, load_engram_weights,  # noqa: E402
                                   resolve_engram_source)
 
@@ -73,15 +65,48 @@ class Toy(nn.Module):
 
 
 class DictDefault(dict):
-    """Like Axolotl's DictDefault: every missing attribute is None (so hasattr() is always True)."""
+    """A mapping that answers every missing attribute with None (engram_requests must not use hasattr)."""
 
     def __getattr__(self, name):
         return self.get(name)
 
 
 class Cfg(types.SimpleNamespace):
-    def __getattr__(self, name):  # unset settings are None, like Axolotl's DictDefault
+    def __getattr__(self, name):  # unset settings are None
         return None
+
+
+class _Grab(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.msgs = []
+
+    def emit(self, record):
+        self.msgs.append(record.getMessage())
+
+
+grab = _Grab()
+logging.getLogger("micro_engram").addHandler(grab)
+
+
+class Setup:
+    """Engram setup as micro_engram.train does it: build every requested engram, freeze the
+    base, train only the engrams that aren't frozen."""
+
+    def __init__(self):
+        self.slots, self.base_conf = [], None
+
+    def post_model_load(self, c, model):
+        self.slots = [build_slot(spec, init_from, frozen, model, model.config, None, dtype=c.micro_engram_dtype,
+                                 sharding=c.micro_engram_sharding)
+                      for spec, init_from, frozen in engram_requests(c)]
+        for p in model.parameters():
+            p.requires_grad_(False)
+        for s_ in self.slots:
+            for p in _params(s_.engram):
+                p.requires_grad_(not s_.frozen)
+        self.base_conf = {"model_dim": D, "vocab_size": V, "canon_path": None, "base_model": None,
+                          "base_fingerprint": None}
 
 
 def cfg(**kw):
@@ -92,7 +117,7 @@ def cfg(**kw):
     return Cfg(**base)
 
 
-def fake_checkpoint(model, plugin, out_dir, step):
+def fake_checkpoint(model, setup, out_dir, step):
     """What an FSDP2 trainable-only save leaves: DCP of the trainable weights + config."""
     ckpt = os.path.join(out_dir, f"checkpoint-{step}")
     # through state_dict(), as FSDP's get_model_state_dict does (it writes the scales, not their deltas)
@@ -101,27 +126,18 @@ def fake_checkpoint(model, plugin, out_dir, step):
     keep |= {n for n, _ in model.named_buffers() if "micro_engram" in n}
     sd = {k: v.detach().clone() for k, v in full.items() if k in keep}
     dcp.save(sd, checkpoint_id=os.path.join(ckpt, "pytorch_model_fsdp_0"), no_dist=True)
-    cb = _WriteConfigCallback(plugin.base_conf, plugin.slots, "pytorch_model_fsdp_0")
-    state = types.SimpleNamespace(is_world_process_zero=True, global_step=step)
-    cb.on_train_begin(types.SimpleNamespace(output_dir=out_dir), state, None)
-    cb.on_save(types.SimpleNamespace(output_dir=out_dir), state, None)
+    write_config(build_config(setup.base_conf, setup.slots, lambda s_: "pytorch_model_fsdp_0"), ckpt)
+    write_config(build_config(setup.base_conf, setup.slots, lambda s_: f"checkpoint-{step}/pytorch_model_fsdp_0"),
+                 out_dir)
     open(os.path.join(ckpt, "trainer_state.json"), "w").write("{}")
     return ckpt
-
-
-def axolotl_unfreeze(model, pattern):  # utils/freeze.py: dots literal unless followed by '+'
-    import re
-    rx = re.compile(re.sub(r"\.(?!\+)", "\\.", pattern))
-    for n, p in model.named_parameters():
-        p.requires_grad = bool(rx.match(n))
 
 
 # ----------------------------------------------------------------------------- run A
 run_a = os.path.join(TMP, "runA")
 model_a = Toy()
-plug_a = MicroEngramPlugin()
-plug_a.post_model_load(cfg(unfrozen_parameters=[".+micro_engram"]), model_a)
-axolotl_unfreeze(model_a, ".+micro_engram")
+plug_a = Setup()
+plug_a.post_model_load(cfg(), model_a)
 eng_a = plug_a.slots[0].engram
 with torch.no_grad():  # "training"
     eng_a.value.weight.normal_(std=0.05)
@@ -145,10 +161,10 @@ check("init_from an output_dir picks the newest COMPLETE checkpoint",
 # ----------------------------------------------------------------------------- run B
 run_b = os.path.join(TMP, "runB")
 model_b = Toy()
-plug_b = MicroEngramPlugin()
-cfg_b = cfg(unfrozen_parameters=[".+micro_engram"], micro_engram_init_from=run_a, micro_engram_frozen=True,
+plug_b = Setup()
+cfg_b = cfg(micro_engram_init_from=run_a, micro_engram_frozen=True,
             micro_engram_table_size=999,  # wrong on purpose: the trained engram's settings win
-            micro_engram_extra=[DictDefault(layer=2, gate="scalar")])  # as Axolotl passes it
+            micro_engram_extra=[DictDefault(layer=2, gate="scalar")])
 plug_b.post_model_load(cfg_b, model_b)
 e0, e2 = plug_b.slots[0].engram, plug_b.slots[1].engram
 check("run B: frozen layer-0 engram equals run A's (trained settings used, not the YAML's)",
@@ -158,9 +174,7 @@ check("run B: layer-2 engram is new, its own gate, seed 10007*2, starts as a no-
       e2.gate == "scalar" and plug_b.slots[1].spec["seed"] == 20014
       and not torch.equal(e2.mults, e0.mults) and e2.value.weight.abs().sum() == 0)
 
-axolotl_unfreeze(model_b, ".+micro_engram")  # Axolotl's freezing runs after post_model_load...
-plug_b.post_trainer_create(cfg_b, None)        # ...and the plugin re-freezes the frozen engram
-check("frozen engram stays frozen although '.+micro_engram' matches it; the new one trains",
+check("frozen engram stays frozen; the new one trains",
       not any(p.requires_grad for p in e0.parameters()) and all(p.requires_grad for p in e2.parameters()))
 
 ckpt_b = fake_checkpoint(model_b, plug_b, run_b, 5)
@@ -187,7 +201,7 @@ ckpt_b = fake_checkpoint(model_b, plug_b, run_b, 6)
 ids = torch.randint(5, V, (1, 12))
 model_b.eval()
 with torch.no_grad():
-    ref = model_b(input_ids=ids)  # training-time path: both engrams via the plugin hooks
+    ref = model_b(input_ids=ids)  # training-time path: both engrams via their forward hooks
 
 sys.argv = ["x"]
 from infer_engram import attach_planned, plan_engrams  # noqa: E402
@@ -242,145 +256,9 @@ lines = [ln for ln in r.stdout.splitlines() if ln.startswith("step")]
 check(f"engram_stats.py reports only the trained engram ({lines[-1] if lines else r.stderr[-200:]})",
       r.returncode == 0 and lines and all(" L2 " in ln for ln in lines))
 
-# ----------------------------------------------------------------------------- log callbacks
-import logging  # noqa: E402
-
-from micro_engram.plugin import _ReportTrainableCallback, _StatsCallback  # noqa: E402
-
-model_b.train()
-model_b(input_ids=ids)  # records gate stats
-logs = {"loss": 1.0}
-_StatsCallback(plug_b.slots, 10).on_log(None, types.SimpleNamespace(is_world_process_zero=True, global_step=10),
-                                        None, logs=logs)
-check("stats: per-engram keys (engram_L2/...), none for the frozen engram",
-      "engram_L2/out_abs_mean" in logs and "engram_L2/gate_mean" in logs
-      and not any(k.startswith("engram_L0/") or k.startswith("engram/") for k in logs))
-
-
-class _Grab(logging.Handler):
-    def __init__(self):
-        super().__init__()
-        self.msgs = []
-
-    def emit(self, record):
-        self.msgs.append(record.getMessage())
-
-
-grab = _Grab()
-logging.getLogger("micro_engram").addHandler(grab)
-_ReportTrainableCallback(plug_b.slots).on_train_begin(
-    None, types.SimpleNamespace(is_world_process_zero=True), None, model=model_b)
-report = " | ".join(grab.msgs)
-check("train-start report lists both engrams, the frozen one as frozen, and no errors",
-      "layer 0: 0.0M of" in report and "(frozen)" in report and "layer 2:" in report
-      and "FROZEN" not in report and "should be frozen" not in report)
-
-# ----------------------------------------------------------------------------- adapter checkpoints
-# With an adapter (placeholder QLoRA) the Trainer saves FSDP checkpoints adapter_only=True;
-# Accelerate then kept only the LoRA and the engram was lost (~100 KB checkpoints).
-try:
-    from peft import LoraConfig, get_peft_model
-    from accelerate.utils import fsdp_utils
-    from torch.distributed.checkpoint.state_dict import StateDictOptions
-    have_peft = True
-except ImportError as e:
-    print(f"   (adapter checkpoint checks skipped: {e})")
-    have_peft = False
-
-if have_peft:
-
-    def peft_with_engram():
-        m = get_peft_model(Toy(), LoraConfig(r=1, lora_alpha=1, target_modules=["model.language_model.layers.3.lin"]))
-        p = MicroEngramPlugin()
-        p.post_model_load(cfg(adapter="qlora", unfrozen_parameters=[".+micro_engram"]), m)
-        axolotl_unfreeze(m, ".+micro_engram")
-        return m, p.slots[0].engram
-
-    opts = StateDictOptions(full_state_dict=False)  # SHARDED_STATE_DICT, as in your runs
-    unpatched = fsdp_utils._get_model_state_dict  # the plugin installs the fix when it loads
-    pm, pe = peft_with_engram()
-    before = unpatched(pm, adapter_only=True, sd_options=opts)
-    check("reproduced: unpatched adapter_only checkpoint has the LoRA but no engram",
-          any("lora" in k for k in before) and not any("micro_engram" in k for k in before))
-
-    check("the plugin installs the fix itself on an adapter + FSDP run",
-          getattr(fsdp_utils._get_model_state_dict, "_micro_engram_patched", False))
-    after = fsdp_utils._get_model_state_dict(pm, adapter_only=True, sd_options=opts)
-    check("fixed: adapter_only checkpoint holds the engram, not the frozen LoRA",
-          any(k.endswith("micro_engram.tables.0.weight") for k in after)
-          and not any("lora" in k for k in after))
-
-    with torch.no_grad():
-        pe.value.weight.normal_(std=0.05)
-        pe.tables[0].weight.add_(0.5)
-        pe.q_scale.add_(0.25)  # stored as delta; files hold 1.25
-    ck = os.path.join(TMP, "adapter_ckpt")
-    dcp.save(fsdp_utils._get_model_state_dict(pm, adapter_only=True, sd_options=opts), checkpoint_id=ck, no_dist=True)
-    pm2, pe2 = peft_with_engram()  # fresh run resuming: same steps as load_fsdp_model
-    template = fsdp_utils._get_model_state_dict(pm2, adapter_only=True, sd_options=opts)
-    dcp.load(template, checkpoint_id=ck, no_dist=True)
-    fsdp_utils._set_model_state_dict(pm2, template, adapter_only=True, sd_options=opts)
-    check("resume from an adapter_only checkpoint restores the engram (scales too)",
-          torch.equal(pe2.tables[0].weight, pe.tables[0].weight) and torch.equal(pe2.value.weight, pe.value.weight)
-          and torch.allclose(pe2.q_scale, pe.q_scale)
-          and torch.allclose(load_engram_weights(ck, layer=0)["q_scale"], pe.q_scale + 1))
-    check("assemble/inference loaders read the engram from it (PEFT key prefix stripped)",
-          torch.equal(load_engram_weights(ck, layer=0)["value.weight"], pe.value.weight))
-
-# ----------------------------------------------------------------------------- 4-bit base + adapter resume
-# A 4-bit (bitsandbytes) base adds quant state (absmax, quant_map, ...) to its state dict;
-# those are not parameters, so ignore_frozen_params kept them and resume refused them.
-try:
-    import bitsandbytes as bnb
-except ImportError as e:
-    print(f"   (4-bit resume checks skipped: {e})")
-    bnb = None
-
-if have_peft and bnb is not None:
-    def peft_4bit_with_engram():
-        base = Toy()
-        q = bnb.nn.Linear4bit(D, D, bias=True, compute_dtype=torch.float32, quant_type="nf4")
-        q.weight = bnb.nn.Params4bit(base.model.language_model.layers[1].lin.weight.data.clone(),
-                                     requires_grad=False, quant_type="nf4")
-        q.bias = base.model.language_model.layers[1].lin.bias
-        base.model.language_model.layers[1].lin = q
-        base = base.to("cpu")  # quantizes
-        m = get_peft_model(base, LoraConfig(r=1, lora_alpha=1, target_modules=["model.language_model.layers.3.lin"]))
-        p = MicroEngramPlugin()
-        p.post_model_load(cfg(adapter="qlora", unfrozen_parameters=[".+micro_engram"]), m)
-        axolotl_unfreeze(m, ".+micro_engram")
-        return m, p.slots[0].engram
-
-    qm, qe = peft_4bit_with_engram()
-    from torch.distributed.checkpoint.state_dict import get_model_state_dict  # noqa: E402
-
-    old_style = get_model_state_dict(qm, options=StateDictOptions(full_state_dict=False, ignore_frozen_params=True))
-    check("reproduced: the first fix also saved bitsandbytes quant state (absmax, quant_map)",
-          any(k.endswith(".absmax") for k in old_style))
-    new_style = fsdp_utils._get_model_state_dict(qm, adapter_only=True, sd_options=opts)
-    check("now: checkpoint holds only the engram, no quant state",
-          new_style and all("micro_engram" in k for k in new_style))
-
-    with torch.no_grad():
-        qe.value.weight.normal_(std=0.05)
-        qe.tables[2].weight.add_(0.5)
-    old_ck = os.path.join(TMP, "old_style_ckpt")  # like the checkpoint-20 that failed to resume
-    dcp.save(old_style | {k: v for k, v in get_model_state_dict(qm, options=StateDictOptions(
-        full_state_dict=False, ignore_frozen_params=True)).items()}, checkpoint_id=old_ck, no_dist=True)
-    qm2, qe2 = peft_4bit_with_engram()
-    template = fsdp_utils._get_model_state_dict(qm2, adapter_only=True, sd_options=opts)
-    dcp.load(template, checkpoint_id=old_ck, no_dist=True)
-    try:
-        fsdp_utils._set_model_state_dict(qm2, template, adapter_only=True, sd_options=opts)
-        resumed = torch.equal(qe2.tables[2].weight, qe.tables[2].weight) and torch.equal(qe2.value.weight, qe.value.weight)
-    except Exception as e:  # noqa: BLE001
-        print("   resume error:", str(e)[:200])
-        resumed = False
-    check("a checkpoint saved by the first fix (with quant state) now resumes, engram restored", resumed)
-
 # ----------------------------------------------------------------------------- micro_engram_dtype
 bf_model = Toy().to(torch.bfloat16)
-pd = MicroEngramPlugin()
+pd = Setup()
 pd.post_model_load(cfg(micro_engram_dtype="fp32", micro_engram_extra=[DictDefault(layer=2)]), bf_model)
 check("micro_engram_dtype fp32: engrams keep fp32 weights in a bf16 model",
       all(next(s.engram.parameters()).dtype == torch.float32 for s in pd.slots)
@@ -388,15 +266,9 @@ check("micro_engram_dtype fp32: engrams keep fp32 weights in a bf16 model",
 with torch.no_grad():
     out_bf = bf_model(input_ids=ids)
 check("fp32 engram in a bf16 model: forward works, output stays bf16", out_bf.dtype == torch.bfloat16)
-pb = MicroEngramPlugin()
+pb = Setup()
 pb.post_model_load(cfg(), Toy().to(torch.bfloat16))
 check("micro_engram_dtype unset: engram follows its layer (bf16)", next(pb.slots[0].engram.parameters()).dtype == torch.bfloat16)
-grab.msgs.clear()
-_ReportTrainableCallback(pd.slots, "fp32").on_train_begin(None, types.SimpleNamespace(is_world_process_zero=True), None, model=bf_model)
-check("train-start report states the engram dtype", any("engram weights are float32" in m for m in grab.msgs))
-grab.msgs.clear()
-_ReportTrainableCallback(pb.slots, "fp32").on_train_begin(None, types.SimpleNamespace(is_world_process_zero=True), None, model=bf_model)
-check("report flags a dtype that differs from micro_engram_dtype", any("something cast them" in m for m in grab.msgs))
 
 # ----------------------------------------------------------------------------- legacy
 legacy = {"layer": 1, "table_size": 64, "engram_dim": 8, "num_heads": 2, "weights": "micro_engram.pt"}
@@ -404,12 +276,12 @@ sp = engram_specs(legacy, "/x/micro_engram_config.json")
 check("old config (no 'engrams', no 'seed'): one engram, seed 0, weights resolved",
       len(sp) == 1 and sp[0]["seed"] == 0 and sp[0]["layer"] == 1 and sp[0]["weights"] == "/x/micro_engram.pt")
 try:
-    MicroEngramPlugin().post_model_load(cfg(micro_engram_extra=[{"layer": 0}]), Toy())
+    Setup().post_model_load(cfg(micro_engram_extra=[{"layer": 0}]), Toy())
     check("two engrams in one layer are rejected", False)
 except ValueError:
     check("two engrams in one layer are rejected", True)
 try:
-    MicroEngramPlugin().post_model_load(cfg(micro_engram_frozen=True), Toy())
+    Setup().post_model_load(cfg(micro_engram_frozen=True), Toy())
     check("frozen without init_from is rejected", False)
 except ValueError:
     check("frozen without init_from is rejected", True)
@@ -453,10 +325,10 @@ check("shared file with full names: each engram gets its own layer's tensors",
 # micro_engram_sharding: rows, single process (the multi-GPU exchange is in test_rows.py)
 ids_r = torch.randint(5, V, (2, 12))
 plain = Toy()
-p_plain = MicroEngramPlugin()
+p_plain = Setup()
 p_plain.post_model_load(cfg(micro_engram_init_from=run_a), plain)
 rowm = Toy()
-p_rows = MicroEngramPlugin()
+p_rows = Setup()
 p_rows.post_model_load(cfg(micro_engram_init_from=run_a, micro_engram_sharding="rows",
                            micro_engram_extra=[{"layer": 2}]), rowm)
 e_rows = p_rows.slots[0].engram
@@ -473,19 +345,6 @@ check(f"rows: a new engram's rows start at N(0, 0.02) (std {float(x_rows.std()):
 rowm(input_ids=ids_r).pow(2).sum().backward()
 check("rows: gradients reach the rows through the model", e_rows.row_shards[0].grad is not None
       and e_rows.row_shards[0].grad.abs().sum() > 0)
-logs_r = {"loss": 1.0}
-_StatsCallback(p_rows.slots, 1, rows=types.SimpleNamespace(last_grad_norm=0.5)).on_log(
-    None, types.SimpleNamespace(is_world_process_zero=True, global_step=1), None, logs=logs_r)
-check("rows: stats line from this rank's rows, plus the tables' grad norm",
-      "engram_L0/rows_learned_3g" in logs_r and logs_r["engram/table_grad_norm"] == 0.5)
-grab.msgs.clear()
-_ReportTrainableCallback(p_rows.slots).on_train_begin(None, types.SimpleNamespace(is_world_process_zero=True),
-                                                      None, model=rowm)
-rep_r = " | ".join(grab.msgs)
-n_rows_params = sum(p.numel() for s_ in p_rows.slots for p in s_.engram.row_shards)
-check("rows: train-start report counts the rows, says which rows this GPU holds, no errors",
-      "holds rows 2-grams 0..256 of 257; 3-grams 0..256 of 257" in rep_r and "FROZEN" not in rep_r
-      and f"{(sum(p.numel() for p in rowm.parameters() if p.requires_grad) + n_rows_params) / 1e6:.1f}M trainable" in rep_r)
 mixed = MicroEngram(model_dim=D, table_size=257, engram_dim=8, num_heads=2, vocab_size=V, gate="scalar_sqrt",
                     build_tables=False)
 mixed.shard_rows(0, 1, dtype=torch.float32)
@@ -497,27 +356,15 @@ except RuntimeError as e:
     mixed_ok = False
     print("   mixed:", e)
 check("rows: fp32 rows (micro_engram_dtype: fp32) with bf16 key/value compute; fp32 gradients", mixed_ok)
-p_fr = MicroEngramPlugin()
+p_fr = Setup()
 p_fr.post_model_load(cfg(micro_engram_init_from=run_a, micro_engram_frozen=True, micro_engram_sharding="rows"), Toy())
 check("rows: a frozen engram's rows are frozen too", not any(p.requires_grad for p in p_fr.slots[0].engram.row_shards))
-try:
-    MicroEngramPlugin().post_model_load(cfg(micro_engram_sharding="rows", fsdp_config=None, fsdp_version=None), Toy())
-    no_fsdp = False
-except ValueError:
-    no_fsdp = True
-check("rows: refused without FSDP", no_fsdp)
-try:
-    MicroEngramPlugin().post_model_load(cfg(micro_engram_optimizer="rowwise_adam"), Toy())
-    rw_alone = False
-except ValueError:
-    rw_alone = True
-check("rowwise_adam is refused without micro_engram_sharding: rows", rw_alone)
 
 # per-order table sizes (micro_engram_table_sizes): 4-grams, dropping an order, inheritance
 from micro_engram.module import engram_from_spec  # noqa: E402
 from micro_engram.weights import engram_specs as _specs  # noqa: E402
 
-p_sz = MicroEngramPlugin()
+p_sz = Setup()
 p_sz.post_model_load(cfg(micro_engram_table_sizes={2: 101, 3: 307, 4: 53},
                          micro_engram_extra=[{"layer": 2}, {"layer": 3, "table_size": 61}]), Toy())
 e_main, e_inh, e_own = (s_.engram for s_ in p_sz.slots)
@@ -529,9 +376,9 @@ check("table_sizes: every table's hashed rows stay inside that table",
       all(int(i.max()) < r and int(i.min()) >= 0 for i, r in zip(idx_sz, e_main.table_rows)))
 check("extra engram without sizes inherits the main's per-order sizes; with its own table_size, one size",
       e_inh.table_rows == e_main.table_rows and e_own.orders == (2, 3) and e_own.table_rows == [61] * 4)
-p_drop = MicroEngramPlugin()
+p_drop = Setup()
 p_drop.post_model_load(cfg(micro_engram_table_sizes={2: 0, 3: 307}), Toy())
-p_null = MicroEngramPlugin()
+p_null = Setup()
 p_null.post_model_load(cfg(micro_engram_table_sizes={"2": None, "4": None}), Toy())
 check("an order set to 0 or null is not used (keys may be strings, as from JSON)",
       p_drop.slots[0].engram.orders == (3,) and p_null.slots[0].engram.orders == (3,)
@@ -544,11 +391,11 @@ check("config round trip (JSON): the loaders rebuild the same tables and hashing
       rebuilt.table_rows == e_main.table_rows and torch.equal(rebuilt.mults, e_main.mults)
       and conf_sz["engrams"][0]["table_size"] is None and specs_sz[2]["table_sizes"] == {2: 61, 3: 61})
 grab.msgs.clear()
-p_keep = MicroEngramPlugin()
+p_keep = Setup()
 p_keep.post_model_load(cfg(micro_engram_init_from=run_a, micro_engram_table_sizes={2: 50, 3: 900}), Toy())
 check("init_from a uniform run keeps the trained sizes over the YAML's table_sizes (and says so)",
       p_keep.slots[0].engram.table_rows == [257] * 4 and any("table_sizes" in m for m in grab.msgs))
-p_rs = MicroEngramPlugin()
+p_rs = Setup()
 toy_rs = Toy()
 p_rs.post_model_load(cfg(micro_engram_table_sizes={2: 101, 3: 307, 4: 53}, micro_engram_sharding="rows"), toy_rs)
 e_rs = p_rs.slots[0].engram
@@ -559,10 +406,8 @@ check("row sharding with mixed sizes: forward and backward run, every table gets
       all(p_.grad is not None for p_ in e_rs.row_shards))
 
 toy_sz = Toy()
-p_sz2 = MicroEngramPlugin()
-p_sz2.post_model_load(cfg(micro_engram_table_sizes={2: 101, 3: 307, 4: 53}, unfrozen_parameters=[".+micro_engram"]),
-                      toy_sz)
-axolotl_unfreeze(toy_sz, ".+micro_engram")
+p_sz2 = Setup()
+p_sz2.post_model_load(cfg(micro_engram_table_sizes={2: 101, 3: 307, 4: 53}), toy_sz)
 with torch.no_grad():
     p_sz2.slots[0].engram.value.weight.normal_(std=0.05)
 ck_sz = fake_checkpoint(toy_sz, p_sz2, os.path.join(TMP, "runSZ"), 4)

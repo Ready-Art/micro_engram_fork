@@ -3,7 +3,6 @@ LazyAdamW (micro_engram_optimizer: lazy_adam) on CPU:  python test_optim.py
 """
 import os
 import sys
-import types
 
 import torch
 import torch.nn as nn
@@ -185,32 +184,6 @@ try:
     dist.destroy_process_group()
 except Exception as e:  # noqa: BLE001
     check(f"FSDP2 checks ({type(e).__name__}: {e})", False)
-
-# 6. plugin: the trainer builds LazyAdamW lazily, tables in the lazy group (Axolotl stubbed)
-for n in ("axolotl", "axolotl.integrations", "axolotl.integrations.base"):
-    sys.modules.setdefault(n, types.ModuleType(n))
-sys.modules["axolotl.integrations.base"].BasePlugin = type("BasePlugin", (), {"__init__": lambda self: None})
-from micro_engram.module import MicroEngram  # noqa: E402
-from micro_engram.plugin import _install_lazy_adam  # noqa: E402
-
-model = nn.Module()
-model.layer = nn.Module()
-model.layer.micro_engram = MicroEngram(model_dim=8, table_size=31, engram_dim=4, num_heads=1, vocab_size=50,
-                                       gate="scalar_sqrt")
-model.frozen = nn.Linear(8, 8)
-model.frozen.requires_grad_(False)
-trainer = types.SimpleNamespace(optimizer=None, model=model, args=types.SimpleNamespace(
-    learning_rate=1e-3, adam_beta1=0.9, adam_beta2=0.999, adam_epsilon=1e-8, weight_decay=0.0),
-    create_optimizer=lambda model=None: None)
-_install_lazy_adam(trainer)
-check("plugin: nothing is built before the trainer asks (FSDP shards first)", trainer.optimizer is None)
-opt = trainer.create_optimizer()
-lazy = {id(p) for g in opt.param_groups if g["lazy"] for p in g["params"]}
-tables = {id(t.weight) for t in model.layer.micro_engram.tables}
-others = {id(p) for n, p in model.named_parameters() if p.requires_grad and "tables" not in n}
-dense = {id(p) for g in opt.param_groups if not g["lazy"] for p in g["params"]}
-check("plugin: exactly the tables are lazy; key/value/scales are AdamW; frozen params left out",
-      lazy == tables and dense == others and id(model.frozen.weight) not in lazy | dense)
 
 bad = 0
 for name, ok in results:

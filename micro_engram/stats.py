@@ -1,6 +1,6 @@
 """Weight statistics for an engram, from a live module or from saved tensors.
 
-Used by the training plugin (logged every micro_engram_stats_steps) and by
+Used by micro_engram.train (logged every micro_engram_stats_steps) and by
 engram_stats.py (reads a checkpoint from disk while training keeps running).
 """
 import re
