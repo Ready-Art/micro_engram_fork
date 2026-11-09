@@ -306,6 +306,12 @@ class Trainer:
             write_config(build_config(self.base_conf, self.slots, lambda s: None), cfg.output_dir)
             self._init_wandb()
         t_last, toks = time.time(), 0
+        self.pbar = None
+        if self.rank == 0:
+            from tqdm import tqdm
+
+            self.pbar = tqdm(total=self.total_steps, initial=self.global_step, desc="train", dynamic_ncols=True,
+                             unit="step")
         while self.global_step < self.total_steps:
             n_ep = self.plan.steps_per_epoch(self.epoch)
             if self.step_in_epoch >= n_ep:
@@ -318,6 +324,10 @@ class Trainer:
             self.global_step += 1
             self.step_in_epoch += 1
             toks += logs.pop("tokens")
+            if self.pbar is not None:
+                self.pbar.update(1)
+                self.pbar.set_postfix(loss=f"{logs['loss']:.4f}", ppl=f"{logs['ppl']:.1f}",
+                                      lr=f"{logs['learning_rate']:.2e}", epoch=self.epoch, refresh=True)
             if self.global_step % cfg.logging_steps == 0 or self.global_step == self.total_steps:
                 dt = time.time() - t_last
                 logs.update(self._memory())
@@ -329,6 +339,9 @@ class Trainer:
                 t_last, toks = time.time(), 0
             if cfg.save_steps and self.global_step % cfg.save_steps == 0:
                 self.save_checkpoint()
+        if self.pbar is not None:
+            self.pbar.close()
+            self.pbar = None
         if not cfg.save_steps or self.global_step % cfg.save_steps:
             self.save_checkpoint()
         self.rows.save(os.path.join(cfg.output_dir, ROWS_DIR))
@@ -376,7 +389,10 @@ class Trainer:
         if self.rank != 0:
             return
         line = json.dumps({k: (round(v, 6) if isinstance(v, float) else v) for k, v in logs.items()})
-        print(line, flush=True)
+        if getattr(self, "pbar", None) is not None:
+            self.pbar.write(line)  # above the progress bar
+        else:
+            print(line, flush=True)
         with open(os.path.join(self.cfg.output_dir, "train_log.jsonl"), "a") as f:
             f.write(line + "\n")
         if self.wandb:

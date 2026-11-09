@@ -25,7 +25,7 @@ IGNORE = -100
 
 class VocabShard:
     def __init__(self, weight, rank, world, embed_scale=None, softcap=None, chunk_tokens=2048,
-                 chunk_bytes=512 << 20, device=None, dtype=None):
+                 chunk_bytes=256 << 20, device=None, dtype=None):
         """weight: the full [V, d] embedding (rank's slice is copied) or None with `local` set later."""
         self.V, self.d = int(weight.shape[0]), int(weight.shape[1])
         self.rank, self.world = rank, world
@@ -74,11 +74,12 @@ def _gather(x, group, world):
 
 
 def _chunk_logits(h, w, softcap):
+    """fp32 logits of a chunk against this GPU's vocab rows, softcapped in place (one fp32
+    buffer; the bf16 matmul result is freed right away)."""
     z = (h @ w.t()).float()
     if softcap:
-        t = torch.tanh(z / softcap)
-        return t * softcap, t
-    return z, None
+        z.div_(softcap).tanh_().mul_(softcap)
+    return z
 
 
 class _VocabParallelCE(torch.autograd.Function):
@@ -93,17 +94,17 @@ class _VocabParallelCE(torch.autograd.Function):
             b = min(N, a + c)
             H = _gather(h_local[a:b], group, world)                # [world*n, d], rank-major
             L = _gather(labels[a:b].contiguous(), group, world)    # [world*n]
-            z, _ = _chunk_logits(H, w, shard.softcap)               # [world*n, rows]
+            z = _chunk_logits(H, w, shard.softcap)                  # [world*n, rows]
             m = z.max(dim=1).values
-            if world > 1:
-                dist.all_reduce(m, op=dist.ReduceOp.MAX, group=group)
-            s = torch.exp(z - m[:, None]).sum(dim=1)
             loc = L - shard.start
             mine = (L != IGNORE) & (loc >= 0) & (loc < shard.rows)
             tgt = torch.zeros_like(m)
             idx = mine.nonzero().squeeze(1)
             if idx.numel():
                 tgt[idx] = z[idx, loc[idx]]
+            if world > 1:
+                dist.all_reduce(m, op=dist.ReduceOp.MAX, group=group)
+            s = z.sub_(m[:, None]).exp_().sum(dim=1)               # in place: no second logits buffer
             if world > 1:
                 st = torch.stack([s, tgt])
                 dist.all_reduce(st, group=group)
@@ -135,8 +136,13 @@ class _VocabParallelCE(torch.autograd.Function):
             n = b - a
             H = _gather(h_local[a:b], group, world)
             L = _gather(labels[a:b].contiguous(), group, world)
-            z, t = _chunk_logits(H, w, shard.softcap)
-            p = torch.exp(z - lse_all[k][:, None])                # softmax over the whole vocab, our columns
+            # softmax over the whole vocab (this GPU's columns), built in place in one fp32 buffer
+            p = _chunk_logits(H, w, shard.softcap)
+            cap = None
+            if shard.softcap:
+                # d/dx softcap*tanh(x/softcap) = 1 - tanh^2 = 1 - (logit/softcap)^2, from the logits
+                cap = (p / shard.softcap).pow_(2).neg_().add_(1)  # fp32: bf16 here costs ~1e-2 in the gradient
+            p.sub_(lse_all[k][:, None]).exp_()
             loc = L - shard.start
             mine = (L != IGNORE) & (loc >= 0) & (loc < shard.rows)
             idx = mine.nonzero().squeeze(1)
@@ -144,8 +150,9 @@ class _VocabParallelCE(torch.autograd.Function):
                 p[idx, loc[idx]] -= 1
             weight = gs.repeat_interleave(n) * (L != IGNORE).float()  # [world*n]
             p.mul_(weight[:, None])
-            if t is not None:
-                p.mul_(1 - t * t)                                  # d softcap*tanh(x/softcap) / dx
+            if cap is not None:
+                p.mul_(cap)
+                del cap
             dH = (p.to(w.dtype) @ w).float()                       # [world*n, d], this GPU's vocab part
             if world > 1:
                 out = torch.empty(n, shard.d, dtype=torch.float32, device=dH.device)
@@ -153,7 +160,7 @@ class _VocabParallelCE(torch.autograd.Function):
             else:
                 out = dH
             grad[a:b] = out.to(grad.dtype)
-            del z, p, dH, H
+            del p, dH, H
         return grad, None, None
 
 
