@@ -99,7 +99,8 @@ class TrainConfig(MicroEngramArgs):
     gradient_accumulation_steps: int = 1
     num_epochs: float = 1
     max_steps: Optional[int] = None
-    learning_rate: float = 1e-3
+    learning_rate: float = 1e-3                       # engram tables (and everything, without micro_engram_dense_lr)
+    micro_engram_dense_lr: Optional[float] = None     # key/value/gates/scales; same schedule; default learning_rate
     lr_scheduler: Literal["constant", "constant_with_warmup", "cosine", "linear",
                           "warmup_stable_decay"] = "constant_with_warmup"
     lr_scheduler_kwargs: Optional[Dict[str, Any]] = None
@@ -139,6 +140,8 @@ class TrainConfig(MicroEngramArgs):
         if self.fsdp_config.activation_checkpointing:
             raise ValueError("fsdp_config.activation_checkpointing is not supported: use gradient_checkpointing: true "
                              "(per-layer non-reentrant checkpointing, as Axolotl's hf implementation)")
+        if self.micro_engram_dense_lr is not None and self.micro_engram_dense_lr <= 0:
+            raise ValueError("micro_engram_dense_lr must be > 0 (freeze an engram with micro_engram_frozen instead)")
         if self.liger_rope:
             raise ValueError("liger_rope: Gemma 4 RoPE is already fused with the q/k norms (fused_attn_kernel)")
         kw = self.gradient_checkpointing_kwargs or {}

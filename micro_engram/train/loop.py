@@ -132,7 +132,10 @@ class Trainer:
         from ..optim import LazyAdamW
 
         a = cfg
-        self.dense_opt = LazyAdamW([{"params": self.dense, "lazy": False}], lr=a.learning_rate,
+        # key/value/gates/scales update every step on every token; the tables only when their
+        # n-gram shows up. micro_engram_dense_lr gives the dense part its own LR (same schedule)
+        self.dense_lr = a.micro_engram_dense_lr if a.micro_engram_dense_lr is not None else a.learning_rate
+        self.dense_opt = LazyAdamW([{"params": self.dense, "lazy": False}], lr=self.dense_lr,
                                    betas=(a.adam_beta1, a.adam_beta2), eps=a.adam_epsilon,
                                    weight_decay=a.weight_decay,
                                    stochastic_rounding=a.micro_engram_stochastic_rounding is not False)
@@ -276,7 +279,9 @@ class Trainer:
             self._reduce_dense()
         dense_norm = torch.nn.utils.clip_grad_norm_(self.dense, self.cfg.max_grad_norm or float("inf"))
         table_norm = self.rows.clip(self.cfg.max_grad_norm)
-        lr = self.dense_opt.param_groups[0]["lr"]
+        g0 = self.dense_opt.param_groups[0]
+        dense_lr = g0["lr"]
+        lr = self.cfg.learning_rate * self._lr_factor()  # the tables: learning_rate, same schedule
         self.dense_opt.step()
         self.rows.step(lr)
         self.dense_opt.zero_grad(set_to_none=True)
@@ -284,7 +289,11 @@ class Trainer:
         mean = float(loss / count)
         return {"loss": mean, "ppl": math.exp(min(mean, 50.0)), "grad_norm": float(dense_norm),
                 "table_grad_norm": table_norm,
-                "learning_rate": lr, "tokens": int(count)}
+                "learning_rate": lr, "dense_lr": dense_lr, "tokens": int(count)}
+
+    def _lr_factor(self):
+        """Where the schedule is now (warmup, decay, ...), as a multiple of the base LR."""
+        return self.scheduler.lr_lambdas[0](self.scheduler.last_epoch)
 
     def _reduce_dense(self):
         grads = [p.grad for p in self.dense if p.grad is not None]
@@ -492,6 +501,11 @@ class Trainer:
         blob = torch.load(os.path.join(ckpt, DENSE_FILE), map_location="cpu", weights_only=False)
         self.dense_opt.load_state_dict(blob["dense_optimizer"])
         self.scheduler.load_state_dict(blob["scheduler"])
+        # the YAML's LRs win over the checkpoint's (so they can be changed when resuming)
+        self.scheduler.base_lrs = [self.dense_lr]
+        for g in self.dense_opt.param_groups:
+            g["initial_lr"] = self.dense_lr
+            g["lr"] = self.dense_lr * self._lr_factor()
         self.global_step, self.epoch, self.step_in_epoch = st["global_step"], st["epoch"], st["step_in_epoch"]
         if st.get("total_steps") not in (None, self.total_steps):
             _log0(f"[micro_engram] resume: the run now has {self.total_steps} steps (checkpoint said "

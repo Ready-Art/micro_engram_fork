@@ -295,6 +295,23 @@ def worker(rank, world, port, root, model_dir, data, q):
     res["sparse_same"] = all(torch.allclose(a[k], b[k], atol=1e-6) for k in a) and \
         all(abs(x - y) < 1e-5 * max(1, abs(y)) for x, y in zip(na, nb))
     res["sparse_norms"] = na
+    # 10. micro_engram_dense_lr: own LR for key/value/gates/scales, same schedule as the tables;
+    # a changed value takes effect on resume
+    lc = {**cfg, "output_dir": os.path.join(root, "run_lr"), "learning_rate": 5e-3, "micro_engram_dense_lr": 1e-3,
+          "lr_scheduler": "cosine", "warmup_steps": 2}
+    tl = _trainer(lc)
+    l1 = [tl.train_step(tl.plan.micro_batches(0, k, rank)) for k in range(3)]
+    tl.global_step = tl.step_in_epoch = 3
+    tl.save_checkpoint()
+    del tl
+    tl = _trainer({**lc, "micro_engram_dense_lr": 2e-4, "resume_from_checkpoint": os.path.join(root, "run_lr", "checkpoint-3")})
+    tl._maybe_resume()
+    l2 = tl.train_step(tl.plan.micro_batches(0, 3, rank))
+    res["lr_ratio"] = [x["learning_rate"] / x["dense_lr"] if x["dense_lr"] else None for x in l1] + \
+        [l2["learning_rate"] / l2["dense_lr"]]
+    res["lr_seq"] = [x["learning_rate"] for x in l1] + [l2["learning_rate"]]
+    del tl
+
     # 9. (last: patches transformers for this process) hybrid attention, packed rows: the global
     # layers get no model mask and build the block mask themselves; loss == the plain reference
     th = _trainer({**cfg, "output_dir": os.path.join(root, "run_h"), "gemma4_hybrid_attn_impl": True})
@@ -337,6 +354,10 @@ def main():
               f"{r0['hybrid_loss']} vs {r0['ref_loss']}, multi-doc {r0['multi_doc']}")
         check("hybrid attention gives the same loss as plain SDPA", abs(r0["hybrid_loss"] - r0["loss"]) < 1e-4,
               f"{r0['hybrid_loss']} vs {r0['loss']}")
+        lr_ok = r0["lr_ratio"][1:3] == [5.0, 5.0] and abs(r0["lr_ratio"][3] - 25.0) < 1e-6 \
+            and r0["lr_seq"][0] == 0.0 and r0["lr_seq"][1] > 0
+        check("micro_engram_dense_lr: dense LR follows the tables' schedule; a new value applies on resume", lr_ok,
+              f"ratios {r0['lr_ratio']}, table LRs {r0['lr_seq']}")
         check("sparse row gradients: same tables and table grad norms as dense ones (3 steps, clipped)",
               all(res[r]["sparse_same"] for r in res) and r0["sparse_flag1"] and not r0["sparse_flag0"]
               and all(n and n > 0 for n in r0["sparse_norms"]), r0["sparse_norms"])
