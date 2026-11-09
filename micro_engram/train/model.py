@@ -241,6 +241,10 @@ def shard_model(text, cfg, mesh, engram_params):
         apply_init_sharded_param_patch()
         apply_init_unsharded_param_patch()
         apply_init_dtype_attrs_patch()
+        if not (getattr(apply_init_sharded_param_patch, "_axolotl_patched", False)
+                and getattr(apply_init_unsharded_param_patch, "_axolotl_patched", False)):
+            raise RuntimeError("load_in_4bit: the FSDP2 4-bit patch does not match this torch version "
+                               f"({torch.__version__}); FSDP would lose the NF4 quantization state")
     kw = {"mesh": mesh, "mp_policy": MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)}
     if cfg.fsdp_config.offload_params:
         kw["offload_policy"] = CPUOffloadPolicy(pin_memory=os.environ.get("FSDP_CPU_OFFLOAD_PIN_MEMORY", "1") != "0")
