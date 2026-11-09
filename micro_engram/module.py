@@ -352,11 +352,15 @@ def layer_device_dtype(layer):
     return params[0].device, torch.bfloat16
 
 
-def attach_engram(model, engram, layer_idx, dtype=None):
+def attach_engram(model, engram, layer_idx, dtype=None, get_ids=None):
     """Nest the engram inside decoder layer `layer_idx` and inject after its forward.
 
     Living inside the layer means FSDP2 shards, gathers, offloads and checkpoints it
     together with that Gemma4TextDecoderLayer, and auto-resume restores it.
+
+    get_ids: optional callable returning (input_ids, position_ids) for the current forward.
+    Default: taken from the kwargs of `model`'s forward (a pre-hook). micro_engram.train
+    feeds the text model inputs_embeds, so it hands the ids over this way.
     """
     name, layers = find_text_layers(model)
     target = layers[layer_idx]
@@ -376,16 +380,14 @@ def attach_engram(model, engram, layer_idx, dtype=None):
         state["position_ids"] = kwargs.get("position_ids")
 
     def inject(_mod, _args, output):
-        ids = state.get("input_ids")
+        ids, pos = get_ids() if get_ids is not None else (state.get("input_ids"), state.get("position_ids"))
         if ids is None:
             return output
-        pos = state.get("position_ids")
         if isinstance(output, tuple):
             return (engram(output[0], ids, pos),) + tuple(output[1:])
         return engram(output, ids, pos)
 
-    handles = [
-        model.register_forward_pre_hook(grab_ids, with_kwargs=True),
-        target.register_forward_hook(inject),
-    ]
+    handles = [target.register_forward_hook(inject)]
+    if get_ids is None:
+        handles.append(model.register_forward_pre_hook(grab_ids, with_kwargs=True))
     return f"{name}.{layer_idx}", handles
