@@ -358,7 +358,10 @@ def pack(lengths, capacity, seed, shuffle=True):
 
 def collate(samples, bins, seq_len, pad_id):
     """Micro-batch [B, seq_len]: input_ids, labels (-100 untrained/pad), position_ids
-    restarting per document. Padding is one extra document of pad tokens, untrained."""
+    restarting per document. Padding continues the last document's positions: it sits at the
+    end, is untrained, and causal attention never lets a real token see it, so it needs no
+    isolation, and a one-document row with padding still counts as one document (so attention
+    can take the plain causal path instead of a block mask)."""
     import torch
 
     B = len(bins)
@@ -366,10 +369,11 @@ def collate(samples, bins, seq_len, pad_id):
     labels = torch.full((B, seq_len), -100, dtype=torch.long)
     pos = torch.zeros((B, seq_len), dtype=torch.long)
     for r, b in enumerate(bins):
-        t = 0
+        t, last = 0, 0
         for i in b:
             tok, tr = samples.get(i)
             n = len(tok)
+            last = n
             tt = torch.from_numpy(tok.astype(np.int64))
             ids[r, t:t + n] = tt
             lab = tt.clone()
@@ -378,7 +382,7 @@ def collate(samples, bins, seq_len, pad_id):
             pos[r, t:t + n] = torch.arange(n)
             t += n
         if t < seq_len:
-            pos[r, t:] = torch.arange(seq_len - t)
+            pos[r, t:] = torch.arange(last, last + seq_len - t)
     # labels are next-token targets: shift left by one inside each row; the token after a
     # document's last token belongs to the next document, so it is never a target
     shifted = torch.full_like(labels, -100)

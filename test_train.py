@@ -133,8 +133,8 @@ def test_data(root, model_dir, data):
     check("pack: every sample once, no bin over capacity",
           sorted(i for b in bins for i in b) == [0, 1, 2] and all(sum(s.lengths()[i] for i in b) <= 32 for b in bins))
     b = collate(s, [[0, 1]], 8, pad_id=0)
-    check("collate: position_ids restart per document, padding is one more document",
-          b["position_ids"][0].tolist() == [0, 1, 2, 0, 1, 0, 1, 2])
+    check("collate: position_ids restart per document, padding continues the last one",
+          b["position_ids"][0].tolist() == [0, 1, 2, 0, 1, 2, 3, 4])
     check("collate: labels shifted, never across documents, untrained -100",
           b["labels"][0].tolist() == [2, 3, -100, 5, -100, -100, -100, -100], b["labels"][0].tolist())
 

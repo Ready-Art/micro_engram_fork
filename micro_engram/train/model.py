@@ -32,7 +32,11 @@ def apply_kernel_patches(cfg, on_cuda):
 
         patch_gemma4_hybrid_mask()
         set_large_head_policy(cfg.large_head_policy)
-        set_large_head_packed(bool(cfg.sample_packing))
+        # None = check every call whether a row really holds several documents (we run eager, so the
+        # probe costs one tiny sync). Axolotl declared every batch packed, which forced an explicit
+        # S x S block mask on single-document rows too: SDPA then can't skip the causal triangle,
+        # ~2x the work on the 512-dim global layers (34% of the step in the stage-1 profile).
+        set_large_head_packed(None)
         done.append(f"hybrid attention (large-head policy {cfg.large_head_policy})")
     if (cfg.liger_rms_norm or cfg.liger_glu_activation) and on_cuda:
         done += _apply_liger(cfg)
