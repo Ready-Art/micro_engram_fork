@@ -279,7 +279,9 @@ class Trainer:
         self.rows.step(lr)
         self.dense_opt.zero_grad(set_to_none=True)
         self.scheduler.step()
-        return {"loss": float(loss / count), "grad_norm": float(dense_norm), "table_grad_norm": table_norm,
+        mean = float(loss / count)
+        return {"loss": mean, "ppl": math.exp(min(mean, 50.0)), "grad_norm": float(dense_norm),
+                "table_grad_norm": table_norm,
                 "learning_rate": lr, "tokens": int(count)}
 
     def _reduce_dense(self):
