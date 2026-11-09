@@ -238,6 +238,7 @@ The Axolotl plugin this project started as was removed after the new trainer mat
 
 | Script | What it does |
 |---|---|
+| `zero_ngram_order.py SRC --order 4 --out DIR` | Copy an engram (config, checkpoint or output_dir) with the tables of some n-gram orders zeroed: a quick test of whether e.g. the 4-grams are what changes the output, without retraining. Writes `consolidated.pth` + `micro_engram_config.json` |
 | `build_canon.py` | Builds the token-merge map. `python build_canon.py --tokenizer /path/to/model --out canon.pt --paper`. By default it merges only case/NFKC variants (`▁The` = `▁the`). Each option merges more: `--merge-space` (`▁the` = `the`), `--strip-accents` (`é` = `e`, Latin/Greek/Cyrillic diacritics only) and `--merge-whitespace` (all whitespace-only pieces share one id). `--paper` turns on all three, like the paper's tokenizer compression. `--protect names.txt` (one name per line, `#` comments, repeatable) keeps names that are also ordinary words apart from the word, e.g. `Peril` the dragon vs `peril`: a single-token name keeps its own id while the word forms still merge with each other. Names split into several tokens are listed and left alone. Special, added and byte tokens are never merged. It prints the class count for each step so you can compare. |
 | `engram_data_stats.py` | Estimates how many n-grams your data trains and how crowded each table size would be. `python engram_data_stats.py /path/to/last_run_prepared/<hash> [--max-tokens N] [--orders 2,3,4] [--canon canon.pt] [--sizes 1048576,2097152,...]`. `--canon` counts the n-grams the engram really sees (after token merging); 4-grams are counted through a 64-bit hash. Use it to pick `micro_engram_table_size` / `micro_engram_table_sizes`. |
 | `assemble_engram_model.py` | Builds a servable model folder from the base weights (symlinked, not copied) plus an engram from a DCP checkpoint, a safetensors folder or a `.pt`. See *Outputs*. |
@@ -377,6 +378,7 @@ python test_token_diff.py                     # engram_token_diff.py against a f
 python test_render_chat.py                    # render_chat.py: formats, template override, fixed sampling
 python test_vllm_ids.py                       # vLLM path: previous tokens per batch type, same output as training
 python test_vllm_tp.py                        # vLLM tables split over TP GPUs: == full tables, loading (file and checkpoint), with vLLM stand-ins
+python test_zero_order.py                     # zero_ngram_order.py: zeroed orders, rest unchanged, output == engram without those lookups
 python test_multi.py                          # several engrams, init_from + frozen, config, inference == training, assemble, stats (needs transformers)
 python llama_cpp/test/compare.py --llama-cpp <patched llama.cpp> --driver <engram_logits>   # llama.cpp patch vs PyTorch (needs a build; see the file)
 ```
