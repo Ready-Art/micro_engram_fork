@@ -1,4 +1,4 @@
-"""zero_ngram_order.py on CPU: python test_zero_order.py
+"""zero_ngram_order.py (zeroed orders, --scale) on CPU: python test_zero_order.py
 
 Two engrams with 2/3/4-gram tables saved as a DCP checkpoint + config (as micro_engram.train
 writes them). After zeroing order 4: the 4-gram tables are zero, everything else is
@@ -91,6 +91,22 @@ try:
     check("config points to consolidated.pth; both engrams load through engram_specs", len(specs) == 2
           and all(s["weights"].endswith("consolidated.pth") for s in specs))
     check("output == the original engram with its 4-gram lookups removed", ok_out)
+    # --scale / --layer-scale: what the engram adds to h is scaled, nothing else changes
+    out2 = os.path.join(tmp, "scaled")
+    r = subprocess.run([sys.executable, os.path.join(here, "zero_ngram_order.py"), os.path.join(tmp, "out"),
+                        "--scale", "0.5", "--layer-scale", "29=0.25", "--out", out2], capture_output=True, text=True)
+    print(r.stdout.strip())
+    conf3 = os.path.join(out2, "micro_engram_config.json")
+    ok_scale = r.returncode == 0
+    for s in engram_specs(json.load(open(conf3)), conf3):
+        e3 = engram_from_spec(s, D, V)
+        e3.load_state_dict(load_engram_weights(s["weights"], layer=s["layer"], need_layer=True))
+        src = engram_from_spec(s, D, V)
+        src.load_state_dict({k: v for k, v in engs[s["layer"]].state_dict().items()})
+        want = 0.5 if s["layer"] == 0 else 0.25
+        with torch.no_grad():
+            ok_scale &= torch.allclose(e3(h, ids) - h, want * (src(h, ids) - h), atol=1e-5)
+    check("--scale 0.5 / --layer-scale 29=0.25: each engram adds exactly that share of its original output", ok_scale)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 print("\nALL PASSED" if not FAIL else f"\nFAILED: {FAIL}")

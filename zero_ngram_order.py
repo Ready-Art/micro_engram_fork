@@ -1,7 +1,14 @@
 """
-Copy an engram with the tables of some n-gram orders zeroed, e.g. its 4-gram memory switched off.
+Copy an engram with some n-gram orders switched off and/or its injection scaled down.
 
-    python zero_ngram_order.py SRC --order 4 --out /path/to/new_engram_folder
+    python zero_ngram_order.py SRC --order 4 --out /path/to/new_engram_folder      # no 4-gram memory
+    python zero_ngram_order.py SRC --scale 0.5 --out ...                            # half strength
+    python zero_ngram_order.py SRC --order 4 --layer-scale 29=0.5 --out ...         # both, layer 29 only at half
+
+--order N zeroes the tables of n-gram order N (repeatable). --scale S multiplies what every
+engram adds to the hidden state by S (the output projection: `value` for the scalar gates,
+`up` for ple; the gate itself is unchanged, so S=0.5 is the same memory at half volume).
+--layer-scale L=S sets it for one engram (repeatable; overrides --scale for that layer).
 
 SRC: a micro_engram_config.json, or a folder holding one (a checkpoint-N, a training
 output_dir = its newest checkpoint, or a model folder with consolidated.pth + config).
@@ -58,7 +65,10 @@ def table_orders(spec):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("src")
-    ap.add_argument("--order", type=int, action="append", required=True, help="n-gram order to zero (repeatable)")
+    ap.add_argument("--order", type=int, action="append", default=[], help="n-gram order to zero (repeatable)")
+    ap.add_argument("--scale", type=float, default=1.0, help="multiply every engram's injection by this")
+    ap.add_argument("--layer-scale", action="append", default=[], metavar="L=S",
+                    help="injection scale for the engram at layer L (repeatable)")
     ap.add_argument("--out", required=True, help="new folder (created)")
     ap.add_argument("--force", action="store_true", help="write into an existing folder")
     args = ap.parse_args()
@@ -72,6 +82,15 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     zero = set(args.order)
+    layer_scale = {}
+    for item in args.layer_scale:
+        try:
+            lay, val = item.split("=")
+            layer_scale[int(lay)] = float(val)
+        except ValueError:
+            sys.exit(f"--layer-scale wants L=S, e.g. 29=0.5 (got {item!r})")
+    if not zero and args.scale == 1.0 and not layer_scale:
+        sys.exit("nothing to do: give --order, --scale and/or --layer-scale")
     out = {}
     for spec in specs:
         layer = spec["layer"]
@@ -82,7 +101,7 @@ def main():
         if n_tables != len(orders):
             sys.exit(f"layer {layer}: {n_tables} tables in {src_w}, but the config's orders x heads say {len(orders)}")
         missing = zero - set(orders)
-        if missing:
+        if zero and missing:
             print(f"layer {layer}: has no order {sorted(missing)} (orders {sorted(set(orders))}), nothing to zero there")
         zeroed = 0
         for k, n in enumerate(orders):
@@ -90,7 +109,11 @@ def main():
                 t = sd[f"tables.{k}.weight"]
                 zeroed += t.shape[0]
                 t.zero_()
-        print(f"layer {layer}: zeroed {zeroed:,} rows of order(s) {sorted(zero & set(orders))} "
+        scale = layer_scale.get(layer, args.scale)
+        if scale != 1.0:
+            proj = "value.weight" if "value.weight" in sd else "up.weight"  # what the engram adds to h
+            sd[proj] = (sd[proj].float() * scale).to(sd[proj].dtype)
+        print(f"layer {layer}: zeroed {zeroed:,} rows of order(s) {sorted(zero & set(orders))}, injection x{scale:g} "
               f"({len(orders)} tables, from {src_w})")
         for name, t in sd.items():
             out[f"model.language_model.layers.{layer}.micro_engram.{name}"] = t
@@ -101,6 +124,7 @@ def main():
     if new.get("engrams"):
         new["engrams"] = [{**e, "weights": OUT_WEIGHTS} for e in new["engrams"]]
     new["zeroed_orders"] = sorted(zero)
+    new["injection_scale"] = {str(sp["layer"]): layer_scale.get(sp["layer"], args.scale) for sp in specs}
     new["zeroed_from"] = conf_path
     with open(os.path.join(args.out, CONFIG_NAME), "w") as f:
         json.dump(new, f, indent=2)
