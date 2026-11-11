@@ -65,6 +65,23 @@ _, other = run("--n", "3", "--template", jinja, "--seed", "7", out="t3.jsonl")
 check("same --seed picks the same samples (both configs score the same texts)", lines == again)
 check("another seed picks others", [t.replace("<think>", "") for t in lines] != other)
 
+# spans: the assistant turns' content + end-of-turn token, not the role header or user turns
+gen = os.path.join(tmp, "gen.jinja")
+open(gen, "w").write("{{ bos_token }}{% for m in messages %}<{{ m.role }}>{{ m.content }}<end>\n{% endfor %}"
+                     "{% if add_generation_prompt %}<assistant>{% endif %}")
+path = os.path.join(tmp, "spans.jsonl")
+r = subprocess.run([sys.executable, script, "--data", data, "--tokenizer", os.path.join(tmp, "model"), "--out", path,
+                    "--template", gen, "--eot", "<end>", "--n", "100"], capture_output=True, text=True)
+rows = [json.loads(l) for l in open(path)] if os.path.isfile(path) else []
+got = [[row["text"][a:b] for a, b in row["spans"]] for row in rows if row.get("spans")]
+check("spans = each assistant turn's content + <end>, nothing else" + ("" if r.returncode == 0 else f" ({r.stderr[-300:]})"),
+      len(got) == 11 and ['say "3"\nok<end>'] in got and ["sharegpt a<end>"] in got
+      and all(len(g) == 1 for g in got))
+path2 = os.path.join(tmp, "nospans.jsonl")
+subprocess.run([sys.executable, script, "--data", data, "--tokenizer", os.path.join(tmp, "model"), "--out", path2,
+                "--no-spans", "--n", "2"], capture_output=True, text=True)
+check("--no-spans writes text only", all("spans" not in json.loads(l) for l in open(path2)))
+
 shutil.rmtree(tmp, ignore_errors=True)
 bad = 0
 for name, ok in results:

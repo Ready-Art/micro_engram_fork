@@ -15,6 +15,12 @@ field per line. Use text the models were NOT trained on. Long texts are cut into
 of about --max-chars characters at paragraph breaks, the same way on every run, so both
 configs score exactly the same pieces.
 
+Chat conversations: render them with render_chat.py, which adds "spans" (the assistant
+turns). Lines with spans are scored whole (the conversation is the context) but only the
+tokens inside the spans count: what the model writes, not the system prompt, character card
+or user turns (a chat model was never trained to predict those). Token positions come from
+the server's /tokenize. Lines without spans in such a file are skipped.
+
 Uses vLLM's /v1/completions with prompt_logprobs: the score is the log-probability the
 model gives to each real token of the text (no generation, no sampling, deterministic).
 """
@@ -62,9 +68,30 @@ def chunk(text, max_chars):
     return [c for c in out if c.strip()]
 
 
+def load_span_rows(path):
+    """[{id, text, spans}] for a render_chat.py .jsonl with assistant spans, else None."""
+    if not (os.path.isfile(path) and path.endswith(".jsonl")):
+        return None
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if line.strip():
+                obj = json.loads(line)
+                rows.append({"id": f"{os.path.basename(path)}:{i}", "text": obj["text"], "spans": obj.get("spans")})
+    if not any(r["spans"] for r in rows):
+        return None
+    keep = [r for r in rows if r["spans"]]
+    if len(keep) < len(rows):
+        print(f"note: {len(rows) - len(keep)} lines without spans skipped")
+    return keep
+
+
 def load_chunks(path, max_chars, min_chars, prefix=""):
     """`prefix` (e.g. "<bos>" for Gemma, whose tokenizer adds no BOS) starts every piece,
     also the ones cut from the middle of a text; a text that already starts with it keeps one."""
+    rows = load_span_rows(path)
+    if rows is not None:
+        return rows  # whole conversations; only their assistant spans are scored
     chunks = []
     for source, text in read_texts(path):
         text = text.strip()
@@ -117,12 +144,42 @@ def score(base_url, model, piece, timeout):
     }, timeout)
     choice = resp["choices"][0]
     ids, plps = choice["prompt_token_ids"], choice["prompt_logprobs"]
+    scored = range(1, len(ids))  # the first token has nothing to predict it
+    if piece.get("spans"):
+        scored = sorted(span_positions(base_url, model, piece, ids, timeout))
     total, n = 0.0, 0
-    for tok, entry in zip(ids[1:], plps[1:]):  # the first token has nothing to predict it
-        total += entry[str(tok)]["logprob"]
+    for j in scored:
+        total += plps[j][str(ids[j])]["logprob"]
         n += 1
-    token_hash = hashlib.sha1(json.dumps(ids).encode()).hexdigest()[:16]
+    token_hash = hashlib.sha1(json.dumps([ids, piece.get("spans")]).encode()).hexdigest()[:16]
     return {"id": piece["id"], "sum_logprob": total, "n_tokens": n, "token_hash": token_hash}
+
+
+def _common_prefix(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def span_positions(base_url, model, piece, ids, timeout):
+    """Token positions (in `ids`, the whole text's tokens) inside the character spans: the
+    token counts of the text up to each span boundary, from the server's own tokenizer.
+    Boundaries sit at turn markers (special tokens), so the prefixes tokenize like the
+    whole text; the common prefix guards against a merge at the cut."""
+    def tokenize(text):
+        return post(f"{base_url}/tokenize", {"model": model, "prompt": text}, timeout)["tokens"]
+
+    text, out = piece["text"], set()
+    for a, b in piece["spans"]:
+        na = _common_prefix(tokenize(text[:a]), ids)
+        nb = _common_prefix(tokenize(text[:b]), ids)
+        if nb < len(ids) and text[:b] == text:
+            nb = len(ids)
+        out.update(range(max(na, 1), nb))
+    return out
 
 
 def cmd_run(args):

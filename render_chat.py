@@ -8,16 +8,24 @@ Render chat samples into plain text with the model's chat template, for eval_log
 Reads a .jsonl where each line holds a conversation under "messages" (role/content) or
 "conversations" / "conversation" (ShareGPT from/value: human, gpt, system). Picks --n of
 them at random (fixed --seed, so both configs get the same samples) and writes
-{"text": <the conversation exactly as the template renders it>} per line.
+{"text": <the conversation exactly as the template renders it>, "spans": [[start, end], ...]}
+per line. "spans" are the characters of the assistant turns (content + --eot, not the role
+header): what training trains on and what the model writes. eval_logprob.py scores only
+those when they are there (the whole conversation is still the context):
 
-Then score it once per config (each text starts with the template's <bos>; long ones are
-cut into pieces, so give every piece its own <bos> with --prefix):
-    python eval_logprob.py run --url ... --data chat_eval.jsonl --out on.json --max-chars 6000 --parallel 1 --prefix "<bos>"
+    python eval_logprob.py run --url ... --data chat_eval.jsonl --out on.json --parallel 1
+
+Without spans (--no-spans) the whole text is scored: system prompt, character card and user
+turns too. A chat model was never trained to predict those, so that mixes in a different
+skill (predicting any text) and can make a document-style model look far better than it is.
 """
 import argparse
 import json
+import os
 import random
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 ROLE = {"human": "user", "user": "user", "gpt": "assistant", "assistant": "assistant", "model": "assistant",
         "system": "system", "tool": "tool"}
@@ -48,6 +56,10 @@ def main():
     ap.add_argument("--n", type=int, default=80)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--eot", action="append", default=None,
+                    help='end-of-turn token scored with each assistant turn (training\'s eot_tokens), e.g. "<turn|>"; repeatable')
+    ap.add_argument("--roles", default="assistant", help="comma-separated roles whose turns are scored")
+    ap.add_argument("--no-spans", action="store_true", help="score the whole text (old behavior)")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -72,15 +84,36 @@ def main():
         sys.exit(f"{args.data}: no conversations found (expected 'messages' or 'conversations' per line)")
     picked = random.Random(args.seed).sample(convs, min(args.n, len(convs)))
 
-    no_bos = 0
+    from micro_engram.train.data import chat_spans
+
+    def render(m, add_generation_prompt=False):
+        return tok.apply_chat_template(m, tokenize=False, add_generation_prompt=add_generation_prompt, **kwargs)
+
+    roles = {r.strip() for r in args.roles.split(",") if r.strip()}
+    no_bos, no_spans = 0, 0
     with open(args.out, "w", encoding="utf-8") as g:
         for msgs in picked:
-            text = tok.apply_chat_template(msgs, tokenize=False, **kwargs)
-            no_bos += bool(tok.bos_token) and not text.startswith(tok.bos_token)
-            g.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+            row = {}
+            if args.no_spans:
+                row["text"] = render(msgs)
+            else:
+                try:
+                    row["text"], spans = chat_spans(render, msgs, roles, args.eot or ())
+                    row["spans"] = [list(sp) for sp in spans]
+                except ValueError:
+                    no_spans += 1  # template not prefix-stable for this one: whole text, flagged
+                    row["text"] = render(msgs)
+                if not row.get("spans"):
+                    no_spans += "spans" in row
+                    row.pop("spans", None)
+            no_bos += bool(tok.bos_token) and not row["text"].startswith(tok.bos_token)
+            g.write(json.dumps(row, ensure_ascii=False) + "\n")
     avg = sum(len(json.loads(l)["text"]) for l in open(args.out, encoding="utf-8")) / len(picked)
     print(f"{len(picked)} of {len(convs)} conversations rendered to {args.out} (average {avg:,.0f} characters)"
           + (f"; {skipped} lines without a conversation skipped" if skipped else ""))
+    if no_spans:
+        print(f"note: {no_spans} conversations have no scorable {sorted(roles)} turns (or the template is not "
+              f"prefix-stable for them); eval_logprob.py skips them in assistant-only scoring")
     if no_bos:
         print(f"note: {no_bos} rendered texts do not start with {tok.bos_token!r}; pass --prefix "
               f"\"{tok.bos_token}\" to eval_logprob.py so every piece gets one")

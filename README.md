@@ -378,6 +378,7 @@ python test_token_diff.py                     # engram_token_diff.py against a f
 python test_render_chat.py                    # render_chat.py: formats, template override, fixed sampling
 python test_vllm_ids.py                       # vLLM path: previous tokens per batch type, same output as training
 python test_vllm_tp.py                        # vLLM tables split over TP GPUs: == full tables, loading (file and checkpoint), with vLLM stand-ins
+python test_eval_spans.py                     # eval_logprob.py assistant-only scoring (render_chat spans) vs a fake vLLM server
 python test_zero_order.py                     # zero_ngram_order.py: zeroed orders, rest unchanged, output == engram without those lookups
 python test_multi.py                          # several engrams, init_from + frozen, config, inference == training, assemble, stats (needs transformers)
 python llama_cpp/test/compare.py --llama-cpp <patched llama.cpp> --driver <engram_logits>   # llama.cpp patch vs PyTorch (needs a build; see the file)

@@ -114,31 +114,7 @@ class Tokenizing:
         return self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=add_generation_prompt, **kw)
 
     def chat(self, msgs, roles_to_train):
-        full = self.render(msgs)
-        spans = []  # (start char, end char) trained
-        prev = ""
-        for i, m in enumerate(msgs):
-            cur = self.render(msgs[:i + 1])
-            if not full.startswith(cur):
-                raise ValueError("the chat template is not prefix-stable (rendering the first turns is not a prefix "
-                                 "of the whole conversation), so turns can't be located; check chat_template_kwargs "
-                                 "(e.g. preserve_thinking) or use axolotl_prepared_dataset")
-            if m["role"] in roles_to_train:
-                start = len(prev)
-                head = self.render(msgs[:i], add_generation_prompt=True) if i else None
-                if head and cur.startswith(head) and len(head) > start:
-                    start = len(head)  # skip the role header the generation prompt adds
-                end = len(cur)
-                if self.eot:
-                    best = -1
-                    for t in self.eot:
-                        k = cur.rfind(t, start, end)
-                        if k >= 0:
-                            best = max(best, k + len(t))
-                    if best > 0:
-                        end = best  # up to and including the end-of-turn token, not what follows
-                spans.append((start, end))
-            prev = cur
+        full, spans = chat_spans(self.render, msgs, roles_to_train, self.eot)
         enc = self.tok(full, add_special_tokens=False, return_offsets_mapping=True)
         ids, offs = enc["input_ids"], enc["offset_mapping"]
         mask = np.zeros(len(ids), dtype=bool)
@@ -147,6 +123,40 @@ class Tokenizing:
                 if s >= a and e <= b and e > s:
                     mask[j] = True
         return ids, mask
+
+
+def chat_spans(render, msgs, roles_to_train, eot=()):
+    """(the whole rendered conversation, [(start char, end char)] of the trained turns).
+
+    A trained turn's span is its content: from after the role header (what the generation
+    prompt adds) up to and including its end-of-turn token (`eot`), not what follows it.
+    `render(msgs, add_generation_prompt=False)` renders with the chat template. Shared by
+    training (labels) and render_chat.py (eval_logprob.py --assistant-only scoring)."""
+    full = render(msgs)
+    spans, prev = [], ""
+    for i, m in enumerate(msgs):
+        cur = render(msgs[:i + 1])
+        if not full.startswith(cur):
+            raise ValueError("the chat template is not prefix-stable (rendering the first turns is not a prefix "
+                             "of the whole conversation), so turns can't be located; check chat_template_kwargs "
+                             "(e.g. preserve_thinking) or use axolotl_prepared_dataset")
+        if m["role"] in roles_to_train:
+            start = len(prev)
+            head = render(msgs[:i], add_generation_prompt=True) if i else None
+            if head and cur.startswith(head) and len(head) > start:
+                start = len(head)  # skip the role header the generation prompt adds
+            end = len(cur)
+            if eot:
+                best = -1
+                for t in eot:
+                    k = cur.rfind(t, start, end)
+                    if k >= 0:
+                        best = max(best, k + len(t))
+                if best > 0:
+                    end = best  # up to and including the end-of-turn token, not what follows
+            spans.append((start, end))
+        prev = cur
+    return full, spans
 
 
 def load_template(value):
