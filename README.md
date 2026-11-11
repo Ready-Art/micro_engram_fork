@@ -149,6 +149,7 @@ Use `auto` for chat SFT, where nearly every row holds several conversations. If 
 | `micro_engram_optimizer` | unset | Tables: unset = AdamW (every row every step, dense gradients); `lazy_adam` = a row moves only when its n-gram appears (like SparseAdam); `rowwise_adam` = lazy + one fp32 second moment per row (half the optimizer state; FBGEMM/TorchRec style). See *Row-wise Adam* |
 | `learning_rate` | `1e-3` | The tables' LR (and everything's, without `micro_engram_dense_lr`). Hashed rows only learn when their n-gram shows up, so they want a high LR |
 | `micro_engram_dense_lr` | `learning_rate` | LR of key/value, gates and norm scales, which learn on every token. Same schedule as the tables. Logged as `dense_lr` |
+| `micro_engram_train_scales` | `true` | `false`: the `scalar_sqrt` gate's two norm scales stay where they are (1.0 for a new engram, the trained value with `init_from`), so the gate can't learn its own sharpness. The early bf16 runs had them stuck at 1.0 by accident |
 | `micro_engram_lr_epoch_decay` | `null` | Warmup, then LR x this factor at every epoch start (replaces `lr_scheduler`). Otherwise `lr_scheduler`: `constant`, `constant_with_warmup`, `cosine` (+`cosine_min_lr_ratio`), `linear`, `warmup_stable_decay` (+`lr_scheduler_kwargs`) |
 | `micro_engram_stats_steps` | `10` | Every N steps, engram stats in the log line (see *Watching training*) |
 | `micro_engram_init_from` / `micro_engram_frozen` / `micro_engram_seed` / `micro_engram_extra` | | Several engrams, starting from trained ones (see below) |

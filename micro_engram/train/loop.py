@@ -100,6 +100,18 @@ class Trainer:
             if s.frozen:
                 for p in _params(s.engram):
                     p.requires_grad_(False)
+        if not cfg.micro_engram_train_scales:
+            # scalar_sqrt's norm scales set how sharp the gate can get; frozen = kept where they are
+            # (1.0 for a new engram, the trained value with init_from)
+            n = 0
+            for s in self.slots:
+                for name in getattr(s.engram, "DELTA_SCALES", ()):
+                    p = getattr(s.engram, name, None)
+                    if isinstance(p, torch.nn.Parameter) and p.requires_grad:
+                        p.requires_grad_(False)
+                        n += 1
+            _log0(f"[micro_engram] micro_engram_train_scales: false: {n} gate norm scales frozen"
+                  + ("" if n else " (none: no scalar_sqrt gate in this run)"))
         self._place_engrams(meta)
         self.dense = [p for s in self.slots for p in s.engram.parameters() if p.requires_grad]
         trained_layers = [s.layer for s in self.slots if not s.frozen]

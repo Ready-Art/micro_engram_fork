@@ -312,6 +312,19 @@ def worker(rank, world, port, root, model_dir, data, q):
     res["lr_seq"] = [x["learning_rate"] for x in l1] + [l2["learning_rate"]]
     del tl
 
+    # 11. micro_engram_train_scales: false keeps the gate norm scales where they are
+    for train_scales in (False, True):
+        ts = _trainer({**cfg, "output_dir": os.path.join(root, f"run_sc{int(train_scales)}"),
+                       "micro_engram_train_scales": train_scales})
+        _randomize_dense(ts)
+        before = {s_.layer: s_.engram.q_scale.detach().clone() for s_ in ts.slots}
+        for k in range(2):
+            ts.train_step(ts.plan.micro_batches(0, k, rank))
+        res[f"scales_moved{int(train_scales)}"] = any(not torch.equal(before[s_.layer], s_.engram.q_scale)
+                                                     for s_ in ts.slots)
+        res[f"scales_grad{int(train_scales)}"] = all(s_.engram.q_scale.requires_grad == train_scales for s_ in ts.slots)
+        del ts
+
     # 9. (last: patches transformers for this process) hybrid attention, packed rows: the global
     # layers get no model mask and build the block mask themselves; loss == the plain reference
     th = _trainer({**cfg, "output_dir": os.path.join(root, "run_h"), "gemma4_hybrid_attn_impl": True})
@@ -358,6 +371,8 @@ def main():
             and r0["lr_seq"][0] == 0.0 and r0["lr_seq"][1] > 0
         check("micro_engram_dense_lr: dense LR follows the tables' schedule; a new value applies on resume", lr_ok,
               f"ratios {r0['lr_ratio']}, table LRs {r0['lr_seq']}")
+        check("micro_engram_train_scales: false freezes the gate norm scales; default true trains them",
+              not r0["scales_moved0"] and r0["scales_grad0"] and r0["scales_moved1"] and r0["scales_grad1"])
         check("sparse row gradients: same tables and table grad norms as dense ones (3 steps, clipped)",
               all(res[r]["sparse_same"] for r in res) and r0["sparse_flag1"] and not r0["sparse_flag0"]
               and all(n and n > 0 for n in r0["sparse_norms"]), r0["sparse_norms"])

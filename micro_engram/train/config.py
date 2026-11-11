@@ -101,6 +101,7 @@ class TrainConfig(MicroEngramArgs):
     max_steps: Optional[int] = None
     learning_rate: float = 1e-3                       # engram tables (and everything, without micro_engram_dense_lr)
     micro_engram_dense_lr: Optional[float] = None     # key/value/gates/scales; same schedule; default learning_rate
+    micro_engram_train_scales: bool = True            # false: scalar_sqrt's gate norm scales stay as they are (1.0 if new)
     lr_scheduler: Literal["constant", "constant_with_warmup", "cosine", "linear",
                           "warmup_stable_decay"] = "constant_with_warmup"
     lr_scheduler_kwargs: Optional[Dict[str, Any]] = None
