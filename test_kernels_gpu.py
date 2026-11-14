@@ -9,12 +9,12 @@ Each kernel is compared with plain PyTorch on random inputs, forward AND gradien
      block-diagonal causal mask.
   2. fused q/k/v RMSNorm + RoPE (fused_attn_kernel): the patched Gemma4TextAttention.forward
      against the original one, on a sliding layer and a global layer (partial rotary).
-  3. end to end, a tiny Gemma 4 with head_dim-512 global layers on a packed batch: the
-     trainer's kernel setup (fused attention + hybrid attention + FA2 + large_head_attention:
-     auto) against stock HF SDPA: same loss, same gradient into the inputs, and the Triton
-     kernel and the fused RoPE actually ran.
+  3. end to end, a tiny Gemma 4 with head_dim-512 global layers on packed and one-document
+     batches: hybrid attention (FA2 + Triton/causal globals), then + fused norm/RoPE, against
+     stock HF; and that the Triton kernel and the fused RoPE actually ran.
 
-bf16 everywhere, so the comparisons use relative error (|a-b| / |b| over the whole tensor).
+Tests 2 and 3 use an fp32 run of stock HF as the truth: a bf16 kernel passes if its error vs
+fp32 is not clearly worse than plain bf16 HF's own error (bf16 HF is not exact either).
 """
 import os
 import sys
@@ -39,7 +39,7 @@ def check(name, ok, detail=""):
 
 
 def rel(a, b):
-    a, b = a.float(), b.float()
+    a, b = a.detach().float(), b.detach().float()
     return float((a - b).norm() / b.norm().clamp_min(1e-12))
 
 
@@ -102,46 +102,62 @@ def tiny_config(**over):
     return Gemma4TextConfig(**c)
 
 
-def build_model(attn):
+def build_model(attn, dtype=torch.bfloat16):
+    """Same weights every time (seeded, made in fp32, then cast), so fp32 and bf16 copies match."""
     from transformers import Gemma4ForCausalLM
 
     torch.manual_seed(1)
-    m = Gemma4ForCausalLM._from_config(tiny_config(), attn_implementation=attn, dtype=torch.bfloat16)
+    m = Gemma4ForCausalLM._from_config(tiny_config(), attn_implementation=attn, dtype=torch.float32)
     with torch.no_grad():
         for n, p in m.named_parameters():
             if p.dim() == 1:
                 p.copy_(1 + 0.2 * torch.randn_like(p))         # norms away from 1, so they matter
-    return m.to(DEV, torch.bfloat16).eval()
+                if n.endswith(("q_norm.weight", "k_norm.weight")):
+                    # Gemma 4 uses scaling=1.0 on RMS-normed q/k: with norm weights ~1 the scores have
+                    # std ~8 (head_dim 64) to ~22 (512), softmax is nearly argmax and bf16 vs fp32
+                    # differs by ~130% in the input gradient. 0.3x (a trained-model-like temperature)
+                    # brings that floor to ~4%, so the checks below can see a real kernel bug.
+                    p.mul_(0.3)
+    return m.to(DEV, dtype).eval()
+
+
+def no_worse(err, floor, slack=1.5, eps=1e-3):
+    """bf16 kernels can't be compared with bf16 HF as if HF were exact: both are compared with an
+    fp32 run, and the kernel passes if its error is not clearly worse than plain bf16 HF's."""
+    return err <= slack * floor + eps
 
 
 # ----------------------------------------------------------------------------- 2. fused RMSNorm + RoPE
 def test_fused_rope():
     from transformers.models.gemma4 import modeling_gemma4 as mg
 
-    model = build_model("sdpa")
-    text = model.model
-    orig = mg.Gemma4TextAttention.forward
     from micro_engram.train.vendor.gemma4_fused_attn import _make_fused_forward
 
+    orig = mg.Gemma4TextAttention.forward
     fused = _make_fused_forward(orig)
+    m16, m32 = build_model("sdpa"), build_model("sdpa", torch.float32)
     torch.manual_seed(2)
     S = 256
     pos = torch.arange(S, device=DEV)[None]
     for li in (0, 5):                                             # a sliding layer, the global layer
-        attn = text.layers[li].self_attn
-        ltype = text.config.layer_types[li]
-        h = (torch.randn(1, S, 256, device=DEV) * 0.5).bfloat16()
-        pe = text.rotary_emb(h, pos, ltype)
-        outs, grads = [], []
-        for fwd in (orig, fused):
+        ltype = m16.model.config.layer_types[li]
+        h16 = (torch.randn(1, S, 256, device=DEV) * 0.5).bfloat16()
+
+        def run(model, fwd, h):
+            attn = model.model.layers[li].self_attn
             x = h.clone().requires_grad_()
+            pe = model.model.rotary_emb(x, pos, ltype)
             o, _ = fwd(attn, x, pe, None, shared_kv_states={}, position_ids=pos)
             o.float().pow(2).sum().backward()
-            outs.append(o.detach())
-            grads.append(x.grad)
-        e_out, e_grad = rel(outs[1], outs[0]), rel(grads[1], grads[0])
-        check(f"fused q/k/v norm + RoPE == original attention ({ltype}, layer {li}): output and input grad",
-              e_out < 2e-2 and e_grad < 3e-2, f"rel err {e_out:.1e} {e_grad:.1e}")
+            return o.detach().float(), x.grad.detach().float()
+
+        t_out, t_grad = run(m32, orig, h16.float())                # truth: fp32 original
+        b_out, b_grad = run(m16, orig, h16)                        # bf16 original (the noise floor)
+        f_out, f_grad = run(m16, fused, h16)                       # bf16 fused kernel
+        fo, fg, bo, bg = rel(f_out, t_out), rel(f_grad, t_grad), rel(b_out, t_out), rel(b_grad, t_grad)
+        check(f"fused q/k/v norm + RoPE ({ltype}, layer {li}): no worse than bf16 HF vs fp32",
+              no_worse(fo, bo) and no_worse(fg, bg),
+              f"vs fp32: fused out {fo:.1e} grad {fg:.1e} | bf16 HF out {bo:.1e} grad {bg:.1e}")
 
 
 # ----------------------------------------------------------------------------- 3. end to end
@@ -152,7 +168,7 @@ def loss_and_grad(model, ids, pos, labels):
     loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1),
                                              ignore_index=-100)
     loss.backward()
-    return float(loss), emb.grad.detach()
+    return float(loss), emb.grad.detach().float()
 
 
 def packed_batch(lens_per_row, S, seed):
@@ -173,14 +189,17 @@ def test_end_to_end():
         return
     S = 1024
     batches = {
-        "packed rows (Triton kernel)": packed_batch([[300, 500, 224], [100, 924]], S, 3),
-        "one-document rows (causal SDPA)": packed_batch([[1024], [1024]], S, 4),
+        "packed rows": packed_batch([[300, 500, 224], [100, 924]], S, 3),
+        "one-document rows": packed_batch([[1024], [1024]], S, 4),
     }
-    ref_model = build_model("sdpa")                                # stock HF: builds the block masks itself
-    refs = {k: loss_and_grad(ref_model, *b) for k, b in batches.items()}
-    del ref_model
+    # truth: stock HF in fp32 (SDPA, block masks built by HF); floor: stock HF in bf16
+    m32 = build_model("sdpa", torch.float32)
+    truth = {k: loss_and_grad(m32, *b) for k, b in batches.items()}
+    del m32
+    m16 = build_model("sdpa")
+    floor = {k: loss_and_grad(m16, *b) for k, b in batches.items()}
+    del m16
 
-    # the trainer's setup: count kernel calls
     from micro_engram.train.vendor import flash_attn_d512 as fd, gemma4_fused_rope as fr
 
     calls = {"flash_d512": 0, "fused_rope": 0}
@@ -195,25 +214,35 @@ def test_end_to_end():
     fr.fused_rms_norm_rope = counting("fused_rope", fr.fused_rms_norm_rope)
     from micro_engram.train import model as M
 
-    cfg = types.SimpleNamespace(fused_attn_kernel=True, gradient_checkpointing=False, activation_offloading=False,
+    cfg = types.SimpleNamespace(fused_attn_kernel=False, gradient_checkpointing=False, activation_offloading=False,
                                 gemma4_hybrid_attn_impl=True, large_head_policy="auto", sample_packing=True,
                                 liger_rms_norm=False, liger_glu_activation=False, attn_implementation="flash_attention_2")
-    M.apply_kernel_patches(cfg, True)
-    test_model = build_model("flash_attention_2")
-    M.hybrid_attention(test_model.model, cfg)
-    for name, b in batches.items():
-        before = calls["flash_d512"]
-        loss, grad = loss_and_grad(test_model, *b)
-        rloss, rgrad = refs[name]
-        e = rel(grad, rgrad)
-        check(f"end to end, {name}: loss and input gradient == stock HF SDPA",
-              abs(loss - rloss) < 1e-2 * max(1.0, abs(rloss)) and e < 5e-2,
-              f"loss {loss:.4f} vs {rloss:.4f}, grad rel err {e:.1e}")
-        used = calls["flash_d512"] - before
-        if "packed" in name:
-            check("  ...the Triton head_dim-512 kernel ran on the packed rows", used > 0, f"{used} calls")
-        else:
-            check("  ...one-document rows took the causal SDPA path (no Triton call)", used == 0, f"{used} calls")
+    M.apply_kernel_patches(cfg, True)                              # first: hybrid attention only
+    model = build_model("flash_attention_2")
+    M.hybrid_attention(model.model, cfg)
+
+    def compare(label):
+        for name, b in batches.items():
+            before = calls["flash_d512"]
+            loss, grad = loss_and_grad(model, *b)
+            tl, tg = truth[name]
+            fl, fg = floor[name]
+            el, eg = abs(loss - tl), rel(grad, tg)
+            fel, feg = abs(fl - tl), rel(fg, tg)
+            check(f"{label}, {name}: loss and input gradient no worse than bf16 HF vs fp32",
+                  no_worse(el, fel, eps=2e-3) and no_worse(eg, feg, eps=5e-3),
+                  f"vs fp32: loss diff {el:.1e} grad {eg:.1e} | bf16 HF loss diff {fel:.1e} grad {feg:.1e}")
+            used = calls["flash_d512"] - before
+            if name == "packed rows":
+                check("  ...the Triton head_dim-512 kernel ran on the packed rows", used > 0, f"{used} calls")
+            else:
+                check("  ...one-document rows took the causal SDPA path (no Triton call)", used == 0, f"{used} calls")
+
+    compare("hybrid attention (FA2 sliding + Triton/causal globals)")
+    from micro_engram.train.vendor.gemma4_fused_attn import patch_gemma4_fused_attn
+
+    patch_gemma4_fused_attn(install_shared_kv_workaround=False)  # then: + fused norm/RoPE (class-level)
+    compare("hybrid attention + fused norm/RoPE (the trainer's full setup)")
     check("fused RMSNorm + RoPE kernel ran", calls["fused_rope"] > 0, f"{calls['fused_rope']} calls")
     from micro_engram.train.vendor import large_head
 
