@@ -98,6 +98,18 @@ gives the same loss as plain SDPA and the HF reference. The Triton path itself w
 in micro_engram. Check it with a profile (Triton `_fwd` / `_bwd_dkdv` / `_bwd_dq` kernels instead of
 `fmha_cutlass*`) and a step-1 loss match, with and without `large_head_attention: auto`, same seed.
 
+### Check first: FA2 only isolates packed documents in a batch of ONE row
+
+transformers' `_is_packed_sequence` (`modeling_flash_attention_utils.py`) returns False whenever
+`batch_size != 1`. With several rows per batch, FA2 treats each row as one sequence, and the documents
+packed into a row attend to each other (within the sliding window, on Gemma 4's sliding layers). That was
+found with `test_kernels_gpu.py` on the 3090s. SDPA and the Triton kernel are not affected.
+
+- Axolotl's default multipack concatenates a micro-batch into one row (one bin of
+  `micro_batch_size * sequence_len`), so that's fine.
+- **`multipack_real_batches: true` gives several rows: don't use it with FA2.**
+- micro_engram.train flattens micro-batches into one row before the forward (`loop.py`, `forward_loss`).
+
 ## 3. Loss normalization across gradient accumulation
 
 **Finding (0.19.0, read, not run):** `monkeypatch/gemma4_loss_kwargs.py` sets

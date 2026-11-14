@@ -295,6 +295,20 @@ def worker(rank, world, port, root, model_dir, data, q):
     res["sparse_same"] = all(torch.allclose(a[k], b[k], atol=1e-6) for k in a) and \
         all(abs(x - y) < 1e-5 * max(1, abs(y)) for x, y in zip(na, nb))
     res["sparse_norms"] = na
+    # 12. micro_batch_size 2: rows are flattened into one before the forward; same loss as HF on 2 rows
+    t2 = _trainer({**cfg, "output_dir": os.path.join(root, "run_mb2"), "micro_batch_size": 2,
+                   "gradient_accumulation_steps": 1})
+    mb = t2._micro_batch(t2.plan.micro_batches(0, 0, rank)[0])
+    with torch.no_grad():
+        lg = ref(input_ids=mb["input_ids"], position_ids=mb["position_ids"]).logits.float()
+        rs = torch.nn.functional.cross_entropy(lg.reshape(-1, V), mb["labels"].reshape(-1), ignore_index=-100,
+                                               reduction="sum")
+        rc = (mb["labels"] != -100).sum()
+    s2 = torch.stack([rs, rc.float()])
+    dist.all_reduce(s2)
+    res["mb2"] = (t2.train_step(t2.plan.micro_batches(0, 0, rank))["loss"], float(s2[0] / s2[1]))
+    del t2
+
     # 10. micro_engram_dense_lr: own LR for key/value/gates/scales, same schedule as the tables;
     # a changed value takes effect on resume
     lc = {**cfg, "output_dir": os.path.join(root, "run_lr"), "learning_rate": 5e-3, "micro_engram_dense_lr": 1e-3,
@@ -367,6 +381,8 @@ def main():
               f"{r0['hybrid_loss']} vs {r0['ref_loss']}, multi-doc {r0['multi_doc']}")
         check("hybrid attention gives the same loss as plain SDPA", abs(r0["hybrid_loss"] - r0["loss"]) < 1e-4,
               f"{r0['hybrid_loss']} vs {r0['loss']}")
+        check("micro_batch_size 2 (rows flattened into one): loss == plain HF forward on the 2 rows",
+              abs(r0["mb2"][0] - r0["mb2"][1]) < 2e-2 * r0["mb2"][1], f"{r0['mb2']}")
         lr_ok = r0["lr_ratio"][1:3] == [5.0, 5.0] and abs(r0["lr_ratio"][3] - 25.0) < 1e-6 \
             and r0["lr_seq"][0] == 0.0 and r0["lr_seq"][1] > 0
         check("micro_engram_dense_lr: dense LR follows the tables' schedule; a new value applies on resume", lr_ok,

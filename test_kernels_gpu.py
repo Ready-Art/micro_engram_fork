@@ -187,10 +187,11 @@ def test_end_to_end():
     except ImportError:
         check("end to end (needs flash-attn for the sliding layers)", False, "flash_attn not installed")
         return
-    S = 1024
+    # ONE row per batch, as micro_engram.train feeds the model (it flattens micro-batches): transformers'
+    # FA2 only isolates packed documents for a batch of one row (_is_packed_sequence), see the last check
     batches = {
-        "packed rows": packed_batch([[300, 500, 224], [100, 924]], S, 3),
-        "one-document rows": packed_batch([[1024], [1024]], S, 4),
+        "packed rows": packed_batch([[300, 500, 224, 100, 924]], 2048, 3),
+        "one-document rows": packed_batch([[1024]], 1024, 4),
     }
     # truth: stock HF in fp32 (SDPA, block masks built by HF); floor: stock HF in bf16
     m32 = build_model("sdpa", torch.float32)
@@ -257,6 +258,14 @@ def test_end_to_end():
 
     patch_gemma4_fused_attn(install_shared_kv_workaround=False)  # d) + fused norm/RoPE (class-level)
     compare("d) c + fused norm/RoPE (the trainer's full setup)", model)
+
+    # e) documents the transformers limit the trainer works around: the same documents as 2 rows
+    two_rows = packed_batch([[300, 500, 224], [100, 924]], 1024, 3)
+    t_loss, _ = loss_and_grad(build_model("sdpa", torch.float32), *two_rows)
+    f_loss, _ = loss_and_grad(model, *two_rows)
+    print(f"note: FA2 with 2 packed rows per batch: loss {f_loss:.4f} vs fp32 {t_loss:.4f} "
+          f"(diff {abs(f_loss - t_loss):.1e}; large = documents leak across in FA2's sliding layers, "
+          f"which is why micro_engram.train flattens micro-batches into one row)")
     check("fused RMSNorm + RoPE kernel ran", calls["fused_rope"] > 0, f"{calls['fused_rope']} calls")
     from micro_engram.train.vendor import large_head
 

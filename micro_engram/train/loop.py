@@ -256,6 +256,12 @@ class Trainer:
     def forward_loss(self, batch, scale):
         """Sum of this GPU's token losses for one micro-batch; backward of loss * scale."""
         ids, pos, labels = batch["input_ids"], batch["position_ids"], batch["labels"]
+        if ids.shape[0] > 1:
+            # One row: transformers' FA2 only uses document-aware (varlen) attention for a batch of
+            # one row (_is_packed_sequence: batch_size != 1 -> not packed); with several rows the
+            # sliding layers would attend across the documents packed in a row. Every row starts
+            # a document (position 0) and labels never cross rows, so this changes nothing else.
+            ids, pos, labels = (t.reshape(1, -1) for t in (ids, pos, labels))
         self.ctx["ids"], self.ctx["pos"] = ids, pos
         emb = self.vocab.embed(ids)
         kw = {}
