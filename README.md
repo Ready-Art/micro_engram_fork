@@ -380,6 +380,7 @@ python test_render_chat.py                    # render_chat.py: formats, templat
 python test_vllm_ids.py                       # vLLM path: previous tokens per batch type, same output as training
 python test_vllm_tp.py                        # vLLM tables split over TP GPUs: == full tables, loading (file and checkpoint), with vLLM stand-ins
 python test_eval_spans.py                     # eval_logprob.py assistant-only scoring (render_chat spans) vs a fake vLLM server
+python test_kernels_gpu.py                    # GPU only (run on the server): Triton head_dim-512 flash, fused norm+RoPE, hybrid attention end to end vs stock HF
 python test_head.py                           # vocab-parallel embedding + chunked softcapped loss vs a full-logit reference (1 and 3 procs)
 python test_zero_order.py                     # zero_ngram_order.py: zeroed orders, rest unchanged, output == engram without those lookups
 python test_multi.py                          # several engrams, init_from + frozen, config, inference == training, assemble, stats (needs transformers)
