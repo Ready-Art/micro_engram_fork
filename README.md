@@ -137,7 +137,7 @@ Use `auto` for chat SFT, where nearly every row holds several conversations. If 
 
 | Key | Default | Meaning |
 |---|---|---|
-| `micro_engram_layer` | `0` | Inject the memory into the output of this decoder layer (0-indexed: `0` = after the first block, the Engram paper's best single placement) |
+| `micro_engram_layer` | `0` | Inject the memory into the output of this decoder layer (0-indexed: `0` = after the first block). A layer right after a global-attention layer (Gemma 4 31B: 5, 11, …, 29, …; check `layer_types` in config.json) gives the gate a hidden state that has seen the whole context |
 | `micro_engram_table_size` | `65536` | Rows per hash table |
 | `micro_engram_table_sizes` | unset | Rows per table **for each n-gram order**, overriding `micro_engram_table_size`, e.g. `{2: 1048576, 3: 3145728}`. `0`/`null` drops an order; an order not listed keeps `micro_engram_table_size` (orders 2 and 3), so `{4: N}` **adds 4-grams** |
 | `micro_engram_dim` | `128` | Width of each table row |
