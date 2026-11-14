@@ -214,14 +214,9 @@ def test_end_to_end():
     fr.fused_rms_norm_rope = counting("fused_rope", fr.fused_rms_norm_rope)
     from micro_engram.train import model as M
 
-    cfg = types.SimpleNamespace(fused_attn_kernel=False, gradient_checkpointing=False, activation_offloading=False,
-                                gemma4_hybrid_attn_impl=True, large_head_policy="auto", sample_packing=True,
-                                liger_rms_norm=False, liger_glu_activation=False, attn_implementation="flash_attention_2")
-    M.apply_kernel_patches(cfg, True)                              # first: hybrid attention only
-    model = build_model("flash_attention_2")
-    M.hybrid_attention(model.model, cfg)
+    from micro_engram.train.vendor.large_head import set_large_head_policy
 
-    def compare(label):
+    def compare(label, model, expect_triton=True):
         for name, b in batches.items():
             before = calls["flash_d512"]
             loss, grad = loss_and_grad(model, *b)
@@ -229,20 +224,39 @@ def test_end_to_end():
             fl, fg = floor[name]
             el, eg = abs(loss - tl), rel(grad, tg)
             fel, feg = abs(fl - tl), rel(fg, tg)
-            check(f"{label}, {name}: loss and input gradient no worse than bf16 HF vs fp32",
+            check(f"{label}, {name}: no worse than bf16 HF vs fp32",
                   no_worse(el, fel, eps=2e-3) and no_worse(eg, feg, eps=5e-3),
                   f"vs fp32: loss diff {el:.1e} grad {eg:.1e} | bf16 HF loss diff {fel:.1e} grad {feg:.1e}")
             used = calls["flash_d512"] - before
-            if name == "packed rows":
+            if name == "packed rows" and expect_triton:
                 check("  ...the Triton head_dim-512 kernel ran on the packed rows", used > 0, f"{used} calls")
+            elif name == "packed rows":
+                check("  ...no Triton call (block mask instead)", used == 0, f"{used} calls")
             else:
                 check("  ...one-document rows took the causal SDPA path (no Triton call)", used == 0, f"{used} calls")
 
-    compare("hybrid attention (FA2 sliding + Triton/causal globals)")
+    def setup(attn, policy):
+        cfg = types.SimpleNamespace(fused_attn_kernel=False, gradient_checkpointing=False, activation_offloading=False,
+                                    gemma4_hybrid_attn_impl=True, large_head_policy=policy, sample_packing=True,
+                                    liger_rms_norm=False, liger_glu_activation=False, attn_implementation=attn)
+        M.apply_kernel_patches(cfg, True)                          # idempotent; sets the policy
+        set_large_head_policy(policy)
+        model = build_model(attn)
+        M.hybrid_attention(model.model, cfg)
+        return model
+
+    # One piece at a time, so a failure points at it (patches are process-wide, order matters):
+    # a) all SDPA (sliding layers get HF's packed sliding masks), global layers on the Triton kernel
+    compare("a) SDPA sliding + Triton globals", setup("sdpa", "auto"))
+    # b) FA2 varlen sliding layers, global layers on the block mask (no Triton)
+    compare("b) FA2 sliding + block-mask globals", setup("flash_attention_2", "sdpa"), expect_triton=False)
+    # c) FA2 sliding + Triton globals (the trainer's attention setup)
+    model = setup("flash_attention_2", "auto")
+    compare("c) FA2 sliding + Triton globals", model)
     from micro_engram.train.vendor.gemma4_fused_attn import patch_gemma4_fused_attn
 
-    patch_gemma4_fused_attn(install_shared_kv_workaround=False)  # then: + fused norm/RoPE (class-level)
-    compare("hybrid attention + fused norm/RoPE (the trainer's full setup)")
+    patch_gemma4_fused_attn(install_shared_kv_workaround=False)  # d) + fused norm/RoPE (class-level)
+    compare("d) c + fused norm/RoPE (the trainer's full setup)", model)
     check("fused RMSNorm + RoPE kernel ran", calls["fused_rope"] > 0, f"{calls['fused_rope']} calls")
     from micro_engram.train.vendor import large_head
 
