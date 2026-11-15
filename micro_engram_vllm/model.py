@@ -50,6 +50,25 @@ class EngramGemma4DecoderLayer(Gemma4DecoderLayer):
         return self.micro_engram.inject(hidden_states, idx, keep), residual
 
 
+def _uses_v2_model_runner(vllm_config: VllmConfig) -> bool:
+    """Is vLLM's Model Runner V2 building this model? Older vLLM (the pinned 64175d3827) has
+    VllmConfig.use_v2_model_runner; newer releases dropped it, so fall back to looking at who is
+    constructing us: V2's runner lives in vllm/v1/worker/gpu/model_runner.py (V1's in
+    vllm/v1/worker/gpu_model_runner.py)."""
+    flag = getattr(vllm_config, "use_v2_model_runner", None)
+    if flag is not None:
+        return bool(flag)
+    import inspect
+
+    frames = [f.filename.replace("\\", "/") for f in inspect.stack(context=0)]
+    if any(f.endswith("/v1/worker/gpu/model_runner.py") for f in frames):
+        return True
+    if any(f.endswith("/v1/worker/gpu_model_runner.py") for f in frames):
+        return False
+    logger.warning("[micro_engram] could not tell which vLLM model runner is in use; assuming V2")
+    return True
+
+
 def _offload_wanted(vllm_config: VllmConfig) -> bool:
     """Engram tables in pinned host memory: --additional-config '{"micro_engram_offload": true}'
     or MICRO_ENGRAM_OFFLOAD=1."""
@@ -140,7 +159,7 @@ class EngramGemma4ForCausalLM(Gemma4ForCausalLM):
                 f"[micro_engram] {arch} is not supported (the engram would never be fed); "
                 "serve Gemma4ForConditionalGeneration or Gemma4ForCausalLM"
             )
-        if not vllm_config.use_v2_model_runner:
+        if not _uses_v2_model_runner(vllm_config):
             raise ValueError(
                 "[micro_engram] needs Model Runner V2 (vLLM's default). Something forced "
                 "V1, e.g. VLLM_USE_V2_MODEL_RUNNER=0 or a feature V2 does not support."
